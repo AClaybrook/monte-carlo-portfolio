@@ -1,0 +1,5 @@
+*.html
+*.db
+*.pyc
+__pycache__/
+.venv/
