@@ -187,3 +187,4 @@ class PortfolioSimulator:
         print(f"\nProbabilities:")
         print(f"  P(Loss): {stats['probability_loss']*100:.2f}%")
         print(f"  P(Double): {stats['probability_double']*100:.2f}%")
+
