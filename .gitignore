@@ -21,3 +21,10 @@ Gemfile.lock
 *.pyc
 __pycache__/
 .venv/
+
+# Personal portfolio configurations (IMPORTANT!)
+config/*.py
+
+# But keep the example config
+!config/example_config.py
+!config/__init__.py
