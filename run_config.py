@@ -169,82 +169,78 @@ class RunConfig:
     """
     Main configuration class that ties everything together.
 
-    This is what you'll create in your config files. It contains all the
-    assets, portfolios, and settings for your simulation run.
+    Assets are automatically discovered from your portfolio allocations!
+    You only need to specify them if you want custom settings.
 
-    Example usage in config/my_portfolios.py:
-
-        from run_config import RunConfig, AssetConfig, PortfolioConfig, SimulationConfig
+    Example - Simple (assets auto-discovered):
 
         config = RunConfig(
-            name="My Investment Analysis",
-
-            # Define the assets you want to analyze
-            assets=[
-                AssetConfig(ticker='VOO', name='S&P 500'),
-                AssetConfig(ticker='QQQ', name='Nasdaq 100'),
-                AssetConfig(ticker='BND', name='Bonds'),
-            ],
-
-            # Define the portfolios you want to test
+            name="Simple Analysis",
             portfolios=[
                 PortfolioConfig(
-                    name='Conservative',
-                    allocations={'voo': 0.4, 'qqq': 0.2, 'bnd': 0.4}
+                    name='60/40',
+                    allocations={'VOO': 0.6, 'BND': 0.4}  # ← Assets discovered here
                 ),
-                PortfolioConfig(
-                    name='Aggressive',
-                    allocations={'voo': 0.5, 'qqq': 0.5}
-                ),
+            ]
+        )
+
+    Example - Custom asset settings:
+
+        config = RunConfig(
+            name="Custom Settings",
+            portfolios=[
+                PortfolioConfig(name='My Portfolio', allocations={'VOO': 0.6, 'TQQQ': 0.4}),
             ],
-
-            # Simulation settings
-            simulation=SimulationConfig(
-                initial_capital=100000,
-                years=10,
-                simulations=10000
-            ),
-
-            # Optional: optimization
-            optimization=OptimizationConfig(
-                assets=['voo', 'qqq', 'bnd'],
-                objective_weights={'return': 0.5, 'sharpe': 0.3, 'drawdown': 0.2}
-            )
+            assets={
+                'TQQQ': AssetConfig(lookback_years=8, name='3x Nasdaq')  # Custom settings
+            }
         )
     """
     name: str  # Name for this configuration/run
-    assets: List[AssetConfig]  # Assets to load from Yahoo Finance
     portfolios: List[PortfolioConfig]  # Portfolios to simulate
+
+    # Optional: Only specify if you need custom settings
+    assets: Optional[Dict[str, AssetConfig]] = None  # ticker -> custom config
+
     simulation: SimulationConfig = field(default_factory=SimulationConfig)
-    optimization: Optional[OptimizationConfig] = None  # Optional optimization
+    optimization: Optional[OptimizationConfig] = None
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
 
     def __post_init__(self):
-        """Validate the entire configuration"""
-        # Check that all portfolio allocations reference defined assets
-        asset_names = {asset.ticker.lower() for asset in self.assets}
+        """Validate and auto-discover assets"""
+        # Discover all tickers from portfolios and optimization
+        discovered_tickers = set()
 
         for portfolio in self.portfolios:
-            for asset_name in portfolio.allocations.keys():
-                if asset_name.lower() not in asset_names:
-                    raise ValueError(
-                        f"Portfolio '{portfolio.name}' references unknown asset '{asset_name}'. "
-                        f"Available assets: {', '.join(asset_names)}"
-                    )
+            discovered_tickers.update(portfolio.allocations.keys())
 
-        # Check optimization assets if optimization is enabled
+        if self.optimization:
+            discovered_tickers.update(self.optimization.assets)
+
+        # Create default AssetConfig for any ticker without custom config
+        if self.assets is None:
+            self.assets = {}
+
+        # Normalize ticker case (store as uppercase)
+        self.assets = {k.upper(): v for k, v in self.assets.items()}
+
+        # Fill in missing assets with defaults
+        for ticker in discovered_tickers:
+            ticker_upper = ticker.upper()
+            if ticker_upper not in self.assets:
+                self.assets[ticker_upper] = AssetConfig(ticker=ticker_upper)
+
+        # Validate optimization assets if present
         if self.optimization:
             for asset_name in self.optimization.assets:
-                if asset_name.lower() not in asset_names:
-                    raise ValueError(
-                        f"Optimization references unknown asset '{asset_name}'. "
-                        f"Available assets: {', '.join(asset_names)}"
-                    )
+                if asset_name.upper() not in self.assets:
+                    # This shouldn't happen after auto-discovery, but just in case
+                    self.assets[asset_name.upper()] = AssetConfig(ticker=asset_name.upper())
 
-    def get_asset_map(self) -> Dict[str, AssetConfig]:
-        """Get a dictionary mapping lowercase asset names to configs"""
-        return {asset.ticker.lower(): asset for asset in self.assets}
+    def get_asset_config(self, ticker: str) -> AssetConfig:
+        """Get asset config for a ticker (case-insensitive)"""
+        return self.assets[ticker.upper()]
 
     def summary(self) -> str:
         """Get a human-readable summary of this configuration"""
@@ -253,8 +249,9 @@ class RunConfig:
             f"",
             f"Assets ({len(self.assets)}):",
         ]
-        for asset in self.assets:
-            lines.append(f"  - {asset.ticker}: {asset.name}")
+        for ticker, asset in sorted(self.assets.items()):
+            custom = " (custom settings)" if asset.name != ticker or asset.lookback_years != 10 else ""
+            lines.append(f"  - {ticker}: {asset.name}{custom}")
 
         lines.append(f"")
         lines.append(f"Portfolios ({len(self.portfolios)}):")

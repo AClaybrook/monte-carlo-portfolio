@@ -102,13 +102,13 @@ Examples:
 
     # Load all assets
     asset_map = {}
-    for asset_config in config.assets:
+    for ticker, asset_config in config.assets.items():
         asset = sim.define_asset_from_ticker(
             asset_config.ticker,
             name=asset_config.name,
             lookback_years=asset_config.lookback_years
         )
-        asset_map[asset_config.ticker.lower()] = asset
+        asset_map[ticker.upper()] = asset
 
     print("\n" + "="*60)
     print("Running Portfolio Simulations")
@@ -123,7 +123,7 @@ Examples:
         portfolio_assets = []
         portfolio_allocations = []
         for asset_name, weight in portfolio_config.allocations.items():
-            portfolio_assets.append(asset_map[asset_name.lower()])
+            portfolio_assets.append(asset_map[asset_name.upper()])
             portfolio_allocations.append(weight)
 
         # Run simulation
@@ -160,7 +160,7 @@ Examples:
         print("="*60)
 
         # Get assets for optimization
-        opt_assets = [asset_map[name.lower()] for name in config.optimization.assets]
+        opt_assets = [asset_map[name.upper()] for name in config.optimization.assets]
 
         # Run optimization
         if config.optimization.method == 'grid_search':
