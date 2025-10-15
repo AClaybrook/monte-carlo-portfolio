@@ -29,14 +29,14 @@ def find_config_file(specified_path: str = None) -> Path:
         return personal_config
 
     # Fall back to simple example
-    example_config = Path('config/example_simple.py')
+    example_config = Path('config/example_config.py')
     if example_config.exists():
-        print("⚠ No personal config found, using example_simple.py")
+        print("⚠ No personal config found, using example_config.py")
         print(f"  Create {personal_config} to customize your portfolios")
         return example_config
 
     raise FileNotFoundError(
-        "No config file found. Create config/my_portfolios.py or config/example_simple.py"
+        "No config file found. Create config/my_portfolios.py or config/example_config.py"
     )
 
 def main():
@@ -91,7 +91,8 @@ Examples:
         data_manager=data_manager,
         initial_capital=config.simulation.initial_capital,
         years=config.simulation.years,
-        simulations=config.simulation.simulations
+        simulations=config.simulation.simulations,
+        end_date=config.simulation.end_date
     )
     optimizer = PortfolioOptimizer(sim, data_manager)
     visualizer = PortfolioVisualizer(sim)
@@ -106,7 +107,7 @@ Examples:
         asset = sim.define_asset_from_ticker(
             asset_config.ticker,
             name=asset_config.name,
-            lookback_years=asset_config.lookback_years
+            lookback_years=config.simulation.lookback_years
         )
         asset_map[ticker.upper()] = asset
 

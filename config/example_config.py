@@ -59,18 +59,20 @@ config = RunConfig(
         years=10,                # 10 year horizon
         simulations=1000,       # 10k Monte Carlo runs
         method='geometric_brownian',       # Use historical data resampling
+        end_date='2025-10-01',
+        lookback_years=5,      # 10 years of historical data (if available)
     ),
 
     optimization=OptimizationConfig(
-        assets=['VOO', 'QQQ', 'BND', 'TQQQ', 'VCR', 'ARKK'],
+        assets=['VOO', 'QQQ', 'BND', 'TQQQ', 'VCR', 'ARKK', 'VGT'],
         method='grid_search',    # Grid search over allocations
-        grid_points=11,          # points per asset (coarse)
+        grid_points=6,          # points per asset (coarse)
         top_n=5,                # Show top 5 results
         objective_weights={      # Weights for custom objective function
             'return': 0.5,       # Maximize return
-            'sharpe': 0.125,     # Maximize Sharpe ratio
-            'sortino': 0.125,    # Maximize Sortino ratio
-            'worst_max_drawdown': 0.25,        # Minimize drawdown
+            'sharpe': 0.25,     # Maximize Sharpe ratio
+            'sortino': 0.25,    # Maximize Sortino ratio
+            'worst_max_drawdown': 0.0,        # Minimize drawdown
         }
     ),
 

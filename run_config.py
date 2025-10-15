@@ -124,6 +124,8 @@ class SimulationConfig:
     years: int = 10  # Investment time horizon
     simulations: int = 10000  # Number of Monte Carlo runs (more = more accurate)
     method: Literal['bootstrap', 'geometric_brownian', 'parametric'] = 'bootstrap'
+    end_date: Optional[str] = None  # End date for historical data (YYYY-MM-DD), defaults to today
+    lookback_years: int = 10  # Years of historical data to use if available
 
     def __post_init__(self):
         """Validate simulation config"""

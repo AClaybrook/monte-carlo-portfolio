@@ -211,6 +211,7 @@ class PortfolioVisualizer:
                 f"${stats['median_final_value']:,.0f}",
                 f"{stats['median_cagr']*100:.1f}%",
                 f"{stats['median_max_drawdown']*100:.1f}%",
+                f"{stats['max_drawdown_95']*100:.1f}%",
                 f"{stats['sharpe_ratio']:.2f}",
                 f"{stats['sortino_ratio']:.2f}"
             ])
@@ -218,7 +219,7 @@ class PortfolioVisualizer:
         fig.add_trace(
             go.Table(
                 header=dict(
-                    values=['Portfolio', 'Median Value', 'Median CAGR', 'Median DD', 'Sharpe', 'Sortino'],
+                    values=['Portfolio', 'Median Value', 'Median CAGR', 'Median DD', '95% Max DD', 'Sharpe', 'Sortino'],
                     fill_color='paleturquoise',
                     align='left',
                     font=dict(size=10, color='black')

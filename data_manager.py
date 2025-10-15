@@ -84,6 +84,8 @@ class DataManager:
             if db_data is not None and len(db_data) > 0:
                 db_start = db_data.index.min().date()
                 db_end = db_data.index.max().date()
+                print(f"{db_start = }, {db_end = }")  # Debug print
+                print(f"{start_date = }, {end_date = }")  # Debug print
                 if db_start <= start_date and db_end >= end_date - timedelta(days=5):
                     print(f"✓ Retrieved {ticker} from database ({len(db_data)} records)")
                     return db_data
@@ -144,7 +146,7 @@ class DataManager:
         try:
             query = self.session.query(StockPrice).filter(
                 StockPrice.ticker == ticker,
-                StockPrice.date >= start_date,
+                StockPrice.date >= start_date - timedelta(days=1),
                 StockPrice.date <= end_date
             ).order_by(StockPrice.date)
 
