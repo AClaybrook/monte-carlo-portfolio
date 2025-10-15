@@ -52,6 +52,10 @@ class PortfolioOptimizer:
             drawdown_score = 1 + stats['median_max_drawdown']  # Convert to 0-1 range
             score += weights['drawdown'] * drawdown_score
 
+        if 'worst_max_drawdown' in weights:
+            max_dd_score = 1 + stats['worst_max_drawdown']  # Convert to 0-1 range
+            score += weights['worst_max_drawdown'] * max_dd_score
+
         # Probability of doubling component
         if 'prob_double' in weights:
             score += weights['prob_double'] * stats['probability_double']

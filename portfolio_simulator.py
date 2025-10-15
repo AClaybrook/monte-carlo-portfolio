@@ -149,6 +149,8 @@ class PortfolioSimulator:
             'std_cagr': np.std(cagr),
             'mean_max_drawdown': np.mean(max_drawdowns),
             'median_max_drawdown': np.median(max_drawdowns),
+            'std_max_drawdown': np.std(max_drawdowns),
+            'worst_max_drawdown': np.min(max_drawdowns),  # Negative value
             'percentile_5': np.percentile(final_values, 5),
             'percentile_25': np.percentile(final_values, 25),
             'percentile_75': np.percentile(final_values, 75),

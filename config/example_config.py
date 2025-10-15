@@ -14,21 +14,18 @@ config = RunConfig(
     portfolios=[
         # Conservative: More bonds
         PortfolioConfig(
-            name='Conservative 60/40',
+            name='SP500',
             allocations={
-                'VOO': 0.40,  # S&P 500
-                'QQQ': 0.20,  # Nasdaq 100
-                'BND': 0.40   # Bonds
+                'VOO': 1.0,  # S&P 500
             },
-            description='40% stocks, 40% bonds'
+            description='100% S&P 500 (VOO)'
         ),
 
         # Balanced: Mix of everything
         PortfolioConfig(
             name='Balanced',
             allocations={
-                'VOO': 0.50,
-                'QQQ': 0.30,
+                'VOO': 0.80,
                 'BND': 0.20
             },
             description='80% stocks, 20% bonds'
@@ -44,17 +41,16 @@ config = RunConfig(
             description='100% stocks, no bonds'
         ),
 
-
-        # Aggressive: All stocks
         PortfolioConfig(
-            name='Custom Aggressive 100% Stocks',
+            name='Tech Heavy 100% Stocks',
             allocations={
-                'VOO': 0.60,
-                'NVDA': 0.30,
-                'ARKK': 0.10
+                'VOO': 0.40,
+                'VGT': 0.30,
+                'QQQ': 0.30
             },
-            description='100% stocks, custom'
+            description='100% stocks, tech heavy'
         ),
+
     ],
 
     # Optional: Customize simulation settings
@@ -62,18 +58,19 @@ config = RunConfig(
         initial_capital=100000,  # $100k starting
         years=10,                # 10 year horizon
         simulations=1000,       # 10k Monte Carlo runs
-        method='bootstrap'       # Use historical data resampling
+        method='geometric_brownian',       # Use historical data resampling
     ),
 
     optimization=OptimizationConfig(
-        assets=['VOO', 'QQQ', 'BND', 'TQQQ', 'VCR', 'NVDA', 'ARKK'],
+        assets=['VOO', 'QQQ', 'BND', 'TQQQ', 'VCR', 'ARKK'],
         method='grid_search',    # Grid search over allocations
-        grid_points=5,          # 5 points per asset (coarse)
+        grid_points=11,          # points per asset (coarse)
         top_n=5,                # Show top 5 results
         objective_weights={      # Weights for custom objective function
-            'return': 0.5,          # Maximize return
-            'sharpe': 0.25,          # Maximize Sharpe ratio
-            'drawdown': 0.25,        # Minimize drawdown
+            'return': 0.5,       # Maximize return
+            'sharpe': 0.125,     # Maximize Sharpe ratio
+            'sortino': 0.125,    # Maximize Sortino ratio
+            'worst_max_drawdown': 0.25,        # Minimize drawdown
         }
     ),
 
