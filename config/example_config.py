@@ -51,16 +51,25 @@ config = RunConfig(
             description='100% stocks, tech heavy'
         ),
 
+        PortfolioConfig(
+            name='Leveraged Tech Heavy 100% Stocks',
+            allocations={
+                'SPXL': 0.5,
+                'TQQQ': 0.5
+            },
+            description='Leveraged 100% stocks'
+        ),
+
     ],
 
     # Optional: Customize simulation settings
     simulation=SimulationConfig(
         initial_capital=100000,  # $100k starting
         years=10,                # 10 year horizon
-        simulations=1000,       # 10k Monte Carlo runs
-        method='geometric_brownian',       # Use historical data resampling
-        end_date='2025-10-01',
-        lookback_years=5,      # 10 years of historical data (if available)
+        simulations=3000,       # 10k Monte Carlo runs
+        method='bootstrap',       # Use historical data resampling
+        end_date='2025-10-14',
+        lookback_years=15,      # 10 years of historical data (if available)
     ),
 
     optimization=OptimizationConfig(

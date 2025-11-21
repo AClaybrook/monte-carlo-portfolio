@@ -1,6 +1,8 @@
 """
 Monte Carlo portfolio simulation engine - Optimized for speed.
 Uses vectorized operations and efficient numpy routines.
+
+FIXED: Sortino ratio calculation now handles portfolios with no downside correctly
 """
 
 import numpy as np
@@ -24,7 +26,6 @@ class PortfolioSimulator:
 
         end_date = self.end_date
         start_date = end_date - timedelta(days=365*lookback_years)
-        print(f"{end_date = }, {start_date = }")  # Debug print
         df = self.data_manager.get_data(ticker, start_date, end_date)
 
         returns = df['Adj Close'].pct_change().dropna()
@@ -72,18 +73,15 @@ class PortfolioSimulator:
                 print(f"  Warning: {asset['name']} has only {len(historical)} data points. Using parametric method.")
                 method = 'parametric'
             else:
-                # OPTIMIZED: Use numpy's choice with replace=True (faster than manual indexing)
                 return np.random.choice(historical, size=(self.simulations, self.trading_days), replace=True)
 
         if method == 'parametric':
-            # Already optimized - single numpy call
             return np.random.normal(
                 asset['daily_return'],
                 asset['daily_volatility'],
                 (self.simulations, self.trading_days)
             )
         elif method == 'geometric_brownian':
-            # OPTIMIZED: Vectorized geometric brownian motion
             dt = 1/252
             drift = (asset['annual_return'] - 0.5 * asset['annual_volatility']**2) * dt
             shock = asset['annual_volatility'] * np.sqrt(dt)
@@ -111,7 +109,6 @@ class PortfolioSimulator:
             portfolio_returns += returns * weight
 
         # OPTIMIZED: Use cumprod instead of explicit loop
-        # Convert returns to growth factors: (1 + r1) * (1 + r2) * ...
         growth_factors = 1 + portfolio_returns
         cumulative_growth = np.cumprod(growth_factors, axis=1)
 
@@ -162,16 +159,30 @@ class PortfolioSimulator:
         return max_drawdowns
 
     def calculate_statistics(self, final_values, total_returns, cagr, max_drawdowns):
-        """Calculate comprehensive statistics - OPTIMIZED with numpy"""
-        # OPTIMIZED: Use boolean indexing instead of list comprehension
+        """
+        Calculate comprehensive statistics - OPTIMIZED with numpy
+
+        FIXED: Sortino ratio now correctly handles portfolios with no downside risk
+        """
+        # FIXED: Sortino ratio calculation
+        # Sortino measures return relative to DOWNSIDE volatility
         downside_mask = cagr < 0
         downside_returns = cagr[downside_mask]
 
         sortino_ratio = 0
         if len(downside_returns) > 0:
+            # Has some negative returns - calculate normally
             downside_std = np.std(downside_returns)
             if downside_std > 0:
                 sortino_ratio = np.mean(cagr) / downside_std
+        else:
+            # NO negative returns - Sortino should be very high!
+            # Cap at a reasonable maximum (e.g., 10) to avoid infinity
+            # This indicates excellent downside protection
+            if np.mean(cagr) > 0:
+                sortino_ratio = 10.0  # Maximum Sortino (perfect downside protection)
+            else:
+                sortino_ratio = 0  # Zero return with no downside = 0
 
         # OPTIMIZED: All numpy operations, no Python loops
         return {
@@ -195,7 +206,8 @@ class PortfolioSimulator:
             'probability_loss': np.mean(final_values < self.initial_capital),
             'probability_double': np.mean(final_values >= 2 * self.initial_capital),
             'sharpe_ratio': np.mean(cagr) / np.std(cagr) if np.std(cagr) > 0 else 0,
-            'sortino_ratio': sortino_ratio
+            'sortino_ratio': sortino_ratio,
+            'num_negative_outcomes': int(np.sum(downside_mask))  # Debug info
         }
 
     def print_detailed_stats(self, results, label):
@@ -220,8 +232,11 @@ class PortfolioSimulator:
 
         print(f"\nRisk Metrics:")
         print(f"  Median Max Drawdown: {stats['median_max_drawdown']*100:.2f}%")
+        print(f"  Worst Max Drawdown: {stats['worst_max_drawdown']*100:.2f}%")
         print(f"  Sharpe Ratio: {stats['sharpe_ratio']:.3f}")
         print(f"  Sortino Ratio: {stats['sortino_ratio']:.3f}")
+        if stats['num_negative_outcomes'] == 0:
+            print(f"  ⚠ Note: No negative outcomes in simulation (Sortino capped at 10.0)")
 
         print(f"\nProbabilities:")
         print(f"  P(Loss): {stats['probability_loss']*100:.2f}%")
