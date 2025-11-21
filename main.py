@@ -1,9 +1,9 @@
 """
-Main script using the RunConfig system.
+Enhanced main script with improved visualizations.
 
 Usage:
-    python main.py                           # Uses config/my_portfolios.py
-    python main.py config/example_simple.py  # Uses specific config
+    python main_enhanced.py                           # Uses config/my_portfolios.py
+    python main_enhanced.py config/example_simple.py  # Uses specific config
 """
 
 import sys
@@ -42,13 +42,13 @@ def find_config_file(specified_path: str = None) -> Path:
 def main():
     # Parse arguments
     parser = argparse.ArgumentParser(
-        description='Monte Carlo Portfolio Simulator',
+        description='Enhanced Monte Carlo Portfolio Simulator',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python main.py                              # Use config/my_portfolios.py
-  python main.py config/example_simple.py     # Use specific config file
-  python main.py config/aggressive.py         # Use another config
+  python main_enhanced.py                              # Use config/my_portfolios.py
+  python main_enhanced.py config/example_simple.py     # Use specific config file
+  python main_enhanced.py --output custom_report.html  # Custom output filename
         """
     )
     parser.add_argument(
@@ -60,6 +60,16 @@ Examples:
         '--dry-run',
         action='store_true',
         help='Show configuration without running simulation'
+    )
+    parser.add_argument(
+        '--output',
+        default='portfolio_dashboard.html',
+        help='Output HTML filename (default: portfolio_dashboard.html)'
+    )
+    parser.add_argument(
+        '--no-browser',
+        action='store_true',
+        help='Do not open browser automatically'
     )
     args = parser.parse_args()
 
@@ -75,6 +85,14 @@ Examples:
         print("  1. Imports from run_config: from run_config import RunConfig, ...")
         print("  2. Defines a variable: config = RunConfig(...)")
         return 1
+
+    # Override output filename if specified
+    if args.output:
+        config.visualization.output_filename = args.output
+
+    # Override browser setting if specified
+    if args.no_browser:
+        config.visualization.show_browser = False
 
     # Show configuration summary
     print("\n" + "="*60)
@@ -211,18 +229,25 @@ Examples:
             print(f"Sortino Ratio: {stats['sortino_ratio']:.3f}")
             print(f"Max Drawdown: {stats['median_max_drawdown']*100:.2f}%")
 
-    # Create visualizations
+    # Create enhanced visualizations
     print("\n" + "="*60)
-    print("Generating Visualizations")
+    print("Generating Enhanced Visualizations")
     print("="*60)
 
     dashboard = visualizer.create_dashboard(portfolio_results)
 
     if config.visualization.save_html:
         dashboard.write_html(config.visualization.output_filename)
-        print(f"✓ Saved dashboard to: {config.visualization.output_filename}")
+        print(f"✓ Saved enhanced dashboard to: {config.visualization.output_filename}")
+        print(f"\n📊 Dashboard Features:")
+        print(f"  • Overview tab: 12 interactive charts")
+        print(f"  • Statistics tab: Detailed performance metrics")
+        print(f"  • Risk Analysis tab: Comprehensive risk evaluation")
+        print(f"  • All charts linked: Click legend to show/hide portfolios")
+        print(f"  • Hover for details on any data point")
 
     if config.visualization.show_browser:
+        print(f"\n🌐 Opening dashboard in browser...")
         dashboard.show()
 
     # Database info
@@ -250,6 +275,7 @@ Examples:
     # Clean up
     data_manager.close()
     print("\n✓ Analysis complete!")
+    print(f"\n📄 View your results: {config.visualization.output_filename}")
     return 0
 
 if __name__ == "__main__":
