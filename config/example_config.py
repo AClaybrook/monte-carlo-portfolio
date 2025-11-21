@@ -1,95 +1,81 @@
 """
-Simple example configuration - good starting point.
+Example configuration for enhanced dashboard testing.
 
-Assets are automatically discovered from your portfolio allocations!
-Copy this file to config/my_portfolios.py and customize it.
+This config demonstrates comparing multiple portfolio strategies:
+- Conservative (heavy bonds)
+- Balanced (60/40)
+- Aggressive (heavy stocks)
+- All stocks
 """
 
-from run_config import RunConfig, PortfolioConfig, SimulationConfig, OptimizationConfig, VisualizationConfig, DatabaseConfig
-
-config = RunConfig(
-    name="Simple 3-Fund Portfolio Analysis",
-
-    # Just define your portfolios - assets are discovered automatically!
-    portfolios=[
-        # Conservative: More bonds
-        PortfolioConfig(
-            name='SP500',
-            allocations={
-                'VOO': 1.0,  # S&P 500
-            },
-            description='100% S&P 500 (VOO)'
-        ),
-
-        # Balanced: Mix of everything
-        PortfolioConfig(
-            name='Balanced',
-            allocations={
-                'VOO': 0.80,
-                'BND': 0.20
-            },
-            description='80% stocks, 20% bonds'
-        ),
-
-        # Aggressive: All stocks
-        PortfolioConfig(
-            name='Aggressive 100% Stocks',
-            allocations={
-                'VOO': 0.60,
-                'QQQ': 0.40
-            },
-            description='100% stocks, no bonds'
-        ),
-
-        PortfolioConfig(
-            name='Tech Heavy 100% Stocks',
-            allocations={
-                'VOO': 0.40,
-                'VGT': 0.30,
-                'QQQ': 0.30
-            },
-            description='100% stocks, tech heavy'
-        ),
-
-        PortfolioConfig(
-            name='Leveraged Tech Heavy 100% Stocks',
-            allocations={
-                'SPXL': 0.5,
-                'TQQQ': 0.5
-            },
-            description='Leveraged 100% stocks'
-        ),
-
-    ],
-
-    # Optional: Customize simulation settings
-    simulation=SimulationConfig(
-        initial_capital=100000,  # $100k starting
-        years=10,                # 10 year horizon
-        simulations=3000,       # 10k Monte Carlo runs
-        method='bootstrap',       # Use historical data resampling
-        end_date='2025-10-14',
-        lookback_years=15,      # 10 years of historical data (if available)
-    ),
-
-    optimization=OptimizationConfig(
-        assets=['VOO', 'QQQ', 'BND', 'TQQQ', 'VCR', 'ARKK', 'VGT'],
-        method='grid_search',    # Grid search over allocations
-        grid_points=6,          # points per asset (coarse)
-        top_n=5,                # Show top 5 results
-        objective_weights={      # Weights for custom objective function
-            'return': 0.5,       # Maximize return
-            'sharpe': 0.25,     # Maximize Sharpe ratio
-            'sortino': 0.25,    # Maximize Sortino ratio
-            'worst_max_drawdown': 0.0,        # Minimize drawdown
-        }
-    ),
-
-    visualization=VisualizationConfig(
-        save_html=True,  # Save dashboard to HTML file
-        show_browser=True,  # Open in web browser automatically
-        output_filename='portfolio_dashboard.html'  # Output file name
-    ),
+from run_config import (
+    RunConfig,
+    AssetConfig,
+    PortfolioConfig,
+    SimulationConfig,
+    OptimizationConfig
 )
 
+config = RunConfig(
+    name="Portfolio Strategy Comparison",
 
+    # Define portfolios to compare
+    portfolios=[
+        PortfolioConfig(
+            name='Conservative (40/60)',
+            allocations={'VOO': 0.40, 'BND': 0.60},
+            description='Low risk, stable returns'
+        ),
+        PortfolioConfig(
+            name='Balanced (60/40)',
+            allocations={'VOO': 0.60, 'BND': 0.40},
+            description='Classic balanced allocation'
+        ),
+        PortfolioConfig(
+            name='Aggressive (80/20)',
+            allocations={'VOO': 0.80, 'BND': 0.20},
+            description='Higher risk, higher potential returns'
+        ),
+        PortfolioConfig(
+            name='All Stocks (100/0)',
+            allocations={'VOO': 1.00},
+            description='Maximum growth potential'
+        ),
+    ],
+
+    # Optional: Customize asset settings if needed
+    assets={
+        'VOO': AssetConfig(
+            ticker='VOO',
+            name='Vanguard S&P 500 ETF',
+            lookback_years=10
+        ),
+        'BND': AssetConfig(
+            ticker='BND',
+            name='Vanguard Total Bond Market ETF',
+            lookback_years=10
+        ),
+    },
+
+    # Simulation settings
+    simulation=SimulationConfig(
+        initial_capital=100000,
+        years=10,
+        simulations=10000,
+        method='bootstrap',  # Use historical resampling
+        lookback_years=10
+    ),
+
+    # Optional: Enable optimization to find best allocation
+    optimization=OptimizationConfig(
+        assets=['VOO', 'BND'],
+        method='grid_search',
+        objective_weights={
+            'return': 0.40,     # 40% weight on returns
+            'sharpe': 0.30,     # 30% weight on risk-adjusted returns
+            'drawdown': 0.30    # 30% weight on limiting losses
+        },
+        grid_points=11,  # Test 0%, 10%, 20%, ..., 100% allocations
+        top_n=5
+    )
+)
