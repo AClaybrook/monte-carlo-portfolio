@@ -144,6 +144,74 @@ class PortfolioOptimizer:
 
         return self._minimize(risk_parity_objective, assets, args=(cov_mat,), label="Risk Parity")
 
+    def optimize_custom_weighted(self, assets, weights_config, risk_free_rate=0.04, start_date_override=None):
+        """
+        Optimize based on a user-defined weighted sum of metrics.
+        Minimizes: sum(weight * metric_penalty)
+        """
+        returns, mean_rets, cov_mat = self._get_data(assets, start_date_override=start_date_override)
+        if returns is None: return self._package_fail(assets, "Custom Objective", "No Data")
+
+        # Normalize weights to ensure they sum to 1 (optional, but good practice)
+        total_w = sum(weights_config.values())
+        obj_weights = {k: v/total_w for k, v in weights_config.items()}
+
+        def custom_objective(w, returns, mean_rets, cov_mat, rf, obj_weights):
+            # 1. Calculate Portfolio Metrics
+            # Annualized Return
+            p_ret = np.sum(mean_rets * w) * 252
+
+            # Volatility
+            p_vol = np.sqrt(np.dot(w.T, np.dot(cov_mat, w))) * np.sqrt(252)
+
+            # Sharpe
+            p_sharpe = (p_ret - rf) / p_vol if p_vol > 0 else 0
+
+            score = 0.0
+
+            # 2. Add Weighted Penalties (We minimize the score)
+
+            # Maximize Return -> Minimize Negative Return
+            if 'return' in obj_weights:
+                score += obj_weights['return'] * (-p_ret)
+
+            # Maximize Sharpe -> Minimize Negative Sharpe
+            if 'sharpe' in obj_weights:
+                score += obj_weights['sharpe'] * (-p_sharpe)
+
+            # Minimize Volatility -> Add Volatility
+            if 'volatility' in obj_weights:
+                score += obj_weights['volatility'] * p_vol
+
+            # Minimize Drawdown (Computationally expensive, but included per request)
+            if 'drawdown' in obj_weights or 'sortino' in obj_weights:
+                # Generate series
+                p_daily = returns.dot(w)
+
+                if 'drawdown' in obj_weights:
+                    # Quick approximate Max DD calculation
+                    cum_ret = np.cumsum(p_daily)
+                    running_max = np.maximum.accumulate(cum_ret)
+                    # We use log returns approximation or simple cumulative for speed in optimizer
+                    # Let's use simple cumulative sum as proxy for price for speed
+                    dd = np.max(running_max - cum_ret)
+                    score += obj_weights['drawdown'] * dd
+
+                if 'sortino' in obj_weights:
+                    downside = p_daily[p_daily < 0]
+                    downside_std = np.std(downside) * np.sqrt(252)
+                    sortino = (p_ret - rf) / downside_std if downside_std > 0 else 0
+                    score += obj_weights['sortino'] * (-sortino)
+
+            return score
+
+        return self._minimize(
+            custom_objective,
+            assets,
+            args=(returns, mean_rets, cov_mat, risk_free_rate, obj_weights),
+            label="Custom Weighted"
+        )
+
     def _package_result(self, scipy_result, assets, label):
         """Package results and run a final simulation check"""
         allocations = scipy_result.x / np.sum(scipy_result.x)

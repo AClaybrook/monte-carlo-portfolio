@@ -57,23 +57,31 @@ config = RunConfig(
     simulation=SimulationConfig(
         initial_capital=10000,
         years=30,
-        simulations=3000,
+        simulations=5000,
         method='bootstrap',
         lookback_years=10,
     ),
 
     optimization=OptimizationConfig(
         assets=['VOO', 'QQQ', 'BND', 'VGT', 'GLD', 'VTI', 'TLT', 'TQQQ', 'SPXL', 'TMF', 'UPRO','BTC-USD'],
-
-        # SELECT YOUR STRATEGIES HERE:
+        # 1. Active strategies
         active_strategies=[
             'max_sharpe',      # Balanced Growth
             'min_volatility',  # Defensive
             'risk_parity',     # Diversified Risk
             'max_sortino',   # Aggressive Growth (Uncomment to enable)
+            'custom_weighted'  # Custom Weighted Strategy
         ],
 
-        # Automatically adds S&P 500 Investor (VFINX) as baseline
+        # 2. Define your Custom Objective Function
+        objective_weights={
+            'return':   0.30,  # CAGR
+            'sharpe':   0.30,  # risk-adjusted return
+            'drawdown': 0.20,  # minimizing deep losses
+            'volatility': 0.10,
+            'sortino': 0.10
+        },
+
         benchmark_ticker='VFINX'
     ),
 

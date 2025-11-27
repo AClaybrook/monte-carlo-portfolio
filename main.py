@@ -122,6 +122,8 @@ def main():
             'min_volatility': optimizer.optimize_min_volatility,
             'risk_parity': optimizer.optimize_risk_parity,
             'max_sortino': optimizer.optimize_sortino_ratio,
+            # Add the new key here, but we handle the call logic below specially
+            'custom_weighted': optimizer.optimize_custom_weighted
         }
 
         for strat_name in active_strats:
@@ -130,8 +132,17 @@ def main():
                 continue
 
             print(f"Running: {strat_name}...")
-            # Execute optimization
-            strat_result = strategy_map[strat_name](opt_assets, start_date_override=global_start_date)
+
+            if strat_name == 'custom_weighted':
+                # Pass the weights from config
+                strat_result = strategy_map[strat_name](
+                    opt_assets,
+                    weights_config=config.optimization.objective_weights,
+                    start_date_override=global_start_date
+                )
+            else:
+                # Standard call
+                strat_result = strategy_map[strat_name](opt_assets, start_date_override=global_start_date)
 
             # Print allocation
             alloc_str = " / ".join([f"{int(w*100)}% {a['ticker']}" for w, a in zip(strat_result['allocations'], opt_assets)])
