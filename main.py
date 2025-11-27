@@ -1,5 +1,5 @@
 """
-Main script - Global Time Alignment & Modern Reporting.
+Main script - Configurable Strategies & Benchmarks.
 """
 
 import sys
@@ -45,48 +45,63 @@ def main():
     print("\n" + "="*60 + "\nLoading Assets & Aligning Timeframes...\n" + "="*60)
     asset_map = {}
 
-    # 1. Load ALL assets (from portfolios and optimization list)
+    # 1. Load ALL assets (portfolios + optimization + benchmark)
     all_tickers = set()
-    for p in config.portfolios:
-        all_tickers.update(p.allocations.keys())
+    for p in config.portfolios: all_tickers.update(p.allocations.keys())
+
     if config.optimization:
         all_tickers.update(config.optimization.assets)
+        # Force add Benchmark
+        bench_ticker = config.optimization.benchmark_ticker.upper()
+        all_tickers.add(bench_ticker)
 
     start_dates = []
 
     for ticker in all_tickers:
-        # Use config settings if available, otherwise default
         asset_conf = config.assets.get(ticker, None)
         name = asset_conf.name if asset_conf else ticker
 
-        # Load asset
         asset = sim.define_asset_from_ticker(ticker, name)
         asset_map[ticker.upper()] = asset
 
-        # Track start date
         if not asset['historical_returns'].empty:
             start_dates.append(asset['historical_returns'].index.min())
 
-    # 2. Determine Global Common Start Date
     if not start_dates:
         print("Error: No data found for any assets.")
         return 1
 
     global_start_date = max(start_dates)
-    print(f"✓ GLOBAL ALIGNMENT: All analysis will start from {global_start_date.date()}")
-    print(f"  (Dictated by the asset with the shortest history)")
+    global_end_date = sim.end_date
+    print(f"✓ GLOBAL ALIGNMENT: {global_start_date.date()} to {global_end_date}")
 
     portfolio_results = []
 
-    # 3. Process Defined Portfolios (With Forced Start Date)
+    # 2. Add Benchmark Portfolio
+    if config.optimization:
+        bench_ticker = config.optimization.benchmark_ticker.upper()
+        if bench_ticker in asset_map:
+            print(f"Adding Benchmark: {bench_ticker}")
+            assets = [asset_map[bench_ticker]]
+            weights = [1.0]
+
+            sim_res = sim.simulate_portfolio(assets, weights, start_date_override=global_start_date)
+            bt_res = backtester.run_backtest(assets, weights, config.simulation.initial_capital, start_date_override=global_start_date)
+
+            portfolio_results.append({
+                'label': f"Benchmark ({bench_ticker})",
+                'results': sim_res,
+                'backtest': bt_res
+            })
+
+    # 3. Process Defined Portfolios
     print("\n" + "="*60 + "\nProcessing Defined Portfolios...\n" + "="*60)
     for p_conf in config.portfolios:
         print(f"Processing {p_conf.name}...")
         assets = [asset_map[t.upper()] for t in p_conf.allocations.keys()]
         weights = list(p_conf.allocations.values())
 
-        # Pass global_start_date to force alignment
-        sim_res = sim.simulate_portfolio(assets, weights, config.simulation.method, start_date_override=global_start_date)
+        sim_res = sim.simulate_portfolio(assets, weights, start_date_override=global_start_date)
         bt_res = backtester.run_backtest(assets, weights, config.simulation.initial_capital, start_date_override=global_start_date)
 
         portfolio_results.append({
@@ -95,37 +110,57 @@ def main():
             'backtest': bt_res
         })
 
-    # 4. Optimization
+    # 4. Run Selected Optimizations
     if config.optimization:
-        print("\n" + "="*60 + "\nRunning Modern Optimization...\n" + "="*60)
+        print("\n" + "="*60 + "\nRunning Selected Optimizations...\n" + "="*60)
         opt_assets = [asset_map[name.upper()] for name in config.optimization.assets]
+        active_strats = config.optimization.active_strategies
 
-        # Run Optimizers
-        strategies = [
-            optimizer.optimize_sharpe_ratio(opt_assets, start_date_override=global_start_date),
-            optimizer.optimize_min_volatility(opt_assets, start_date_override=global_start_date),
-            optimizer.optimize_risk_parity(opt_assets, start_date_override=global_start_date),
-            optimizer.optimize_sortino_ratio(opt_assets, start_date_override=global_start_date)
-        ]
+        # Dispatcher for strategies
+        strategy_map = {
+            'max_sharpe': optimizer.optimize_sharpe_ratio,
+            'min_volatility': optimizer.optimize_min_volatility,
+            'risk_parity': optimizer.optimize_risk_parity,
+            'max_sortino': optimizer.optimize_sortino_ratio,
+        }
 
-        for strat in strategies:
-            print(f"Optimization Found: {strat['label']}")
-            alloc_str = " / ".join([f"{int(w*100)}% {a['ticker']}" for w, a in zip(strat['allocations'], opt_assets)])
-            print(f"  Allocation: {alloc_str}")
+        for strat_name in active_strats:
+            if strat_name not in strategy_map:
+                print(f"⚠ Unknown strategy: {strat_name}")
+                continue
 
-            # Backtest the optimized result
-            bt_res = backtester.run_backtest(opt_assets, strat['allocations'], config.simulation.initial_capital, start_date_override=global_start_date)
+            print(f"Running: {strat_name}...")
+            # Execute optimization
+            strat_result = strategy_map[strat_name](opt_assets, start_date_override=global_start_date)
+
+            # Print allocation
+            alloc_str = " / ".join([f"{int(w*100)}% {a['ticker']}" for w, a in zip(strat_result['allocations'], opt_assets)])
+            print(f"  Result: {alloc_str}")
+
+            # Run Backtest
+            bt_res = backtester.run_backtest(opt_assets, strat_result['allocations'], config.simulation.initial_capital, start_date_override=global_start_date)
 
             portfolio_results.append({
-                'label': strat['label'],
-                'results': strat['results'],
+                'label': strat_result['label'],
+                'results': strat_result['results'],
                 'backtest': bt_res
             })
 
-    # 5. Generate Report
-    print("\n" + "="*60 + "\nGenerating Collapsible HTML Report...\n" + "="*60)
-    visualizer.generate_html_report(portfolio_results, config.visualization.output_filename)
-    print(f"✓ Report saved to: {config.visualization.output_filename}")
+    # 5. Generate Report with Dates
+    print("\n" + "="*60 + "\nGenerating Report...\n" + "="*60)
+    out_dir = 'output'
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    from datetime import datetime
+    output_path = Path(out_dir) / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{config.visualization.output_filename}"
+
+
+    visualizer.generate_html_report(
+        portfolio_results,
+        str(output_path),
+        start_date=global_start_date.date(),
+        end_date=global_end_date
+    )
+    print(f"✓ Report saved to: {output_path}")
 
     data_manager.close()
 

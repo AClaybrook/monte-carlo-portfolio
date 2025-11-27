@@ -140,29 +140,35 @@ class PortfolioVisualizer:
         fig.update_layout(height=1200, template='plotly_white', hovermode='x unified')
         return fig
 
-    def generate_html_report(self, portfolio_results, filename):
+    def generate_html_report(self, portfolio_results, filename, start_date=None, end_date=None):
         mc_fig = self.create_monte_carlo_plot(portfolio_results)
         bt_fig = self.create_backtest_plot(portfolio_results)
 
-        # (Table generation code matches previous implementation, omitted for brevity but included in file)
-        table_html = """
+        # Date formatting
+        date_str = ""
+        if start_date and end_date:
+            date_str = f"<p style='color: #666; margin-top: -15px;'>Analysis Period: <b>{start_date}</b> to <b>{end_date}</b></p>"
+
+        table_html = f"""
         <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 20px; background: #f9f9f9; color: #333; }
-            details { background: white; padding: 20px; margin-bottom: 15px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 1px solid #eaeaea; }
-            summary { cursor: pointer; font-weight: 600; font-size: 1.1em; padding-bottom: 5px; outline: none; list-style: none; }
-            summary:after { content: "+"; float: right; font-weight: bold; }
-            details[open] summary:after { content: "-"; }
-            table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 0.9em; }
-            th, td { border-bottom: 1px solid #eee; padding: 12px 8px; text-align: right; }
-            th { background-color: #f8f9fa; color: #666; font-weight: 600; text-align: center; }
-            td:first-child { text-align: left; font-weight: 600; color: #2c3e50; }
-            .pos-val { color: #27ae60; }
-            .neg-val { color: #c0392b; }
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 20px; background: #f9f9f9; color: #333; }}
+            details {{ background: white; padding: 20px; margin-bottom: 15px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 1px solid #eaeaea; }}
+            summary {{ cursor: pointer; font-weight: 600; font-size: 1.1em; padding-bottom: 5px; outline: none; list-style: none; }}
+            summary:after {{ content: "+"; float: right; font-weight: bold; }}
+            details[open] summary:after {{ content: "-"; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 0.9em; }}
+            th, td {{ border-bottom: 1px solid #eee; padding: 12px 8px; text-align: right; }}
+            th {{ background-color: #f8f9fa; color: #666; font-weight: 600; text-align: center; }}
+            td:first-child {{ text-align: left; font-weight: 600; color: #2c3e50; }}
+            .pos-val {{ color: #27ae60; }}
+            .neg-val {{ color: #c0392b; }}
         </style>
         <h1>Portfolio Analysis Report</h1>
+        {date_str}
         <details open><summary>Performance Metrics Summary</summary><table>
         <tr><th>Portfolio</th><th>Sim CAGR</th><th>Hist CAGR</th><th>Delta</th><th>Sharpe</th><th>Max DD</th><th>Best Year</th><th>Worst Year</th><th>Tracking Err</th></tr>
         """
+
         for item in portfolio_results:
             m = item['backtest']['metrics']
             sim_cagr = item['results']['stats']['median_cagr']

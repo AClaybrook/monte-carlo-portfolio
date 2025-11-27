@@ -1,28 +1,26 @@
 """
-Example configuration updated for Efficient Frontier Optimization & Backtesting.
-
-Assets are automatically discovered from your portfolio allocations!
-Copy this file to config/my_portfolios.py and customize it.
+Example configuration - Selectable Optimizations & Benchmark.
 """
 
 from run_config import RunConfig, PortfolioConfig, SimulationConfig, OptimizationConfig, VisualizationConfig
 
 config = RunConfig(
-    name="Long-Term 30 Year Analysis",
+    name="Strategic Portfolio Analysis",
 
-    # Define your manual portfolios to test
     portfolios=[
-        # Conservative
         PortfolioConfig(
             name='60/40 Classic',
-            allocations={
-                'VOO': 0.60,
-                'BND': 0.40
-            },
-            description='Standard 60/40 Stocks/Bonds'
+            allocations={'VOO': 0.60, 'BND': 0.40},
+            description='Classic 60/40 Stock/Bond Portfolio'
         ),
-
-        # Growth
+        PortfolioConfig(
+            name='Hedgefundie Adventure',
+            allocations={
+                'UPRO': 0.6,
+                'TMF': 0.4
+            },
+            description='Leveraged Risk Parity'
+        ),
         PortfolioConfig(
             name='Aggressive Growth',
             allocations={
@@ -32,48 +30,54 @@ config = RunConfig(
             },
             description='Tech heavy growth'
         ),
-
-        # Hedgefundie / Leverage
         PortfolioConfig(
-            name='Hedgefundie Adventure',
+            name='Aggressive + Crypto ',
             allocations={
-                'UPRO': 0.55,
-                'TMF': 0.45
+                'VOO': 0.40,
+                'QQQ': 0.25,
+                'VGT': 0.25,
+                'BTC-USD': 0.10
             },
-            description='Leveraged Risk Parity'
+            description='Tech heavy growth + Crypto'
         ),
+        PortfolioConfig(
+            name='Leveraged Tech Heavy 100% Stocks',
+            allocations={
+                'SPXL': 0.5,
+                'TQQQ': 0.5
+            },
+            description='Leveraged 100% stocks'
+        ),
+        PortfolioConfig(
+            name='All Weather',
+            allocations={'VTI': 0.30, 'TLT': 0.40, 'IEF': 0.15, 'GLD': 0.075, 'DBC': 0.075}
+        )
     ],
 
-    # Simulation Settings
     simulation=SimulationConfig(
         initial_capital=10000,
-        years=30,                 # UPDATED: 30 Year Horizon
-        simulations=5000,         # 5,000 runs is usually sufficient for Cholesky method
-        method='bootstrap',       # 'bootstrap' preserves historical correlations best
-        lookback_years=20,        # Use up to 20 years of history if available
+        years=30,
+        simulations=3000,
+        method='bootstrap',
+        lookback_years=10,
     ),
 
-    # Optimization Settings
-    # Note: The system now uses SciPy (SLSQP) to find the Efficient Frontier mathematically.
-    # It will automatically calculate:
-    # 1. Maximum Sharpe Ratio Portfolio
-    # 2. Minimum Volatility Portfolio
     optimization=OptimizationConfig(
-        assets=['VOO', 'QQQ', 'BND', 'VGT', 'GLD', 'VTI'],
-        # The parameters below are kept for config validation but
-        # the new engine uses mathematical optimization (Efficient Frontier)
-        # rather than random grid search.
-        method='grid_search',
-        objective_weights={
-            'return': 0.5,
-            'sharpe': 0.5,
-            'drawdown': 0.0,
-        }
+        assets=['VOO', 'QQQ', 'BND', 'VGT', 'GLD', 'VTI', 'TLT', 'TQQQ', 'SPXL', 'TMF', 'UPRO','BTC-USD'],
+
+        # SELECT YOUR STRATEGIES HERE:
+        active_strategies=[
+            'max_sharpe',      # Balanced Growth
+            'min_volatility',  # Defensive
+            'risk_parity',     # Diversified Risk
+            'max_sortino',   # Aggressive Growth (Uncomment to enable)
+        ],
+
+        # Automatically adds S&P 500 Investor (VFINX) as baseline
+        benchmark_ticker='VFINX'
     ),
 
     visualization=VisualizationConfig(
-        save_html=True,
-        show_browser=True,
-        output_filename='portfolio_analysis_30yr.html'
+        output_filename='portfolio_analysis.html'
     ),
 )

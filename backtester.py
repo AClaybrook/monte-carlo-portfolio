@@ -1,6 +1,6 @@
 """
 Historical Backtester with Rolling Metrics.
-FIXED: Uses full available history from asset objects instead of re-fetching default 10y.
+FIXED: Correct order of operations for start_date_override.
 """
 import pandas as pd
 import numpy as np
@@ -10,19 +10,21 @@ class Backtester:
         self.data_manager = data_manager
 
     def run_backtest(self, assets, allocations, initial_capital=10000, benchmark_ticker=None, start_date_override=None):
-        # ... inside loop ...
-        if start_date_override:
-            s = s[s.index >= start_date_override]
-        # 1. Align Data (Use full_data from assets to ensure max history)
+        # 1. Align Data
         dfs = []
         for asset in assets:
+            # --- Step A: Define 's' (Get Data) ---
             # Use the already loaded full_data if available, otherwise fetch
             if 'full_data' in asset and not asset['full_data'].empty:
                 s = asset['full_data']['Adj Close']
             else:
-                # Fallback (should not happen usually)
+                # Fallback
                 df = self.data_manager.get_data(asset['ticker'])
                 s = df['Adj Close']
+
+            # --- Step B: Filter 's' (NOW it is safe to use) ---
+            if start_date_override:
+                s = s[s.index >= start_date_override]
 
             s.name = asset['ticker']
             dfs.append(s)
@@ -41,16 +43,19 @@ class Backtester:
         drawdown_series = (portfolio_value - running_max) / running_max
 
         # 4. Rolling Returns (Annualized)
+        # 3 Years = 756 trading days
         roll_3y = cumulative_growth.rolling(window=756).apply(
             lambda x: (x.iloc[-1] / x.iloc[0]) ** (1/3) - 1 if x.iloc[0] > 0 else 0
         )
 
+        # 5 Years = 1260 trading days
         roll_5y = cumulative_growth.rolling(window=1260).apply(
             lambda x: (x.iloc[-1] / x.iloc[0]) ** (1/5) - 1 if x.iloc[0] > 0 else 0
         )
 
         # 5. Benchmark & Metrics
         if benchmark_ticker is None: benchmark_ticker = assets[0]['ticker']
+
         # Handle benchmark alignment
         if benchmark_ticker in returns.columns:
             bench_rets = returns[benchmark_ticker]
