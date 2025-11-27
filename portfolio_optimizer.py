@@ -1,6 +1,6 @@
 """
 Portfolio optimization using SciPy with Enhanced Methods (Risk Parity, Sortino).
-FIXED: Robust handling of NaNs and Infinite values.
+FIXED: Robust handling of NaNs/Infinites AND Consistent Timeframe Alignment.
 """
 import numpy as np
 import scipy.optimize as sco
@@ -11,10 +11,14 @@ class PortfolioOptimizer:
         self.simulator = simulator
         self.data_manager = data_manager
 
-    def _get_data(self, assets):
-        """Helper to get aligned covariance and returns with strict cleaning"""
+    def _get_data(self, assets, start_date_override=None):
+        """
+        Helper to get aligned covariance and returns with strict cleaning.
+        UPDATED: Accepts start_date_override to align optimization timeframe.
+        """
         try:
-            df = self.simulator._prepare_multivariate_data(assets)
+            # Pass the override down to the simulator's data preparer
+            df = self.simulator._prepare_multivariate_data(assets, start_date_override=start_date_override)
         except ValueError as e:
             print(f"Optimization Skipped: {e}")
             return None, None, None
@@ -83,8 +87,9 @@ class PortfolioOptimizer:
         }
 
     # --- Optimizers ---
+
     def optimize_sharpe_ratio(self, assets, risk_free_rate=0.04, start_date_override=None):
-        # UPDATED: Pass the override date to the data fetcher
+        """Maximize Sharpe Ratio"""
         returns, mean_rets, cov_mat = self._get_data(assets, start_date_override=start_date_override)
 
         if returns is None: return self._package_fail(assets, "Max Sharpe", "No Data")
@@ -97,8 +102,10 @@ class PortfolioOptimizer:
 
         return self._minimize(neg_sharpe, assets, args=(mean_rets, cov_mat, risk_free_rate), label="Max Sharpe Ratio")
 
-    def optimize_min_volatility(self, assets):
-        returns, mean_rets, cov_mat = self._get_data(assets)
+    def optimize_min_volatility(self, assets, start_date_override=None):
+        """Minimize Volatility"""
+        returns, mean_rets, cov_mat = self._get_data(assets, start_date_override=start_date_override)
+
         if returns is None: return self._package_fail(assets, "Min Volatility", "No Data")
 
         def port_vol(weights, cov_mat):
@@ -106,8 +113,10 @@ class PortfolioOptimizer:
 
         return self._minimize(port_vol, assets, args=(cov_mat,), label="Min Volatility")
 
-    def optimize_sortino_ratio(self, assets, risk_free_rate=0.04):
-        returns, mean_rets, cov_mat = self._get_data(assets)
+    def optimize_sortino_ratio(self, assets, risk_free_rate=0.04, start_date_override=None):
+        """Maximize Sortino Ratio"""
+        returns, mean_rets, cov_mat = self._get_data(assets, start_date_override=start_date_override)
+
         if returns is None: return self._package_fail(assets, "Max Sortino", "No Data")
 
         def neg_sortino(weights, returns, rf):
@@ -120,12 +129,15 @@ class PortfolioOptimizer:
 
         return self._minimize(neg_sortino, assets, args=(returns, risk_free_rate), label="Max Sortino (Growth)")
 
-    def optimize_risk_parity(self, assets):
-        returns, mean_rets, cov_mat = self._get_data(assets)
+    def optimize_risk_parity(self, assets, start_date_override=None):
+        """Equal Risk Contribution"""
+        returns, mean_rets, cov_mat = self._get_data(assets, start_date_override=start_date_override)
+
         if returns is None: return self._package_fail(assets, "Risk Parity", "No Data")
 
         def risk_parity_objective(weights, cov_mat):
             portfolio_volatility = np.sqrt(np.dot(weights.T, np.dot(cov_mat, weights)))
+            # Marginal Risk Contribution
             mrc = weights * np.dot(cov_mat, weights) / portfolio_volatility
             target_risk = portfolio_volatility / len(weights)
             return np.sum(np.square(mrc - target_risk))
@@ -133,7 +145,10 @@ class PortfolioOptimizer:
         return self._minimize(risk_parity_objective, assets, args=(cov_mat,), label="Risk Parity")
 
     def _package_result(self, scipy_result, assets, label):
+        """Package results and run a final simulation check"""
         allocations = scipy_result.x / np.sum(scipy_result.x)
+        # Note: We do NOT pass start_date_override here because the main loop
+        # will run its own verification simulation/backtest with the correct date.
         sim_results = self.simulator.simulate_portfolio(assets, allocations)
         return {
             'label': label, 'score': 0, 'allocations': allocations,
