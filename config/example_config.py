@@ -1,81 +1,79 @@
 """
-Example configuration for enhanced dashboard testing.
+Example configuration updated for Efficient Frontier Optimization & Backtesting.
 
-This config demonstrates comparing multiple portfolio strategies:
-- Conservative (heavy bonds)
-- Balanced (60/40)
-- Aggressive (heavy stocks)
-- All stocks
+Assets are automatically discovered from your portfolio allocations!
+Copy this file to config/my_portfolios.py and customize it.
 """
 
-from run_config import (
-    RunConfig,
-    AssetConfig,
-    PortfolioConfig,
-    SimulationConfig,
-    OptimizationConfig
-)
+from run_config import RunConfig, PortfolioConfig, SimulationConfig, OptimizationConfig, VisualizationConfig
 
 config = RunConfig(
-    name="Portfolio Strategy Comparison",
+    name="Long-Term 30 Year Analysis",
 
-    # Define portfolios to compare
+    # Define your manual portfolios to test
     portfolios=[
+        # Conservative
         PortfolioConfig(
-            name='Conservative (40/60)',
-            allocations={'VOO': 0.40, 'BND': 0.60},
-            description='Low risk, stable returns'
+            name='60/40 Classic',
+            allocations={
+                'VOO': 0.60,
+                'BND': 0.40
+            },
+            description='Standard 60/40 Stocks/Bonds'
         ),
+
+        # Growth
         PortfolioConfig(
-            name='Balanced (60/40)',
-            allocations={'VOO': 0.60, 'BND': 0.40},
-            description='Classic balanced allocation'
+            name='Aggressive Growth',
+            allocations={
+                'VOO': 0.40,
+                'QQQ': 0.40,
+                'VGT': 0.20
+            },
+            description='Tech heavy growth'
         ),
+
+        # Hedgefundie / Leverage
         PortfolioConfig(
-            name='Aggressive (80/20)',
-            allocations={'VOO': 0.80, 'BND': 0.20},
-            description='Higher risk, higher potential returns'
-        ),
-        PortfolioConfig(
-            name='All Stocks (100/0)',
-            allocations={'VOO': 1.00},
-            description='Maximum growth potential'
+            name='Hedgefundie Adventure',
+            allocations={
+                'UPRO': 0.55,
+                'TMF': 0.45
+            },
+            description='Leveraged Risk Parity'
         ),
     ],
 
-    # Optional: Customize asset settings if needed
-    assets={
-        'VOO': AssetConfig(
-            ticker='VOO',
-            name='Vanguard S&P 500 ETF',
-            lookback_years=10
-        ),
-        'BND': AssetConfig(
-            ticker='BND',
-            name='Vanguard Total Bond Market ETF',
-            lookback_years=10
-        ),
-    },
-
-    # Simulation settings
+    # Simulation Settings
     simulation=SimulationConfig(
-        initial_capital=100000,
-        years=10,
-        simulations=10000,
-        method='bootstrap',  # Use historical resampling
-        lookback_years=10
+        initial_capital=10000,
+        years=30,                 # UPDATED: 30 Year Horizon
+        simulations=5000,         # 5,000 runs is usually sufficient for Cholesky method
+        method='bootstrap',       # 'bootstrap' preserves historical correlations best
+        lookback_years=20,        # Use up to 20 years of history if available
     ),
 
-    # Optional: Enable optimization to find best allocation
+    # Optimization Settings
+    # Note: The system now uses SciPy (SLSQP) to find the Efficient Frontier mathematically.
+    # It will automatically calculate:
+    # 1. Maximum Sharpe Ratio Portfolio
+    # 2. Minimum Volatility Portfolio
     optimization=OptimizationConfig(
-        assets=['VOO', 'BND'],
+        assets=['VOO', 'QQQ', 'BND', 'VGT', 'GLD', 'VTI'],
+        # The parameters below are kept for config validation but
+        # the new engine uses mathematical optimization (Efficient Frontier)
+        # rather than random grid search.
         method='grid_search',
         objective_weights={
-            'return': 0.40,     # 40% weight on returns
-            'sharpe': 0.30,     # 30% weight on risk-adjusted returns
-            'drawdown': 0.30    # 30% weight on limiting losses
-        },
-        grid_points=11,  # Test 0%, 10%, 20%, ..., 100% allocations
-        top_n=5
-    )
+            'return': 0.5,
+            'sharpe': 0.5,
+            'drawdown': 0.0,
+        }
+    ),
+
+    visualization=VisualizationConfig(
+        save_html=True,
+        show_browser=True,
+        output_filename='portfolio_analysis_30yr.html'
+    ),
 )
