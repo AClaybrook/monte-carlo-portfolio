@@ -32,6 +32,60 @@ class PortfolioVisualizer:
         except:
             return [], []
 
+    def create_allocation_plot(self, portfolio_results):
+        """
+        NEW: Creates a stacked bar chart showing the asset allocation for each portfolio.
+        """
+        # 1. Collect Data: Map ticker -> { portfolio_label: weight }
+        asset_weights = {}
+        all_portfolios = []
+
+        for item in portfolio_results:
+            label = item['label']
+            all_portfolios.append(label)
+
+            res = item['results']
+            allocations = res['allocations']
+            assets = res['assets']
+
+            # Pair assets with their weights
+            for asset, weight in zip(assets, allocations):
+                ticker = asset['ticker']
+                if ticker not in asset_weights:
+                    asset_weights[ticker] = {}
+                asset_weights[ticker][label] = weight
+
+        # 2. Create Traces (One per Asset)
+        data = []
+        sorted_tickers = sorted(asset_weights.keys())
+
+        for ticker in sorted_tickers:
+            weights = []
+            for p_label in all_portfolios:
+                # Get weight, default to 0 if asset not in this portfolio
+                weights.append(asset_weights[ticker].get(p_label, 0.0))
+
+            data.append(go.Bar(
+                name=ticker,
+                x=all_portfolios,
+                y=weights,
+                hovertemplate=f"<b>{ticker}</b><br>Weight: %{{y:.1%}}<extra></extra>"
+            ))
+
+        # 3. Create Figure
+        fig = go.Figure(data=data)
+        fig.update_layout(
+            barmode='stack',
+            title_text="",
+            yaxis=dict(title="Weight", tickformat=".0%"),
+            template='plotly_white',
+            height=500,
+            hovermode='x unified',
+            legend_title_text='Assets'
+        )
+
+        return fig
+
     def create_monte_carlo_plot(self, portfolio_results):
         """
         Updated with Financial Formatting and Probability over Time.
@@ -143,6 +197,7 @@ class PortfolioVisualizer:
     def generate_html_report(self, portfolio_results, filename, start_date=None, end_date=None):
         mc_fig = self.create_monte_carlo_plot(portfolio_results)
         bt_fig = self.create_backtest_plot(portfolio_results)
+        alloc_fig = self.create_allocation_plot(portfolio_results) # <--- Generate Allocation Plot
 
         # Date formatting
         date_str = ""
@@ -178,7 +233,12 @@ class PortfolioVisualizer:
             table_html += f"<tr><td>{item['label']}</td><td>{sim_cagr*100:.2f}%</td><td>{hist_cagr*100:.2f}%</td><td class='{delta_class}'>{delta*100:+.2f}%</td><td>{m['Sharpe']:.2f}</td><td class='neg-val'>{m['Max Drawdown']*100:.2f}%</td><td class='pos-val'>{m['Best Year']*100:.2f}%</td><td class='neg-val'>{m['Worst Year']*100:.2f}%</td><td>{m['Tracking Error']*100:.2f}%</td></tr>"
 
         table_html += "</table></details>"
-        html_content = f"{table_html}<details open><summary>Historical Backtest</summary>{pio.to_html(bt_fig, full_html=False, include_plotlyjs='cdn')}</details><details open><summary>Monte Carlo Simulation</summary>{pio.to_html(mc_fig, full_html=False, include_plotlyjs=False)}</details>"
+
+        # ADD ALLOCATION SECTION HERE
+        html_content = f"{table_html}" \
+                       f"<details open><summary>Asset Allocation</summary>{pio.to_html(alloc_fig, full_html=False, include_plotlyjs=False)}</details>" \
+                       f"<details open><summary>Historical Backtest</summary>{pio.to_html(bt_fig, full_html=False, include_plotlyjs='cdn')}</details>" \
+                       f"<details open><summary>Monte Carlo Simulation</summary>{pio.to_html(mc_fig, full_html=False, include_plotlyjs=False)}</details>"
 
         with open(filename, 'w', encoding='utf-8') as f:
             f.write(html_content)
