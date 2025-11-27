@@ -1,6 +1,6 @@
 """
 Portfolio optimization using SciPy with Enhanced Methods (Risk Parity, Sortino).
-FIXED: Handled NaNs and insufficient data.
+FIXED: Robust handling of NaNs and Infinite values.
 """
 import numpy as np
 import scipy.optimize as sco
@@ -12,23 +12,29 @@ class PortfolioOptimizer:
         self.data_manager = data_manager
 
     def _get_data(self, assets):
-        """Helper to get aligned covariance and returns"""
+        """Helper to get aligned covariance and returns with strict cleaning"""
         try:
             df = self.simulator._prepare_multivariate_data(assets)
         except ValueError as e:
             print(f"Optimization Skipped: {e}")
             return None, None, None
 
-        # Calculate returns
-        returns = df.pct_change().dropna()
+        # 1. Forward Fill to handle missing days (e.g. holidays differ)
+        df = df.ffill()
 
-        # CLEAN DATA CHECK
+        # 2. Calculate Returns
+        returns = df.pct_change()
+
+        # 3. CLEANING: Replace Infinites (divide by zero) and Drop NaNs
+        returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
+
+        # 4. Check for Empty or Bad Data
         if len(returns) < 50:
-            print(f"Optimization Skipped: Insufficient data points ({len(returns)}) after alignment.")
+            print(f"Optimization Skipped: Insufficient data points ({len(returns)}) after cleaning.")
             return None, None, None
 
         if not np.isfinite(returns.values).all():
-             print(f"Optimization Skipped: Data contains NaNs or Infinite values.")
+             print(f"Optimization Skipped: Data still contains NaNs or Infinite values after cleaning.")
              return None, None, None
 
         return returns, returns.mean(), returns.cov()
@@ -45,7 +51,6 @@ class PortfolioOptimizer:
 
         initial_guess = np.array(num_assets * [1. / num_assets,])
 
-        # Try finding a solution
         try:
             result = sco.minimize(fun, initial_guess, args=args, method='SLSQP', bounds=bounds, constraints=constraints)
 
@@ -78,9 +83,10 @@ class PortfolioOptimizer:
         }
 
     # --- Optimizers ---
+    def optimize_sharpe_ratio(self, assets, risk_free_rate=0.04, start_date_override=None):
+        # UPDATED: Pass the override date to the data fetcher
+        returns, mean_rets, cov_mat = self._get_data(assets, start_date_override=start_date_override)
 
-    def optimize_sharpe_ratio(self, assets, risk_free_rate=0.04):
-        returns, mean_rets, cov_mat = self._get_data(assets)
         if returns is None: return self._package_fail(assets, "Max Sharpe", "No Data")
 
         def neg_sharpe(weights, mean_rets, cov_mat, rf):

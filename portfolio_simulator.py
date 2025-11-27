@@ -1,6 +1,6 @@
 """
 Monte Carlo portfolio simulation engine.
-FIXED: Auto-trims to common start date and reports Sim vs Backtest Delta.
+FIXED: Global Time Alignment & Advanced Probability Calculations.
 """
 import numpy as np
 import pandas as pd
@@ -12,7 +12,7 @@ class PortfolioSimulator:
         self.config = sim_config
         self.initial_capital = sim_config.initial_capital
         self.simulations = sim_config.simulations
-        self.years = sim_config.years # Target years
+        self.years = sim_config.years
         self.trading_days = 252 * sim_config.years
 
         if hasattr(sim_config, 'end_date') and sim_config.end_date:
@@ -36,46 +36,34 @@ class PortfolioSimulator:
             'daily_mean': returns.mean(), 'daily_std': returns.std()
         }
 
-    def _prepare_multivariate_data(self, assets):
-        """
-        Aligns data and TRIMS to the shortest common history.
-        """
-        # 1. Identify Common Start Date
-        start_dates = [asset['historical_returns'].index.min() for asset in assets]
-        common_start = max(start_dates)
-
-        limiting_asset = assets[start_dates.index(common_start)]['ticker']
-
-        print(f"  [Timeframe] Trimming analysis to Common Start Date: {common_start.date()} (Limited by {limiting_asset})")
-
-        # 2. Slice all assets to this start date
+    def _prepare_multivariate_data(self, assets, start_date_override=None):
+        """Aligns data, optionally forcing a specific start date."""
         dfs = []
         for asset in assets:
             s = asset['historical_returns']
-            s = s[s.index >= common_start]
+            if start_date_override:
+                s = s[s.index >= start_date_override]
             s.name = asset['ticker']
             dfs.append(s)
 
         aligned_df = pd.concat(dfs, axis=1, join='inner').dropna()
 
         if len(aligned_df) < 20:
-             raise ValueError(f"Insufficient common history ({len(aligned_df)} days) starting {common_start.date()}. Cannot simulate.")
+             raise ValueError(f"Insufficient common history ({len(aligned_df)} days).")
 
         return aligned_df
 
-    def simulate_portfolio(self, assets, allocations, method=None):
+    def simulate_portfolio(self, assets, allocations, method=None, start_date_override=None):
         if method is None: method = self.config.method
 
-        # 1. Get Aligned Data
-        aligned_returns_df = self._prepare_multivariate_data(assets)
+        # 1. Get Aligned Data (With Override)
+        aligned_returns_df = self._prepare_multivariate_data(assets, start_date_override)
 
-        # 2. Run Simulation
+        # 2. Run Simulation (Standard Logic)
         n_assets = len(assets)
         weights = np.array(allocations)
 
-        # Use aligned data for parameters
         if method == 'bootstrap':
-            # Resample from the ALIGNED history
             random_indices = np.random.randint(0, len(aligned_returns_df), (self.simulations, self.trading_days))
             asset_returns = aligned_returns_df.values[random_indices].transpose(2, 0, 1)
         elif method in ['geometric_brownian', 'parametric']:
@@ -94,7 +82,6 @@ class PortfolioSimulator:
             asset_returns = drift + correlated
             if method == 'geometric_brownian': asset_returns = np.exp(asset_returns) - 1
 
-        # 3. Aggregate
         weighted_returns = asset_returns * weights.reshape(n_assets, 1, 1)
         portfolio_daily_returns = np.sum(weighted_returns, axis=0)
 
@@ -105,11 +92,47 @@ class PortfolioSimulator:
         cagr = (final_values / self.initial_capital) ** (1 / self.years) - 1
         max_drawdowns = self._calculate_max_drawdown_vectorized(portfolio_values)
 
+        # 3. Calculate Advanced Probabilities
+        probs = self._calculate_probabilities(portfolio_values)
+
         return {
             'portfolio_values': portfolio_values, 'final_values': final_values,
             'cagr': cagr, 'max_drawdowns': max_drawdowns,
             'assets': assets, 'allocations': allocations,
+            'probabilities': probs, # NEW
             'stats': self.calculate_statistics(final_values, cagr, max_drawdowns)
+        }
+
+    def _calculate_probabilities(self, portfolio_values):
+        """
+        Calculates probability of Loss and probability of >10% return
+        at every year mark (Year 1, Year 2 ... Year N).
+        """
+        years = np.arange(1, self.years + 1)
+        # Convert years to indices (approx 252 days per year)
+        indices = (years * 252).astype(int)
+        indices = np.minimum(indices, portfolio_values.shape[1] - 1)
+
+        prob_loss = []
+        prob_high_return = [] # Probability of > 10% CAGR
+
+        for year, idx in zip(years, indices):
+            values_at_year = portfolio_values[:, idx]
+
+            # 1. Probability of Loss (< Initial Capital)
+            p_loss = np.mean(values_at_year < self.initial_capital)
+            prob_loss.append(p_loss)
+
+            # 2. Probability of > 10% CAGR
+            # Value needed for 10% CAGR: Initial * (1.10)^Year
+            target_value = self.initial_capital * (1.10 ** year)
+            p_high = np.mean(values_at_year > target_value)
+            prob_high_return.append(p_high)
+
+        return {
+            'years': years,
+            'prob_loss': np.array(prob_loss),
+            'prob_high_return': np.array(prob_high_return)
         }
 
     def _calculate_max_drawdown_vectorized(self, portfolio_values):
@@ -136,7 +159,5 @@ class PortfolioSimulator:
         }
 
     def print_detailed_stats(self, results, label):
-        stats = results['stats']
-        print(f"\n--- {label} ---")
-        print(f"  Median CAGR: {stats['median_cagr']*100:.2f}%")
-        print(f"  Sharpe Ratio: {stats['sharpe_ratio']:.2f}")
+        # Stub for main calling
+        pass

@@ -1,5 +1,6 @@
 """
 Historical Backtester with Rolling Metrics.
+FIXED: Uses full available history from asset objects instead of re-fetching default 10y.
 """
 import pandas as pd
 import numpy as np
@@ -8,15 +9,25 @@ class Backtester:
     def __init__(self, data_manager):
         self.data_manager = data_manager
 
-    def run_backtest(self, assets, allocations, initial_capital=10000, benchmark_ticker=None):
-        # 1. Align Data
+    def run_backtest(self, assets, allocations, initial_capital=10000, benchmark_ticker=None, start_date_override=None):
+        # ... inside loop ...
+        if start_date_override:
+            s = s[s.index >= start_date_override]
+        # 1. Align Data (Use full_data from assets to ensure max history)
         dfs = []
         for asset in assets:
-            df = self.data_manager.get_data(asset['ticker'])
-            s = df['Adj Close']
+            # Use the already loaded full_data if available, otherwise fetch
+            if 'full_data' in asset and not asset['full_data'].empty:
+                s = asset['full_data']['Adj Close']
+            else:
+                # Fallback (should not happen usually)
+                df = self.data_manager.get_data(asset['ticker'])
+                s = df['Adj Close']
+
             s.name = asset['ticker']
             dfs.append(s)
 
+        # Join Inner to find common history
         prices = pd.concat(dfs, axis=1, join='inner').dropna()
         returns = prices.pct_change().fillna(0)
 
@@ -30,23 +41,25 @@ class Backtester:
         drawdown_series = (portfolio_value - running_max) / running_max
 
         # 4. Rolling Returns (Annualized)
-        # 3 Years = 252 * 3 = 756 trading days
         roll_3y = cumulative_growth.rolling(window=756).apply(
             lambda x: (x.iloc[-1] / x.iloc[0]) ** (1/3) - 1 if x.iloc[0] > 0 else 0
         )
 
-        # 5 Years = 252 * 5 = 1260 trading days
         roll_5y = cumulative_growth.rolling(window=1260).apply(
             lambda x: (x.iloc[-1] / x.iloc[0]) ** (1/5) - 1 if x.iloc[0] > 0 else 0
         )
 
-        # 5. Benchmark & Scalar Metrics (Standard calculations)
+        # 5. Benchmark & Metrics
         if benchmark_ticker is None: benchmark_ticker = assets[0]['ticker']
-        bench_rets = returns[benchmark_ticker] if benchmark_ticker in returns else portfolio_daily_rets
+        # Handle benchmark alignment
+        if benchmark_ticker in returns.columns:
+            bench_rets = returns[benchmark_ticker]
+        else:
+            bench_rets = portfolio_daily_rets # Fallback
 
         days = len(portfolio_value)
         years = days / 252
-        cagr = (portfolio_value.iloc[-1] / initial_capital) ** (1/years) - 1
+        cagr = (portfolio_value.iloc[-1] / initial_capital) ** (1/years) - 1 if years > 0 else 0
         ann_std = portfolio_daily_rets.std() * np.sqrt(252)
 
         active_rets = portfolio_daily_rets - bench_rets
@@ -59,9 +72,9 @@ class Backtester:
         return {
             'dates': portfolio_value.index,
             'values': portfolio_value.values,
-            'drawdowns': drawdown_series,          # NEW
-            'rolling_3y': roll_3y,                 # NEW
-            'rolling_5y': roll_5y,                 # NEW
+            'drawdowns': drawdown_series,
+            'rolling_3y': roll_3y,
+            'rolling_5y': roll_5y,
             'metrics': {
                 'Start Balance': initial_capital,
                 'End Balance': portfolio_value.iloc[-1],
