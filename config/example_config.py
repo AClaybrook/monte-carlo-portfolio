@@ -8,11 +8,11 @@ config = RunConfig(
     name="Strategic Portfolio Analysis",
 
     portfolios=[
-        PortfolioConfig(
-            name='60/40 Classic',
-            allocations={'VOO': 0.60, 'BND': 0.40},
-            description='Classic 60/40 Stock/Bond Portfolio'
-        ),
+        # PortfolioConfig(
+        #     name='60/40 Classic',
+        #     allocations={'VOO': 0.60, 'BND': 0.40},
+        #     description='Classic 60/40 Stock/Bond Portfolio'
+        # ),
         PortfolioConfig(
             name='Hedgefundie Adventure',
             allocations={
@@ -65,7 +65,7 @@ config = RunConfig(
     ),
 
     optimization=OptimizationConfig(
-        assets=['VOO', 'QQQ', 'VGT', 'VTI', 'TQQQ', 'SPXL', 'BTC-USD'], # , 'SHV'
+        assets=['VOO', 'QQQ'],
         # 1. Active strategies
         active_strategies=[
             'max_sharpe',      # Balanced Growth

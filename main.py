@@ -13,6 +13,7 @@ from portfolio_simulator import PortfolioSimulator
 from portfolio_optimizer import PortfolioOptimizer
 from visualizations import PortfolioVisualizer
 from backtester import Backtester
+from strategies import BuyTheDipStrategy
 
 def find_config_file(specified_path: str = None) -> Path:
     if specified_path:
@@ -105,19 +106,29 @@ def main():
     print("\n" + "="*60 + "\nProcessing Defined Portfolios...\n" + "="*60)
     for p_conf in config.portfolios:
         print(f"Processing {p_conf.name}...")
-        # Use .upper() to match the keys in asset_map
         assets = [asset_map[t.upper()] for t in p_conf.allocations.keys()]
         weights = list(p_conf.allocations.values())
 
-        sim_res = sim.simulate_portfolio(assets, weights, start_date_override=global_start_date)
-        bt_res = backtester.run_backtest(assets, weights, config.simulation.initial_capital, start_date_override=global_start_date)
+        # CHECK FOR CUSTOM STRATEGY
+        strategy = None
+        # Example: If portfolio name contains 'Dynamic', use the strategy
+        if "Dynamic" in p_conf.name:
+            # Find index of TQQQ or SPXL
+            target = "TQQQ"
+            try:
+                # Find which index in the 'assets' list matches TQQQ
+                idx = [a['ticker'] for a in assets].index(target)
+                print(f"  > Activated 'Buy the Dip' strategy on {target}")
+                strategy = BuyTheDipStrategy(target_ticker_index=idx, threshold=0.10, aggressive_weight=0.6)
+            except ValueError:
+                print(f"  > Warning: Target {target} not found in portfolio assets.")
 
-        portfolio_results.append({
-            'label': p_conf.name,
-            'results': sim_res,
-            'backtest': bt_res
-        })
-
+        sim_res = sim.simulate_portfolio(
+            assets,
+            weights,
+            start_date_override=global_start_date,
+            strategy=strategy  # Pass the strategy here
+        )
     # 5. Run Selected Optimizations
     if config.optimization:
         print("\n" + "="*60 + "\nRunning Selected Optimizations...\n" + "="*60)
@@ -183,3 +194,23 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    # # Just import data
+    # tickers = ['SPXL']
+
+    # data_manager = DataManager()
+    # from datetime import datetime, timedelta
+    # start_date = datetime(2009, 1, 1)
+    # start_date = start_date.date()
+    # end_date = datetime.now().date()
+    # for ticker in tickers:
+    #     print(f"Importing data for {ticker}...")
+
+    #     # request data in batches
+    #     batch_size = 365 * 1
+    #     current_start = start_date
+    #     while current_start < end_date:
+    #         current_end = min(current_start + timedelta(days=batch_size), end_date)
+    #         print(f"  Fetching data from {current_start} to {current_end}...")
+    #         data_manager.get_data(ticker, start_date=current_start, end_date=current_end)
+    #         current_start = current_end + timedelta(days=1)
