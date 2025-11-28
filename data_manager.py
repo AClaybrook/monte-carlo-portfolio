@@ -139,9 +139,11 @@ class DataManager:
             df.index = pd.DatetimeIndex([d.date() for d in df.index])
             df.index.name = 'Date'
 
-            # 2. Update Metadata (Learn the inception date)
             actual_start = df.index.min().date()
-            self._update_metadata(ticker, actual_start)
+
+            gap = (actual_start - download_start).days
+            if gap > 7:
+                self._update_metadata(ticker, actual_start)
 
             self._save_to_db(ticker, df)
             print(f"✓ Downloaded {ticker} ({len(df)} records). Start: {actual_start}")

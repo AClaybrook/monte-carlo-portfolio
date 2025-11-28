@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
 import plotly.io as pio
+import pandas as pd
 from scipy import stats
 
 class PortfolioVisualizer:
@@ -32,59 +33,68 @@ class PortfolioVisualizer:
         except:
             return [], []
 
-    def create_allocation_plot(self, portfolio_results):
+    def create_allocation_table_html(self, portfolio_results):
         """
-        NEW: Creates a stacked bar chart showing the asset allocation for each portfolio.
+        Creates a formatted HTML table showing allocations for ALL portfolios.
+        TRANSPOSED: Rows = Portfolios, Columns = Tickers.
         """
-        # 1. Collect Data: Map ticker -> { portfolio_label: weight }
-        asset_weights = {}
-        all_portfolios = []
+        # 1. Aggregate Data
+        all_tickers = set()
+        portfolio_rows = [] # List of dicts: {'Portfolio': name, 'TICKER': weight...}
 
         for item in portfolio_results:
-            label = item['label']
-            all_portfolios.append(label)
-
+            p_name = item['label']
             res = item['results']
             allocations = res['allocations']
             assets = res['assets']
 
-            # Pair assets with their weights
+            # Create a row for this portfolio
+            row_data = {'Portfolio': p_name}
+
             for asset, weight in zip(assets, allocations):
-                ticker = asset['ticker']
-                if ticker not in asset_weights:
-                    asset_weights[ticker] = {}
-                asset_weights[ticker][label] = weight
+                ticker = asset['ticker'].upper()
+                all_tickers.add(ticker)
+                row_data[ticker] = weight
 
-        # 2. Create Traces (One per Asset)
-        data = []
-        sorted_tickers = sorted(asset_weights.keys())
+            portfolio_rows.append(row_data)
 
+        # Sort tickers alphabetically for columns
+        sorted_tickers = sorted(list(all_tickers))
+
+        # 2. Construct HTML Table
+        html = '<div style="overflow-x: auto;"><table class="allocation-table">'
+
+        # Header: "Portfolio" + Ticker Names
+        html += '<thead><tr><th style="text-align:left;">Portfolio</th>'
         for ticker in sorted_tickers:
-            weights = []
-            for p_label in all_portfolios:
-                # Get weight, default to 0 if asset not in this portfolio
-                weights.append(asset_weights[ticker].get(p_label, 0.0))
+            html += f'<th>{ticker}</th>'
+        html += '</tr></thead>'
 
-            data.append(go.Bar(
-                name=ticker,
-                x=all_portfolios,
-                y=weights,
-                hovertemplate=f"<b>{ticker}</b><br>Weight: %{{y:.1%}}<extra></extra>"
-            ))
+        # Body: One row per Portfolio
+        html += '<tbody>'
+        for row_dict in portfolio_rows:
+            p_name = row_dict['Portfolio']
+            html += f'<tr><td style="font-weight:bold; text-align:left; background-color: #f8f9fa;">{p_name}</td>'
 
-        # 3. Create Figure
-        fig = go.Figure(data=data)
-        fig.update_layout(
-            barmode='stack',
-            title_text="",
-            yaxis=dict(title="Weight", tickformat=".0%"),
-            template='plotly_white',
-            height=500,
-            hovermode='x unified',
-            legend_title_text='Assets'
-        )
+            for ticker in sorted_tickers:
+                val = row_dict.get(ticker, 0.0)
 
-        return fig
+                # Format cell
+                if val > 0.001: # Show if > 0.1%
+                    display_val = f"{val*100:.1f}%"
+                    style = 'style="font-weight:500;"'
+                    # Optional: Add background color intensity based on weight?
+                    # opacity = min(val * 0.8 + 0.1, 1.0)
+                    # style = f'style="font-weight:500; background-color: rgba(33, 150, 243, {opacity}); color: black;"'
+                else:
+                    display_val = "-"
+                    style = 'style="color: #ccc;"'
+
+                html += f'<td {style}>{display_val}</td>'
+            html += '</tr>'
+        html += '</tbody></table></div>'
+
+        return html
 
     def create_monte_carlo_plot(self, portfolio_results):
         """
@@ -197,7 +207,9 @@ class PortfolioVisualizer:
     def generate_html_report(self, portfolio_results, filename, start_date=None, end_date=None):
         mc_fig = self.create_monte_carlo_plot(portfolio_results)
         bt_fig = self.create_backtest_plot(portfolio_results)
-        alloc_fig = self.create_allocation_plot(portfolio_results) # <--- Generate Allocation Plot
+
+        # Table Generation
+        allocation_table_html = self.create_allocation_table_html(portfolio_results)
 
         # Date formatting
         date_str = ""
@@ -211,10 +223,17 @@ class PortfolioVisualizer:
             summary {{ cursor: pointer; font-weight: 600; font-size: 1.1em; padding-bottom: 5px; outline: none; list-style: none; }}
             summary:after {{ content: "+"; float: right; font-weight: bold; }}
             details[open] summary:after {{ content: "-"; }}
+
+            /* General Tables */
             table {{ width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 0.9em; }}
             th, td {{ border-bottom: 1px solid #eee; padding: 12px 8px; text-align: right; }}
             th {{ background-color: #f8f9fa; color: #666; font-weight: 600; text-align: center; }}
             td:first-child {{ text-align: left; font-weight: 600; color: #2c3e50; }}
+
+            /* Allocation Table Specifics */
+            .allocation-table th {{ background-color: #e3f2fd; color: #1565c0; }}
+            .allocation-table tr:hover {{ background-color: #f5f5f5; }}
+
             .pos-val {{ color: #27ae60; }}
             .neg-val {{ color: #c0392b; }}
         </style>
@@ -234,9 +253,9 @@ class PortfolioVisualizer:
 
         table_html += "</table></details>"
 
-        # ADD ALLOCATION SECTION HERE
+        # INSERT THE ALLOCATION TABLE
         html_content = f"{table_html}" \
-                       f"<details open><summary>Asset Allocation</summary>{pio.to_html(alloc_fig, full_html=False, include_plotlyjs=False)}</details>" \
+                       f"<details open><summary>Asset Allocation Details</summary>{allocation_table_html}</details>" \
                        f"<details open><summary>Historical Backtest</summary>{pio.to_html(bt_fig, full_html=False, include_plotlyjs='cdn')}</details>" \
                        f"<details open><summary>Monte Carlo Simulation</summary>{pio.to_html(mc_fig, full_html=False, include_plotlyjs=False)}</details>"
 

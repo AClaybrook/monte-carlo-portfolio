@@ -1,5 +1,6 @@
 """
 Main script - Configurable Strategies & Benchmarks.
+FIXED: Robust Up-Front Ticker Collection & Casing
 """
 
 import sys
@@ -45,24 +46,30 @@ def main():
     print("\n" + "="*60 + "\nLoading Assets & Aligning Timeframes...\n" + "="*60)
     asset_map = {}
 
-    # 1. Load ALL assets (portfolios + optimization + benchmark)
+    # 1. Load ALL unique tickers up front (Case Insensitive)
     all_tickers = set()
-    for p in config.portfolios: all_tickers.update(p.allocations.keys())
 
+    # From Manual Portfolios
+    for p in config.portfolios:
+        all_tickers.update([t.upper() for t in p.allocations.keys()])
+
+    # From Optimization Config
     if config.optimization:
-        all_tickers.update(config.optimization.assets)
+        all_tickers.update([t.upper() for t in config.optimization.assets])
         # Force add Benchmark
         bench_ticker = config.optimization.benchmark_ticker.upper()
         all_tickers.add(bench_ticker)
 
     start_dates = []
 
+    # 2. Fetch Data for Unique Set
     for ticker in all_tickers:
+        # Check if user provided a specific name in assets config, otherwise use ticker
         asset_conf = config.assets.get(ticker, None)
         name = asset_conf.name if asset_conf else ticker
 
         asset = sim.define_asset_from_ticker(ticker, name)
-        asset_map[ticker.upper()] = asset
+        asset_map[ticker] = asset
 
         if not asset['historical_returns'].empty:
             start_dates.append(asset['historical_returns'].index.min())
@@ -77,7 +84,7 @@ def main():
 
     portfolio_results = []
 
-    # 2. Add Benchmark Portfolio
+    # 3. Add Benchmark Portfolio
     if config.optimization:
         bench_ticker = config.optimization.benchmark_ticker.upper()
         if bench_ticker in asset_map:
@@ -94,10 +101,11 @@ def main():
                 'backtest': bt_res
             })
 
-    # 3. Process Defined Portfolios
+    # 4. Process Defined Portfolios
     print("\n" + "="*60 + "\nProcessing Defined Portfolios...\n" + "="*60)
     for p_conf in config.portfolios:
         print(f"Processing {p_conf.name}...")
+        # Use .upper() to match the keys in asset_map
         assets = [asset_map[t.upper()] for t in p_conf.allocations.keys()]
         weights = list(p_conf.allocations.values())
 
@@ -110,9 +118,10 @@ def main():
             'backtest': bt_res
         })
 
-    # 4. Run Selected Optimizations
+    # 5. Run Selected Optimizations
     if config.optimization:
         print("\n" + "="*60 + "\nRunning Selected Optimizations...\n" + "="*60)
+        # Ensure we look up using uppercase keys
         opt_assets = [asset_map[name.upper()] for name in config.optimization.assets]
         active_strats = config.optimization.active_strategies
 
@@ -122,7 +131,6 @@ def main():
             'min_volatility': optimizer.optimize_min_volatility,
             'risk_parity': optimizer.optimize_risk_parity,
             'max_sortino': optimizer.optimize_sortino_ratio,
-            # Add the new key here, but we handle the call logic below specially
             'custom_weighted': optimizer.optimize_custom_weighted
         }
 
@@ -133,15 +141,14 @@ def main():
 
             print(f"Running: {strat_name}...")
 
+            # Handle Custom vs Standard
             if strat_name == 'custom_weighted':
-                # Pass the weights from config
                 strat_result = strategy_map[strat_name](
                     opt_assets,
                     weights_config=config.optimization.objective_weights,
                     start_date_override=global_start_date
                 )
             else:
-                # Standard call
                 strat_result = strategy_map[strat_name](opt_assets, start_date_override=global_start_date)
 
             # Print allocation
@@ -157,13 +164,12 @@ def main():
                 'backtest': bt_res
             })
 
-    # 5. Generate Report with Dates
+    # 6. Generate Report
     print("\n" + "="*60 + "\nGenerating Report...\n" + "="*60)
     out_dir = 'output'
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     from datetime import datetime
     output_path = Path(out_dir) / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{config.visualization.output_filename}"
-
 
     visualizer.generate_html_report(
         portfolio_results,
