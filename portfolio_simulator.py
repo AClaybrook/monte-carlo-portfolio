@@ -1,6 +1,6 @@
 """
 Monte Carlo portfolio simulation engine.
-FIXED: Global Time Alignment & Advanced Probability Calculations.
+FIXED: Memory Optimization (Batch Processing) to prevent crashes.
 """
 import numpy as np
 import pandas as pd
@@ -54,19 +54,18 @@ class PortfolioSimulator:
         return aligned_df
 
     def simulate_portfolio(self, assets, allocations, method=None, start_date_override=None):
+        """
+        Runs simulation in batches to save RAM.
+        """
         if method is None: method = self.config.method
 
         # 1. Get Aligned Data (With Override)
         aligned_returns_df = self._prepare_multivariate_data(assets, start_date_override)
-
-        # 2. Run Simulation (Standard Logic)
         n_assets = len(assets)
         weights = np.array(allocations)
 
-        if method == 'bootstrap':
-            random_indices = np.random.randint(0, len(aligned_returns_df), (self.simulations, self.trading_days))
-            asset_returns = aligned_returns_df.values[random_indices].transpose(2, 0, 1)
-        elif method in ['geometric_brownian', 'parametric']:
+        # Pre-calculate params for GBM method if needed
+        if method in ['geometric_brownian', 'parametric']:
             mean_returns = aligned_returns_df.mean().values
             cov_matrix = aligned_returns_df.cov().values
             try:
@@ -74,32 +73,87 @@ class PortfolioSimulator:
             except np.linalg.LinAlgError:
                 U, S, V = np.linalg.svd(cov_matrix)
                 L = U @ np.sqrt(np.diag(S))
-
-            uncorrelated = np.random.normal(0, 1, (n_assets, self.simulations, self.trading_days))
-            correlated = np.einsum('ij,jkl->ikl', L, uncorrelated)
             variances = np.diag(cov_matrix)
             drift = (mean_returns - 0.5 * variances).reshape(n_assets, 1, 1)
-            asset_returns = drift + correlated
-            if method == 'geometric_brownian': asset_returns = np.exp(asset_returns) - 1
 
-        weighted_returns = asset_returns * weights.reshape(n_assets, 1, 1)
-        portfolio_daily_returns = np.sum(weighted_returns, axis=0)
+        # 2. Run Simulation in Batches
+        # We process e.g., 1000 simulations at a time to keep memory usage low.
+        BATCH_SIZE = 1000
+        all_final_values = []
+        all_max_drawdowns = []
 
-        cumulative_growth = np.cumprod(1 + portfolio_daily_returns, axis=1)
-        portfolio_values = np.column_stack([np.ones(self.simulations), cumulative_growth]) * self.initial_capital
+        # We need to store paths for the visualizer, but storing ALL paths for ALL sims
+        # is what kills memory. We will collect them, but if memory is still tight,
+        # we might need to only store percentiles. For now, we construct the full array
+        # incrementally.
+        portfolio_values_list = []
 
-        final_values = portfolio_values[:, -1]
+        total_sims = self.simulations
+
+        for i in range(0, total_sims, BATCH_SIZE):
+            # Determine size of this batch (last batch might be smaller)
+            current_batch_size = min(BATCH_SIZE, total_sims - i)
+
+            # --- A. Generate Asset Returns for Batch ---
+            if method == 'bootstrap':
+                # Shape: (Batch, Days)
+                random_indices = np.random.randint(0, len(aligned_returns_df), (current_batch_size, self.trading_days))
+                # Shape: (Assets, Batch, Days) <--- This is the heavy array we split up
+                asset_returns = aligned_returns_df.values[random_indices].transpose(2, 0, 1)
+
+            elif method in ['geometric_brownian', 'parametric']:
+                uncorrelated = np.random.normal(0, 1, (n_assets, current_batch_size, self.trading_days))
+                correlated = np.einsum('ij,jkl->ikl', L, uncorrelated)
+                # Re-broadcast drift for current batch size
+                curr_drift = drift
+                # If drift shape is (n, 1, 1), it broadcasts automatically.
+
+                batch_returns = curr_drift + correlated
+                if method == 'geometric_brownian':
+                    asset_returns = np.exp(batch_returns) - 1
+                else:
+                    asset_returns = batch_returns
+
+            # --- B. Calculate Portfolio Value for Batch ---
+            # Weighted returns: (Batch, Days)
+            weighted_returns = np.sum(asset_returns * weights.reshape(n_assets, 1, 1), axis=0)
+
+            # Clean up heavy asset_returns immediately
+            del asset_returns
+
+            # Cumulative Growth
+            cumulative_growth = np.cumprod(1 + weighted_returns, axis=1)
+
+            # Convert to Dollars
+            # Shape: (Batch, Days + 1)
+            batch_values = np.column_stack([np.ones(current_batch_size), cumulative_growth]) * self.initial_capital
+
+            # --- C. Extract Stats for Batch ---
+            # Store full paths
+            portfolio_values_list.append(batch_values)
+
+            # Store finals
+            all_final_values.append(batch_values[:, -1])
+
+            # Store drawdowns
+            running_max = np.maximum.accumulate(batch_values, axis=1)
+            drawdowns = (batch_values - running_max) / running_max
+            all_max_drawdowns.append(np.min(drawdowns, axis=1))
+
+        # 3. Consolidate Results
+        portfolio_values = np.vstack(portfolio_values_list)
+        final_values = np.concatenate(all_final_values)
+        max_drawdowns = np.concatenate(all_max_drawdowns)
         cagr = (final_values / self.initial_capital) ** (1 / self.years) - 1
-        max_drawdowns = self._calculate_max_drawdown_vectorized(portfolio_values)
 
-        # 3. Calculate Advanced Probabilities
+        # 4. Calculate Advanced Probabilities (Vectorized on full result)
         probs = self._calculate_probabilities(portfolio_values)
 
         return {
             'portfolio_values': portfolio_values, 'final_values': final_values,
             'cagr': cagr, 'max_drawdowns': max_drawdowns,
             'assets': assets, 'allocations': allocations,
-            'probabilities': probs, # NEW
+            'probabilities': probs,
             'stats': self.calculate_statistics(final_values, cagr, max_drawdowns)
         }
 
@@ -134,11 +188,6 @@ class PortfolioSimulator:
             'prob_loss': np.array(prob_loss),
             'prob_high_return': np.array(prob_high_return)
         }
-
-    def _calculate_max_drawdown_vectorized(self, portfolio_values):
-        running_max = np.maximum.accumulate(portfolio_values, axis=1)
-        drawdowns = (portfolio_values - running_max) / running_max
-        return np.min(drawdowns, axis=1)
 
     def calculate_statistics(self, final_values, cagr, max_drawdowns):
         downside_mask = cagr < 0
