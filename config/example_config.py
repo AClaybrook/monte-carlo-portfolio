@@ -60,10 +60,12 @@ config = RunConfig(
         simulations=5000,
         method='geometric_brownian',
         lookback_years=10,
+        contribution_amount=0.0,
+        contribution_frequency=21  # trading days
     ),
 
     optimization=OptimizationConfig(
-        assets=['VOO', 'QQQ', 'BND', 'VGT', 'GLD', 'VTI', 'TLT', 'TQQQ', 'SPXL', 'TMF', 'BTC-USD'],
+        assets=['VOO', 'QQQ', 'VGT', 'VTI', 'TQQQ', 'SPXL', 'BTC-USD'], # , 'SHV'
         # 1. Active strategies
         active_strategies=[
             'max_sharpe',      # Balanced Growth
@@ -76,8 +78,8 @@ config = RunConfig(
         # 2. Define your Custom Objective Function
         objective_weights={
             'return':   0.35,  # CAGR
-            'sharpe':   0.30,  # risk-adjusted return
-            'drawdown': 0.20,  # minimizing deep losses
+            'sharpe':   0.20,  # risk-adjusted return
+            'drawdown': 0.30,  # minimizing deep losses
             'volatility': 0.05,
             'sortino': 0.10
         },

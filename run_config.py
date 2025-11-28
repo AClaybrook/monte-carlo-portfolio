@@ -54,6 +54,8 @@ class SimulationConfig:
     method: Literal['bootstrap', 'geometric_brownian', 'parametric'] = 'bootstrap'
     end_date: Optional[str] = None
     lookback_years: int = 10
+    contribution_amount: float = 0.0
+    contribution_frequency: int = 21  # trading days
 
 @dataclass
 class VisualizationConfig:
