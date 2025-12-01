@@ -1,6 +1,7 @@
 """
 Data management module - Smart Memory & Metadata.
 Now remembers when a stock didn't exist to avoid redundant downloads.
+UPDATED: Added bulk download support to avoid Yahoo Finance rate limiting.
 """
 
 import pandas as pd
@@ -90,7 +91,7 @@ class DataManager:
         return session
 
     def get_data(self, ticker, start_date=None, end_date=None, force_update=False):
-        """Get stock data with Smart Memory logic"""
+        """Get stock data with Smart Memory logic (single ticker - use get_data_bulk for multiple)"""
         if start_date is None: start_date = date.today() - timedelta(days=365*10)
         else: start_date = self._normalize_date(start_date)
 
@@ -105,7 +106,6 @@ class DataManager:
         # treat the request as if it started in 2015.
         effective_start_date = start_date
         if known_inception and start_date < known_inception:
-            # print(f"  [Smart] {ticker} inception is {known_inception}. Ignoring request for prior dates.")
             effective_start_date = known_inception
 
         if not force_update:
@@ -114,9 +114,6 @@ class DataManager:
                 db_start = db_data.index.min().date()
                 db_end = db_data.index.max().date()
 
-                # Logic: We have enough data IF:
-                # 1. DB Start is before requested start OR DB Start is the Known Inception
-                # 2. DB End is recent enough
                 start_ok = (db_start <= effective_start_date) or (known_inception and db_start <= known_inception)
                 end_ok = (db_end >= end_date - timedelta(days=5))
 
@@ -128,7 +125,6 @@ class DataManager:
 
         print(f"↓ Downloading {ticker} from Yahoo Finance...")
         try:
-            # If we know the inception, don't hammer Yahoo for data before it
             download_start = effective_start_date
 
             df = self._smart_download(ticker, download_start, end_date)
@@ -151,12 +147,166 @@ class DataManager:
             return df
         except Exception as e:
             print(f"✗ Error downloading {ticker}: {str(e)}")
-            # Fallback to DB
             db_data = self._get_from_db(ticker, effective_start_date, end_date)
             if db_data is not None:
                 print(f"⚠ FALLBACK: Using existing data for {ticker}")
                 return db_data
             raise
+
+    def get_data_bulk(self, tickers, start_date=None, end_date=None, force_update=False):
+        """
+        Bulk download multiple tickers in a single request to avoid rate limiting.
+        Returns a dict of {ticker: DataFrame}
+        """
+        if start_date is None: start_date = date.today() - timedelta(days=365*10)
+        else: start_date = self._normalize_date(start_date)
+
+        if end_date is None: end_date = date.today()
+        else: end_date = self._normalize_date(end_date)
+
+        results = {}
+        tickers_to_download = []
+        download_start_dates = {}
+
+        # Phase 1: Check what we already have in DB
+        for ticker in tickers:
+            ticker = ticker.upper()
+
+            # Check metadata for known inception date
+            metadata = self.session.query(TickerMetadata).filter_by(ticker=ticker).first()
+            known_inception = metadata.first_valid_date if metadata else None
+
+            effective_start = start_date
+            if known_inception and start_date < known_inception:
+                effective_start = known_inception
+
+            if not force_update:
+                db_data = self._get_from_db(ticker, effective_start, end_date)
+                if db_data is not None and len(db_data) > 0:
+                    db_start = db_data.index.min().date()
+                    db_end = db_data.index.max().date()
+
+                    start_ok = (db_start <= effective_start) or (known_inception and db_start <= known_inception)
+                    end_ok = (db_end >= end_date - timedelta(days=5))
+
+                    if start_ok and end_ok:
+                        print(f"✓ Retrieved {ticker} from database ({len(db_data)} records)")
+                        results[ticker] = db_data
+                        continue
+
+            # Need to download this ticker
+            tickers_to_download.append(ticker)
+            download_start_dates[ticker] = effective_start
+
+        if not tickers_to_download:
+            return results
+
+        # Phase 2: Bulk download all missing tickers
+        print(f"↓ Bulk downloading {len(tickers_to_download)} tickers: {', '.join(tickers_to_download)}")
+
+        # Use the earliest start date for bulk download
+        bulk_start = min(download_start_dates.values())
+
+        retries = 3
+        delay = 2
+        bulk_df = None
+
+        for attempt in range(retries):
+            try:
+                bulk_df = yf.download(
+                    tickers_to_download,
+                    start=bulk_start,
+                    end=end_date,
+                    auto_adjust=False,
+                    group_by='ticker',
+                    threads=True,
+                    session=self.yf_session
+                )
+                if bulk_df is not None and not bulk_df.empty:
+                    break
+                time.sleep(delay)
+                delay *= 2
+            except Exception as e:
+                print(f"⚠ Bulk download attempt {attempt+1} failed: {e}")
+                if attempt == retries - 1:
+                    print("✗ Bulk download failed after all retries")
+                time.sleep(delay + random.random())
+                delay *= 2
+
+        if bulk_df is None or bulk_df.empty:
+            # Fallback: try to get whatever we have in DB
+            for ticker in tickers_to_download:
+                db_data = self._get_from_db(ticker, download_start_dates[ticker], end_date)
+                if db_data is not None:
+                    print(f"⚠ FALLBACK: Using existing data for {ticker}")
+                    results[ticker] = db_data
+            return results
+
+        # Phase 3: Parse bulk results and save to DB
+        for ticker in tickers_to_download:
+            try:
+                # Handle both single and multi-ticker response formats
+                if len(tickers_to_download) == 1:
+                    # Single ticker: columns are just ['Open', 'High', ...]
+                    df = bulk_df.copy()
+                else:
+                    # Multi-ticker: columns are MultiIndex (ticker, field)
+                    if ticker not in bulk_df.columns.get_level_values(0):
+                        print(f"⚠ No data returned for {ticker}")
+                        continue
+                    df = bulk_df[ticker].copy()
+
+                # Drop rows where all values are NaN
+                df = df.dropna(how='all')
+
+                if df.empty:
+                    print(f"⚠ Empty data for {ticker}")
+                    continue
+
+                # Normalize index
+                df.index = pd.DatetimeIndex([d.date() if hasattr(d, 'date') else d for d in df.index])
+                df.index.name = 'Date'
+
+                # Standardize column names
+                col_map = {}
+                for col in df.columns:
+                    col_lower = str(col).lower()
+                    if 'adj' in col_lower and 'close' in col_lower:
+                        col_map[col] = 'Adj Close'
+                    elif col_lower == 'close':
+                        col_map[col] = 'Close'
+                    elif col_lower == 'open':
+                        col_map[col] = 'Open'
+                    elif col_lower == 'high':
+                        col_map[col] = 'High'
+                    elif col_lower == 'low':
+                        col_map[col] = 'Low'
+                    elif col_lower == 'volume':
+                        col_map[col] = 'Volume'
+                if col_map:
+                    df = df.rename(columns=col_map)
+
+                actual_start = df.index.min().date()
+                effective_start = download_start_dates[ticker]
+
+                # Update metadata if there's a gap
+                gap = (actual_start - effective_start).days
+                if gap > 7:
+                    self._update_metadata(ticker, actual_start)
+
+                self._save_to_db(ticker, df)
+                results[ticker] = df
+                print(f"✓ Downloaded {ticker} ({len(df)} records). Start: {actual_start}")
+
+            except Exception as e:
+                print(f"✗ Error processing {ticker}: {e}")
+                # Try DB fallback
+                db_data = self._get_from_db(ticker, download_start_dates[ticker], end_date)
+                if db_data is not None:
+                    print(f"⚠ FALLBACK: Using existing data for {ticker}")
+                    results[ticker] = db_data
+
+        return results
 
     def _update_metadata(self, ticker, first_date):
         """Update or Create metadata entry"""
@@ -177,7 +327,7 @@ class DataManager:
             print(f"Warning: Could not update metadata: {e}")
 
     def _smart_download(self, ticker, start, end):
-        """Download with Exponential Backoff"""
+        """Download with Exponential Backoff (single ticker fallback)"""
         retries = 3
         delay = 2
         for i in range(retries):
@@ -203,7 +353,7 @@ class DataManager:
         try:
             query = self.session.query(StockPrice).filter(
                 StockPrice.ticker == ticker,
-                StockPrice.date >= start_date, # Strict filter? No, handled by logic
+                StockPrice.date >= start_date,
                 StockPrice.date <= end_date
             ).order_by(StockPrice.date)
             results = query.all()

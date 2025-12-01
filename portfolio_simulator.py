@@ -1,6 +1,7 @@
 """
 Monte Carlo portfolio simulation engine.
 UPDATED: Enhanced strategy support with rich MarketContext.
+UPDATED: Added define_asset_from_dataframe for bulk data loading.
 """
 import numpy as np
 import pandas as pd
@@ -27,6 +28,7 @@ class PortfolioSimulator:
             self.end_date = date.today()
 
     def define_asset_from_ticker(self, ticker, name=None, lookback_years=None):
+        """Original method - fetches data per ticker (can cause rate limiting)."""
         if name is None: name = ticker
         if lookback_years is None: lookback_years = self.config.lookback_years
 
@@ -40,6 +42,43 @@ class PortfolioSimulator:
             'ticker': ticker, 'name': name,
             'historical_returns': returns, 'full_data': df,
             'daily_mean': returns.mean(), 'daily_std': returns.std()
+        }
+
+    def define_asset_from_dataframe(self, ticker, name, df):
+        """
+        Build an asset dict from a pre-fetched DataFrame.
+        Use this with DataManager.get_data_bulk() to avoid per-ticker requests.
+
+        Args:
+            ticker: Stock ticker symbol
+            name: Display name for the asset
+            df: DataFrame with 'Adj Close' column and DatetimeIndex
+
+        Returns:
+            Asset dict compatible with simulate_portfolio()
+        """
+        if df is None or df.empty:
+            raise ValueError(f"No data provided for {ticker}")
+
+        # Use 'Adj Close' for returns calculation (matching define_asset_from_ticker)
+        if 'Adj Close' in df.columns:
+            prices = df['Adj Close']
+        elif 'Close' in df.columns:
+            prices = df['Close']
+        else:
+            raise ValueError(f"No price column found for {ticker}")
+
+        # Calculate daily returns
+        returns = prices.pct_change().dropna()
+
+        # Build asset dict matching define_asset_from_ticker structure
+        return {
+            'ticker': ticker,
+            'name': name,
+            'historical_returns': returns,
+            'full_data': df,
+            'daily_mean': returns.mean(),
+            'daily_std': returns.std()
         }
 
     def _prepare_multivariate_data(self, assets, start_date_override=None):
