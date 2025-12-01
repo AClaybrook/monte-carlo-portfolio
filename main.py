@@ -1,43 +1,52 @@
 """
-Main script - Configurable Strategies & Benchmarks.
-FIXED: Robust Up-Front Ticker Collection & Casing
+Main script - With Strategy Support
 """
 
 import sys
 import argparse
 import pandas as pd
 from pathlib import Path
-from run_config import load_config_from_file
+from datetime import datetime
+
+from run_config import load_config_from_file, create_strategy_from_config
 from data_manager import DataManager
 from portfolio_simulator import PortfolioSimulator
 from portfolio_optimizer import PortfolioOptimizer
 from visualizations import PortfolioVisualizer
 from backtester import Backtester
-from strategies import BuyTheDipStrategy
+from strategies import StaticAllocationStrategy
+
 
 def find_config_file(specified_path: str = None) -> Path:
     if specified_path:
         path = Path(specified_path)
-        if not path.exists(): raise FileNotFoundError(f"Config file not found: {specified_path}")
+        if not path.exists():
+            raise FileNotFoundError(f"Config file not found: {specified_path}")
         return path
-    if Path('config/my_portfolios.py').exists(): return Path('config/my_portfolios.py')
-    if Path('config/example_config.py').exists(): return Path('config/example_config.py')
+    if Path('config/my_portfolios.py').exists():
+        return Path('config/my_portfolios.py')
+    if Path('config/example_config.py').exists():
+        return Path('config/example_config.py')
     raise FileNotFoundError("No config file found.")
+
 
 def main():
     parser = argparse.ArgumentParser(description='Monte Carlo Portfolio Simulator')
     parser.add_argument('config', nargs='?')
+    parser.add_argument('--no-optimize', action='store_true',
+                        help='Skip optimization step')
     args = parser.parse_args()
 
     config_path = find_config_file(args.config)
     print(f"✓ Loading configuration from: {config_path}")
+
     try:
         config = load_config_from_file(str(config_path))
     except Exception as e:
         print(f"\n✗ Error loading config: {e}")
         return 1
 
-    # Initialize
+    # Initialize components
     data_manager = DataManager(db_path=config.database.path)
     sim = PortfolioSimulator(data_manager, config.simulation)
     optimizer = PortfolioOptimizer(sim, data_manager)
@@ -47,25 +56,19 @@ def main():
     print("\n" + "="*60 + "\nLoading Assets & Aligning Timeframes...\n" + "="*60)
     asset_map = {}
 
-    # 1. Load ALL unique tickers up front (Case Insensitive)
+    # Collect all unique tickers
     all_tickers = set()
-
-    # From Manual Portfolios
     for p in config.portfolios:
         all_tickers.update([t.upper() for t in p.allocations.keys()])
 
-    # From Optimization Config
     if config.optimization:
         all_tickers.update([t.upper() for t in config.optimization.assets])
-        # Force add Benchmark
-        bench_ticker = config.optimization.benchmark_ticker.upper()
-        all_tickers.add(bench_ticker)
+        all_tickers.add(config.optimization.benchmark_ticker.upper())
 
     start_dates = []
 
-    # 2. Fetch Data for Unique Set
+    # Fetch data for all tickers
     for ticker in all_tickers:
-        # Check if user provided a specific name in assets config, otherwise use ticker
         asset_conf = config.assets.get(ticker, None)
         name = asset_conf.name if asset_conf else ticker
 
@@ -85,16 +88,19 @@ def main():
 
     portfolio_results = []
 
-    # 3. Add Benchmark Portfolio
+    # Add Benchmark Portfolio if optimization is configured
     if config.optimization:
         bench_ticker = config.optimization.benchmark_ticker.upper()
         if bench_ticker in asset_map:
-            print(f"Adding Benchmark: {bench_ticker}")
+            print(f"\nAdding Benchmark: {bench_ticker}")
             assets = [asset_map[bench_ticker]]
             weights = [1.0]
 
             sim_res = sim.simulate_portfolio(assets, weights, start_date_override=global_start_date)
-            bt_res = backtester.run_backtest(assets, weights, config.simulation.initial_capital, start_date_override=global_start_date)
+            bt_res = backtester.run_backtest(
+                assets, weights, config.simulation.initial_capital,
+                start_date_override=global_start_date
+            )
 
             portfolio_results.append({
                 'label': f"Benchmark ({bench_ticker})",
@@ -102,41 +108,58 @@ def main():
                 'backtest': bt_res
             })
 
-    # 4. Process Defined Portfolios
+    # Process Defined Portfolios WITH STRATEGIES
     print("\n" + "="*60 + "\nProcessing Defined Portfolios...\n" + "="*60)
+
     for p_conf in config.portfolios:
-        print(f"Processing {p_conf.name}...")
+        print(f"\nProcessing: {p_conf.name}")
+
         assets = [asset_map[t.upper()] for t in p_conf.allocations.keys()]
         weights = list(p_conf.allocations.values())
 
-        # CHECK FOR CUSTOM STRATEGY
+        # Create strategy from config if defined
         strategy = None
-        # Example: If portfolio name contains 'Dynamic', use the strategy
-        if "Dynamic" in p_conf.name:
-            # Find index of TQQQ or SPXL
-            target = "TQQQ"
-            try:
-                # Find which index in the 'assets' list matches TQQQ
-                idx = [a['ticker'] for a in assets].index(target)
-                print(f"  > Activated 'Buy the Dip' strategy on {target}")
-                strategy = BuyTheDipStrategy(target_ticker_index=idx, threshold=0.10, aggressive_weight=0.6)
-            except ValueError:
-                print(f"  > Warning: Target {target} not found in portfolio assets.")
+        if p_conf.strategy:
+            strategy = create_strategy_from_config(p_conf.strategy)
+            print(f"  > Strategy: {strategy.name}")
+            print(f"  > Config: {strategy.get_config_summary()}")
 
+        # Run simulation with strategy
         sim_res = sim.simulate_portfolio(
             assets,
             weights,
             start_date_override=global_start_date,
-            strategy=strategy  # Pass the strategy here
+            strategy=strategy
         )
-    # 5. Run Selected Optimizations
-    if config.optimization:
+
+        # Run backtest with strategy
+        bt_res = backtester.run_backtest(
+            assets,
+            weights,
+            config.simulation.initial_capital,
+            start_date_override=global_start_date,
+            strategy=strategy,
+            contribution_amount=config.simulation.contribution_amount,
+            contribution_frequency=config.simulation.contribution_frequency
+        )
+
+        portfolio_results.append({
+            'label': p_conf.name,
+            'results': sim_res,
+            'backtest': bt_res
+        })
+
+        # Print quick summary
+        m = bt_res['metrics']
+        print(f"  > Hist CAGR: {m['CAGR']*100:.2f}%  |  Max DD: {m['Max Drawdown']*100:.2f}%  |  Sharpe: {m['Sharpe']:.2f}")
+
+    # Run Selected Optimizations
+    if config.optimization and not args.no_optimize:
         print("\n" + "="*60 + "\nRunning Selected Optimizations...\n" + "="*60)
-        # Ensure we look up using uppercase keys
+
         opt_assets = [asset_map[name.upper()] for name in config.optimization.assets]
         active_strats = config.optimization.active_strategies
 
-        # Dispatcher for strategies
         strategy_map = {
             'max_sharpe': optimizer.optimize_sharpe_ratio,
             'min_volatility': optimizer.optimize_min_volatility,
@@ -152,7 +175,6 @@ def main():
 
             print(f"Running: {strat_name}...")
 
-            # Handle Custom vs Standard
             if strat_name == 'custom_weighted':
                 strat_result = strategy_map[strat_name](
                     opt_assets,
@@ -162,12 +184,14 @@ def main():
             else:
                 strat_result = strategy_map[strat_name](opt_assets, start_date_override=global_start_date)
 
-            # Print allocation
             alloc_str = " / ".join([f"{int(w*100)}% {a['ticker']}" for w, a in zip(strat_result['allocations'], opt_assets)])
             print(f"  Result: {alloc_str}")
 
-            # Run Backtest
-            bt_res = backtester.run_backtest(opt_assets, strat_result['allocations'], config.simulation.initial_capital, start_date_override=global_start_date)
+            bt_res = backtester.run_backtest(
+                opt_assets, strat_result['allocations'],
+                config.simulation.initial_capital,
+                start_date_override=global_start_date
+            )
 
             portfolio_results.append({
                 'label': strat_result['label'],
@@ -175,11 +199,12 @@ def main():
                 'backtest': bt_res
             })
 
-    # 6. Generate Report
+    # Generate Report
     print("\n" + "="*60 + "\nGenerating Report...\n" + "="*60)
+
     out_dir = 'output'
     Path(out_dir).mkdir(parents=True, exist_ok=True)
-    from datetime import datetime
+
     output_path = Path(out_dir) / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{config.visualization.output_filename}"
 
     visualizer.generate_html_report(
@@ -191,26 +216,8 @@ def main():
     print(f"✓ Report saved to: {output_path}")
 
     data_manager.close()
+    return 0
+
 
 if __name__ == "__main__":
-    main()
-
-    # # Just import data
-    # tickers = ['SPXL']
-
-    # data_manager = DataManager()
-    # from datetime import datetime, timedelta
-    # start_date = datetime(2009, 1, 1)
-    # start_date = start_date.date()
-    # end_date = datetime.now().date()
-    # for ticker in tickers:
-    #     print(f"Importing data for {ticker}...")
-
-    #     # request data in batches
-    #     batch_size = 365 * 1
-    #     current_start = start_date
-    #     while current_start < end_date:
-    #         current_end = min(current_start + timedelta(days=batch_size), end_date)
-    #         print(f"  Fetching data from {current_start} to {current_end}...")
-    #         data_manager.get_data(ticker, start_date=current_start, end_date=current_end)
-    #         current_start = current_end + timedelta(days=1)
+    sys.exit(main())

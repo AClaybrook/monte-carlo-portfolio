@@ -2,7 +2,7 @@
 Example configuration - Selectable Optimizations & Benchmark.
 """
 
-from run_config import RunConfig, PortfolioConfig, SimulationConfig, OptimizationConfig, VisualizationConfig
+from run_config import RunConfig, PortfolioConfig, SimulationConfig, OptimizationConfig, VisualizationConfig, StrategyConfig
 
 config = RunConfig(
     name="Strategic Portfolio Analysis",
@@ -48,6 +48,25 @@ config = RunConfig(
             },
             description='Leveraged 100% stocks'
         ),
+        # In your config file:
+        PortfolioConfig(
+            name='Crypto Opportunistic',
+            allocations={
+                'VOO': 0.70,       # S&P 500 base
+                'BND': 0.10,       # Bonds
+                'BTC-USD': 0.20,   # Bitcoin base
+            },
+            strategy=StrategyConfig(
+                type='crypto_opportunistic',
+                params={
+                    'crypto_ticker': 'BTC-USD',
+                    'equity_ticker': 'VOO',
+                    'dip_threshold': 0.25,      # When BTC down 25%+
+                    'normal_weight': 0.20,       # Normal: 20% to BTC
+                    'dip_weight': 0.50           # During dip: 50% of new DCA to BTC
+                }
+            )
+        )
         # PortfolioConfig(
         #     name='All Weather',
         #     allocations={'VTI': 0.30, 'TLT': 0.40, 'IEF': 0.15, 'GLD': 0.075, 'DBC': 0.075}
@@ -65,7 +84,7 @@ config = RunConfig(
     ),
 
     optimization=OptimizationConfig(
-        assets=['VOO', 'QQQ'],
+        assets=['VOO', 'QQQ', 'BTC-USD', 'SPXL', 'SHV', 'VGT'],
         # 1. Active strategies
         active_strategies=[
             'max_sharpe',      # Balanced Growth
@@ -77,10 +96,10 @@ config = RunConfig(
 
         # 2. Define your Custom Objective Function
         objective_weights={
-            'return':   0.35,  # CAGR
-            'sharpe':   0.20,  # risk-adjusted return
-            'drawdown': 0.30,  # minimizing deep losses
-            'volatility': 0.05,
+            'return':   0.60,  # CAGR
+            'sharpe':   0.10,  # risk-adjusted return
+            'drawdown': 0.10,  # minimizing deep losses
+            'volatility': 0.0,
             'sortino': 0.10
         },
 
