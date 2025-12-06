@@ -1,5 +1,5 @@
 """
-Visualization engine - Financial Formatting & Advanced Probability Plots.
+Visualization engine - With Volatility, DCA Indicator, and MC/Historical Alignment
 """
 
 import plotly.graph_objects as go
@@ -33,14 +33,37 @@ class PortfolioVisualizer:
         except:
             return [], []
 
+    def _get_contribution_info(self, item) -> str:
+        """Extract contribution info from portfolio result"""
+        results = item.get('results', {})
+        backtest = item.get('backtest', {})
+
+        # Check for total invested (indicates DCA)
+        total_invested = backtest.get('metrics', {}).get('Total Invested', None)
+        if total_invested is None:
+            total_invested = results.get('total_invested', None)
+
+        start_balance = backtest.get('metrics', {}).get('Start Balance',
+                                                         results.get('stats', {}).get('initial_capital', 10000))
+
+        if total_invested and total_invested > start_balance * 1.01:
+            contributions = total_invested - start_balance
+            return f"DCA: ${contributions:,.0f}"
+        else:
+            return "Lump Sum"
+
+    def _get_strategy_info(self, item) -> str:
+        """Extract strategy name from portfolio result"""
+        results = item.get('results', {})
+        backtest = item.get('backtest', {})
+
+        strategy = backtest.get('strategy', results.get('strategy', 'Buy and Hold'))
+        return strategy if strategy else 'Buy and Hold'
+
     def create_allocation_table_html(self, portfolio_results):
-        """
-        Creates a formatted HTML table showing allocations for ALL portfolios.
-        TRANSPOSED: Rows = Portfolios, Columns = Tickers.
-        """
-        # 1. Aggregate Data
+        """Creates a formatted HTML table showing allocations for ALL portfolios."""
         all_tickers = set()
-        portfolio_rows = [] # List of dicts: {'Portfolio': name, 'TICKER': weight...}
+        portfolio_rows = []
 
         for item in portfolio_results:
             p_name = item['label']
@@ -48,7 +71,6 @@ class PortfolioVisualizer:
             allocations = res['allocations']
             assets = res['assets']
 
-            # Create a row for this portfolio
             row_data = {'Portfolio': p_name}
 
             for asset, weight in zip(assets, allocations):
@@ -58,19 +80,14 @@ class PortfolioVisualizer:
 
             portfolio_rows.append(row_data)
 
-        # Sort tickers alphabetically for columns
         sorted_tickers = sorted(list(all_tickers))
 
-        # 2. Construct HTML Table
         html = '<div style="overflow-x: auto;"><table class="allocation-table">'
-
-        # Header: "Portfolio" + Ticker Names
         html += '<thead><tr><th style="text-align:left;">Portfolio</th>'
         for ticker in sorted_tickers:
             html += f'<th>{ticker}</th>'
         html += '</tr></thead>'
 
-        # Body: One row per Portfolio
         html += '<tbody>'
         for row_dict in portfolio_rows:
             p_name = row_dict['Portfolio']
@@ -79,13 +96,9 @@ class PortfolioVisualizer:
             for ticker in sorted_tickers:
                 val = row_dict.get(ticker, 0.0)
 
-                # Format cell
-                if val > 0.001: # Show if > 0.1%
+                if val > 0.001:
                     display_val = f"{val*100:.1f}%"
                     style = 'style="font-weight:500;"'
-                    # Optional: Add background color intensity based on weight?
-                    # opacity = min(val * 0.8 + 0.1, 1.0)
-                    # style = f'style="font-weight:500; background-color: rgba(33, 150, 243, {opacity}); color: black;"'
                 else:
                     display_val = "-"
                     style = 'style="color: #ccc;"'
@@ -97,9 +110,7 @@ class PortfolioVisualizer:
         return html
 
     def create_monte_carlo_plot(self, portfolio_results):
-        """
-        Updated with Financial Formatting and Probability over Time.
-        """
+        """Monte Carlo visualization with probability plots"""
         fig = make_subplots(
             rows=2, cols=3,
             subplot_titles=('95% Confidence Trajectories', 'Final Value Density', 'CAGR Density',
@@ -140,7 +151,7 @@ class PortfolioVisualizer:
             # 4. Risk Return
             fig.add_trace(go.Scatter(x=[stats_data['std_cagr']*100], y=[stats_data['mean_cagr']*100], mode='markers', marker=dict(color=color, size=14, line=dict(width=1, color='black')), showlegend=False, legendgroup=grp, name=label, hovertemplate=f"<b>{label}</b><br>Vol: %{{x:.1f}}%<br>Ret: %{{y:.1f}}%"), row=2, col=1)
 
-            # 5. Risk of Loss Over Time (NEW)
+            # 5. Risk of Loss Over Time
             if 'years' in probs:
                 fig.add_trace(go.Scatter(
                     x=probs['years'], y=probs['prob_loss']*100,
@@ -149,7 +160,7 @@ class PortfolioVisualizer:
                     hovertemplate=f"<b>{label}</b><br>Year: %{{x}}<br>Prob Loss: %{{y:.1f}}%"
                 ), row=2, col=2)
 
-            # 6. Prob of High Return Over Time (NEW)
+            # 6. Prob of High Return
             if 'years' in probs:
                 fig.add_trace(go.Scatter(
                     x=probs['years'], y=probs['prob_high_return']*100,
@@ -158,9 +169,8 @@ class PortfolioVisualizer:
                     hovertemplate=f"<b>{label}</b><br>Year: %{{x}}<br>Prob >10%: %{{y:.1f}}%"
                 ), row=2, col=3)
 
-        # FINANCIAL FORMATTING UPDATES
         fig.update_yaxes(tickformat="$,.0f", title="Portfolio Value", row=1, col=1)
-        fig.update_xaxes(tickformat="$,.0s", title="Final Value", row=1, col=2) # 1M, 2M
+        fig.update_xaxes(tickformat="$,.0s", title="Final Value", row=1, col=2)
         fig.update_xaxes(tickformat=".1f", title="CAGR (%)", row=1, col=3)
 
         fig.update_xaxes(tickformat=".1f", title="Volatility (%)", row=2, col=1)
@@ -195,7 +205,6 @@ class PortfolioVisualizer:
             fig.add_trace(go.Scatter(x=bt['dates'], y=bt['rolling_3y']*100, name=label, line=dict(width=1.5, color=color), legendgroup=grp, showlegend=False), row=3, col=1)
             fig.add_trace(go.Scatter(x=bt['dates'], y=bt['rolling_5y']*100, name=label, line=dict(width=1.5, color=color, dash='dot'), legendgroup=grp, showlegend=False), row=4, col=1)
 
-        # FINANCIAL FORMATTING
         fig.update_yaxes(type="log", tickformat="$,.0f", title="Value ($)", row=1, col=1)
         fig.update_yaxes(tickformat=".1f", title="Drawdown (%)", row=2, col=1)
         fig.update_yaxes(tickformat=".1f", title="CAGR (%)", row=3, col=1)
@@ -208,14 +217,13 @@ class PortfolioVisualizer:
         mc_fig = self.create_monte_carlo_plot(portfolio_results)
         bt_fig = self.create_backtest_plot(portfolio_results)
 
-        # Table Generation
         allocation_table_html = self.create_allocation_table_html(portfolio_results)
 
-        # Date formatting
         date_str = ""
         if start_date and end_date:
             date_str = f"<p style='color: #666; margin-top: -15px;'>Analysis Period: <b>{start_date}</b> to <b>{end_date}</b></p>"
 
+        # Build performance metrics table with VOLATILITY and STRATEGY columns
         table_html = f"""
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 20px; background: #f9f9f9; color: #333; }}
@@ -224,36 +232,89 @@ class PortfolioVisualizer:
             summary:after {{ content: "+"; float: right; font-weight: bold; }}
             details[open] summary:after {{ content: "-"; }}
 
-            /* General Tables */
-            table {{ width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 0.9em; }}
-            th, td {{ border-bottom: 1px solid #eee; padding: 12px 8px; text-align: right; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 0.85em; }}
+            th, td {{ border-bottom: 1px solid #eee; padding: 10px 6px; text-align: right; }}
             th {{ background-color: #f8f9fa; color: #666; font-weight: 600; text-align: center; }}
             td:first-child {{ text-align: left; font-weight: 600; color: #2c3e50; }}
 
-            /* Allocation Table Specifics */
             .allocation-table th {{ background-color: #e3f2fd; color: #1565c0; }}
             .allocation-table tr:hover {{ background-color: #f5f5f5; }}
 
             .pos-val {{ color: #27ae60; }}
             .neg-val {{ color: #c0392b; }}
+            .warn-val {{ color: #f39c12; }}
+            .strategy-col {{ font-size: 0.8em; color: #666; }}
         </style>
         <h1>Portfolio Analysis Report</h1>
         {date_str}
-        <details open><summary>Performance Metrics Summary</summary><table>
-        <tr><th>Portfolio</th><th>Sim CAGR</th><th>Hist CAGR</th><th>Delta</th><th>Sharpe</th><th>Max DD</th><th>Best Year</th><th>Worst Year</th><th>Tracking Err</th></tr>
+        <details open><summary>Performance Metrics Summary</summary>
+        <table>
+        <tr>
+            <th>Portfolio</th>
+            <th>Type</th>
+            <th>Sim CAGR</th>
+            <th>Hist CAGR</th>
+            <th>Volatility</th>
+            <th>Sharpe</th>
+            <th>Sortino</th>
+            <th>Max DD</th>
+            <th>Best Yr</th>
+            <th>Worst Yr</th>
+        </tr>
         """
 
         for item in portfolio_results:
             m = item['backtest']['metrics']
-            sim_cagr = item['results']['stats']['median_cagr']
+            sim_stats = item['results']['stats']
+
+            sim_cagr = sim_stats.get('median_cagr', sim_stats.get('mean_cagr', 0))
             hist_cagr = m['CAGR']
+            volatility = m['Stdev']
+
+            # Contribution type
+            contrib_type = self._get_contribution_info(item)
+            strategy = self._get_strategy_info(item)
+
+            # Combine into type column
+            if strategy != 'Buy and Hold' and strategy != 'Static DCA':
+                type_str = f"{contrib_type}<br><span class='strategy-col'>{strategy}</span>"
+            else:
+                type_str = contrib_type
+
+            # Calculate delta and flag large discrepancies
             delta = sim_cagr - hist_cagr
-            delta_class = "neg-val" if delta > 0.05 else "pos-val"
-            table_html += f"<tr><td>{item['label']}</td><td>{sim_cagr*100:.2f}%</td><td>{hist_cagr*100:.2f}%</td><td class='{delta_class}'>{delta*100:+.2f}%</td><td>{m['Sharpe']:.2f}</td><td class='neg-val'>{m['Max Drawdown']*100:.2f}%</td><td class='pos-val'>{m['Best Year']*100:.2f}%</td><td class='neg-val'>{m['Worst Year']*100:.2f}%</td><td>{m['Tracking Error']*100:.2f}%</td></tr>"
+            if abs(delta) > 0.05:
+                delta_class = "warn-val"
+            elif delta > 0:
+                delta_class = "pos-val"
+            else:
+                delta_class = ""
 
-        table_html += "</table></details>"
+            table_html += f"""<tr>
+                <td>{item['label']}</td>
+                <td style="text-align:center;">{type_str}</td>
+                <td>{sim_cagr*100:.2f}%</td>
+                <td>{hist_cagr*100:.2f}%</td>
+                <td>{volatility*100:.2f}%</td>
+                <td>{m['Sharpe']:.2f}</td>
+                <td>{m['Sortino']:.2f}</td>
+                <td class='neg-val'>{m['Max Drawdown']*100:.2f}%</td>
+                <td class='pos-val'>{m['Best Year']*100:.2f}%</td>
+                <td class='neg-val'>{m['Worst Year']*100:.2f}%</td>
+            </tr>"""
 
-        # INSERT THE ALLOCATION TABLE
+        table_html += "</table>"
+
+        # Add MC vs Historical explanation
+        table_html += """
+        <p style="font-size: 0.8em; color: #888; margin-top: 15px;">
+            <b>Note:</b> Sim CAGR = Monte Carlo median. Hist CAGR = actual backtest.
+            Large differences may indicate: different time periods, DCA effects not captured in MC, or strategy-specific behavior.
+            Volatility = annualized standard deviation of returns.
+        </p>
+        </details>
+        """
+
         html_content = f"{table_html}" \
                        f"<details open><summary>Asset Allocation Details</summary>{allocation_table_html}</details>" \
                        f"<details open><summary>Historical Backtest</summary>{pio.to_html(bt_fig, full_html=False, include_plotlyjs='cdn')}</details>" \

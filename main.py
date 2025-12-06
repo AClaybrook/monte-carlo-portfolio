@@ -1,13 +1,12 @@
 """
-Main script - With Strategy Support
-UPDATED: Uses bulk download to avoid Yahoo Finance rate limiting
+Main script - With Strategy Support and Bulk Download
 """
 
 import sys
 import argparse
 import pandas as pd
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 from run_config import load_config_from_file, create_strategy_from_config
 from data_manager import DataManager
@@ -31,11 +30,26 @@ def find_config_file(specified_path: str = None) -> Path:
     raise FileNotFoundError("No config file found.")
 
 
+def collect_all_tickers(config) -> set:
+    """Collect all tickers needed from config"""
+    all_tickers = set()
+
+    for p in config.portfolios:
+        all_tickers.update([t.upper() for t in p.allocations.keys()])
+
+    if config.optimization:
+        all_tickers.update([t.upper() for t in config.optimization.assets])
+        all_tickers.add(config.optimization.benchmark_ticker.upper())
+
+    return all_tickers
+
+
 def main():
     parser = argparse.ArgumentParser(description='Monte Carlo Portfolio Simulator')
     parser.add_argument('config', nargs='?')
-    parser.add_argument('--no-optimize', action='store_true',
-                        help='Skip optimization step')
+    parser.add_argument('--no-optimize', action='store_true', help='Skip optimization step')
+    parser.add_argument('--force-download', action='store_true', help='Force re-download all data')
+    parser.add_argument('--coverage-report', action='store_true', help='Show data coverage report')
     args = parser.parse_args()
 
     config_path = find_config_file(args.config)
@@ -47,72 +61,97 @@ def main():
         print(f"\n✗ Error loading config: {e}")
         return 1
 
-    # Initialize components
+    # Initialize data manager
     data_manager = DataManager(db_path=config.database.path)
+
+    # Coverage report mode
+    if args.coverage_report:
+        all_tickers = list(collect_all_tickers(config))
+        report = data_manager.get_data_coverage_report(all_tickers)
+        print("\n" + "="*80)
+        print("DATA COVERAGE REPORT")
+        print("="*80)
+        print(report.to_string(index=False))
+        data_manager.close()
+        return 0
+
+    # Initialize simulation components
     sim = PortfolioSimulator(data_manager, config.simulation)
     optimizer = PortfolioOptimizer(sim, data_manager)
     visualizer = PortfolioVisualizer(sim)
     backtester = Backtester(data_manager)
 
-    print("\n" + "="*60 + "\nLoading Assets & Aligning Timeframes...\n" + "="*60)
+    print("\n" + "="*60)
+    print("BULK DOWNLOADING DATA")
+    print("="*60)
+
+    # Collect all tickers and bulk download
+    all_tickers = list(collect_all_tickers(config))
+    print(f"Tickers to load: {', '.join(sorted(all_tickers))}")
+
+    # Calculate date range
+    lookback_years = config.simulation.lookback_years
+    end_date = date.today()
+    start_date = end_date - timedelta(days=365 * lookback_years)
+
+    # Bulk download all data at once
+    bulk_data = data_manager.bulk_download(
+        all_tickers,
+        start_date=start_date,
+        end_date=end_date,
+        force_update=args.force_download
+    )
+
+    print(f"\n✓ Loaded data for {len(bulk_data)} tickers")
+
+    # Build asset map from downloaded data
+    print("\n" + "="*60)
+    print("BUILDING ASSET MAP")
+    print("="*60)
+
     asset_map = {}
-
-    # Collect all unique tickers
-    all_tickers = set()
-    for p in config.portfolios:
-        all_tickers.update([t.upper() for t in p.allocations.keys()])
-
-    if config.optimization:
-        all_tickers.update([t.upper() for t in config.optimization.assets])
-        all_tickers.add(config.optimization.benchmark_ticker.upper())
-
-    all_tickers = list(all_tickers)
-    print(f"Found {len(all_tickers)} unique tickers: {', '.join(sorted(all_tickers))}")
-
-    # ========== BULK DOWNLOAD ALL TICKERS ==========
-    # Instead of downloading one by one, fetch all at once
-    print(f"\n--- Fetching data for all {len(all_tickers)} tickers ---")
-    bulk_data = data_manager.get_data_bulk(all_tickers)
-
-    if not bulk_data:
-        print("Error: No data retrieved for any tickers.")
-        return 1
-
-    # Build asset_map from bulk data
     start_dates = []
-    for ticker in all_tickers:
-        ticker = ticker.upper()
-        if ticker not in bulk_data:
-            print(f"⚠ Skipping {ticker} - no data available")
-            continue
 
-        df = bulk_data[ticker]
+    for ticker in all_tickers:
         asset_conf = config.assets.get(ticker, None)
         name = asset_conf.name if asset_conf else ticker
 
-        # Build asset dict using the pre-fetched data
-        asset = sim.define_asset_from_dataframe(ticker, name, df)
-        asset_map[ticker] = asset
+        if ticker in bulk_data:
+            df = bulk_data[ticker]
+            returns = df['Adj Close'].pct_change().dropna()
 
-        if not asset['historical_returns'].empty:
-            start_dates.append(asset['historical_returns'].index.min())
+            asset = {
+                'ticker': ticker,
+                'name': name,
+                'historical_returns': returns,
+                'full_data': df,
+                'daily_mean': returns.mean(),
+                'daily_std': returns.std()
+            }
+            asset_map[ticker] = asset
+
+            if not returns.empty:
+                start_dates.append(returns.index.min())
+                print(f"  ✓ {ticker}: {len(df)} days, {returns.index.min().date()} to {returns.index.max().date()}")
+        else:
+            print(f"  ⚠ {ticker}: No data available")
 
     if not start_dates:
-        print("Error: No valid data found for any assets.")
+        print("Error: No data found for any assets.")
+        data_manager.close()
         return 1
 
     global_start_date = max(start_dates)
     global_end_date = sim.end_date
     print(f"\n✓ GLOBAL ALIGNMENT: {global_start_date.date()} to {global_end_date}")
-    print(f"✓ Successfully loaded {len(asset_map)} assets")
 
     portfolio_results = []
 
-    # Add Benchmark Portfolio if optimization is configured
+    # Add Benchmark Portfolio
     if config.optimization:
         bench_ticker = config.optimization.benchmark_ticker.upper()
         if bench_ticker in asset_map:
-            print(f"\nAdding Benchmark: {bench_ticker}")
+            print(f"\n→ Adding Benchmark: {bench_ticker}")
             assets = [asset_map[bench_ticker]]
             weights = [1.0]
 
@@ -128,41 +167,39 @@ def main():
                 'backtest': bt_res
             })
 
-    # Process Defined Portfolios WITH STRATEGIES
-    print("\n" + "="*60 + "\nProcessing Defined Portfolios...\n" + "="*60)
+    # Process Defined Portfolios
+    print("\n" + "="*60)
+    print("PROCESSING PORTFOLIOS")
+    print("="*60)
 
     for p_conf in config.portfolios:
-        print(f"\nProcessing: {p_conf.name}")
+        print(f"\n→ {p_conf.name}")
 
-        # Check all tickers exist
-        missing = [t.upper() for t in p_conf.allocations.keys() if t.upper() not in asset_map]
+        # Check all assets exist
+        missing = [t for t in p_conf.allocations.keys() if t.upper() not in asset_map]
         if missing:
-            print(f"  ⚠ Skipping - missing tickers: {missing}")
+            print(f"  ⚠ Skipping - missing assets: {missing}")
             continue
 
         assets = [asset_map[t.upper()] for t in p_conf.allocations.keys()]
         weights = list(p_conf.allocations.values())
 
-        # Create strategy from config if defined
+        # Create strategy if defined
         strategy = None
         if p_conf.strategy:
             strategy = create_strategy_from_config(p_conf.strategy)
-            print(f"  > Strategy: {strategy.name}")
-            print(f"  > Config: {strategy.get_config_summary()}")
+            print(f"  Strategy: {strategy.name}")
 
-        # Run simulation with strategy
+        # Run simulation
         sim_res = sim.simulate_portfolio(
-            assets,
-            weights,
+            assets, weights,
             start_date_override=global_start_date,
             strategy=strategy
         )
 
-        # Run backtest with strategy
+        # Run backtest
         bt_res = backtester.run_backtest(
-            assets,
-            weights,
-            config.simulation.initial_capital,
+            assets, weights, config.simulation.initial_capital,
             start_date_override=global_start_date,
             strategy=strategy,
             contribution_amount=config.simulation.contribution_amount,
@@ -175,23 +212,25 @@ def main():
             'backtest': bt_res
         })
 
-        # Print quick summary
+        # Quick summary
         m = bt_res['metrics']
-        print(f"  > Hist CAGR: {m['CAGR']*100:.2f}%  |  Max DD: {m['Max Drawdown']*100:.2f}%  |  Sharpe: {m['Sharpe']:.2f}")
+        print(f"  CAGR: {m['CAGR']*100:.2f}% | Max DD: {m['Max Drawdown']*100:.2f}% | Sharpe: {m['Sharpe']:.2f}")
 
-    # Run Selected Optimizations
+    # Run Optimizations
     if config.optimization and not args.no_optimize:
-        print("\n" + "="*60 + "\nRunning Selected Optimizations...\n" + "="*60)
+        print("\n" + "="*60)
+        print("RUNNING OPTIMIZATIONS")
+        print("="*60)
 
-        # Check all optimization assets exist
-        missing_opt = [t.upper() for t in config.optimization.assets if t.upper() not in asset_map]
-        if missing_opt:
-            print(f"⚠ Missing optimization assets: {missing_opt}")
+        # Filter to available assets
+        opt_assets = [
+            asset_map[name.upper()]
+            for name in config.optimization.assets
+            if name.upper() in asset_map
+        ]
 
-        opt_assets = [asset_map[name.upper()] for name in config.optimization.assets if name.upper() in asset_map]
-
-        if not opt_assets:
-            print("⚠ No valid assets for optimization")
+        if len(opt_assets) < 2:
+            print("⚠ Need at least 2 assets for optimization")
         else:
             active_strats = config.optimization.active_strategies
 
@@ -208,7 +247,7 @@ def main():
                     print(f"⚠ Unknown strategy: {strat_name}")
                     continue
 
-                print(f"Running: {strat_name}...")
+                print(f"\n→ {strat_name}...")
 
                 if strat_name == 'custom_weighted':
                     strat_result = strategy_map[strat_name](
@@ -219,7 +258,10 @@ def main():
                 else:
                     strat_result = strategy_map[strat_name](opt_assets, start_date_override=global_start_date)
 
-                alloc_str = " / ".join([f"{int(w*100)}% {a['ticker']}" for w, a in zip(strat_result['allocations'], opt_assets)])
+                alloc_str = " / ".join([
+                    f"{int(w*100)}% {a['ticker']}"
+                    for w, a in zip(strat_result['allocations'], opt_assets)
+                ])
                 print(f"  Result: {alloc_str}")
 
                 bt_res = backtester.run_backtest(
@@ -235,7 +277,9 @@ def main():
                 })
 
     # Generate Report
-    print("\n" + "="*60 + "\nGenerating Report...\n" + "="*60)
+    print("\n" + "="*60)
+    print("GENERATING REPORT")
+    print("="*60)
 
     out_dir = 'output'
     Path(out_dir).mkdir(parents=True, exist_ok=True)
