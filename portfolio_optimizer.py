@@ -12,6 +12,7 @@ from portfolio_simulator import PortfolioSimulator
 # Leveraged ETFs that shouldn't dominate "min volatility" portfolios
 LEVERAGED_ETFS = {'TQQQ', 'SQQQ', 'SPXL', 'SPXS', 'UPRO', 'TMF', 'TMV', 'UDOW', 'SDOW',
                   'QLD', 'QID', 'SSO', 'SDS', 'UVXY', 'SVXY', 'SOXL', 'SOXS'}
+LEVERAGED_ETFS = {}
 
 class PortfolioOptimizer:
     def __init__(self, simulator: PortfolioSimulator, data_manager):
@@ -150,9 +151,20 @@ class PortfolioOptimizer:
             p_daily_rets = returns.dot(weights)
             ann_ret = np.mean(p_daily_rets) * 252
             downside = p_daily_rets[p_daily_rets < 0]
+
+            # Need enough downside days for meaningful calculation
+            if len(downside) < 20:
+                # Penalize assets with too few negative days (like cash)
+                # Can't calculate meaningful Sortino
+                return 100  # Return LARGE positive = bad score for minimizer
+
             downside_std = np.std(downside) * np.sqrt(252)
-            if downside_std == 0: return -10
-            return - (ann_ret - rf) / downside_std
+            if downside_std < 0.001:
+                # Near-zero downside vol means we can't trust Sortino
+                return 100
+
+            sortino = (ann_ret - rf) / downside_std
+            return -sortino  # Negative because we're minimizing
 
         return self._minimize(neg_sortino, assets, args=(returns, risk_free_rate),
                               label="Max Sortino (Growth)")

@@ -33,12 +33,12 @@ class PortfolioVisualizer:
         except:
             return [], []
 
-    def _get_contribution_info(self, item) -> str:
-        """Extract contribution info from portfolio result"""
+    def _get_type_info(self, item) -> str:
+        """Get combined contribution + strategy info (single line)"""
         results = item.get('results', {})
         backtest = item.get('backtest', {})
 
-        # Check for total invested (indicates DCA)
+        # Check for DCA
         total_invested = backtest.get('metrics', {}).get('Total Invested', None)
         if total_invested is None:
             total_invested = results.get('total_invested', None)
@@ -47,21 +47,21 @@ class PortfolioVisualizer:
                                                          results.get('stats', {}).get('initial_capital', 10000))
 
         if total_invested and total_invested > start_balance * 1.01:
-            contributions = total_invested - start_balance
-            return f"DCA: ${contributions:,.0f}"
+            contrib_str = f"DCA: ${total_invested - start_balance:,.0f}"
         else:
-            return "Lump Sum"
+            contrib_str = "Lump Sum"
 
-    def _get_strategy_info(self, item) -> str:
-        """Extract strategy name from portfolio result"""
-        results = item.get('results', {})
-        backtest = item.get('backtest', {})
+        # Get strategy (but avoid redundancy)
+        strategy = backtest.get('strategy', results.get('strategy', ''))
 
-        strategy = backtest.get('strategy', results.get('strategy', 'Buy and Hold'))
-        return strategy if strategy else 'Buy and Hold'
+        # Skip generic/redundant strategy names
+        if strategy and strategy not in ['Buy and Hold', 'Static DCA', '', None]:
+            return f"{contrib_str}<br><small>{strategy}</small>"
+
+        return contrib_str
 
     def create_allocation_table_html(self, portfolio_results):
-        """Creates a formatted HTML table showing allocations for ALL portfolios."""
+        """Creates a compact allocation table"""
         all_tickers = set()
         portfolio_rows = []
 
@@ -75,35 +75,34 @@ class PortfolioVisualizer:
 
             for asset, weight in zip(assets, allocations):
                 ticker = asset['ticker'].upper()
-                all_tickers.add(ticker)
-                row_data[ticker] = weight
+                if weight > 0.001:  # Only include non-zero allocations
+                    all_tickers.add(ticker)
+                    row_data[ticker] = weight
 
             portfolio_rows.append(row_data)
 
         sorted_tickers = sorted(list(all_tickers))
 
-        html = '<div style="overflow-x: auto;"><table class="allocation-table">'
-        html += '<thead><tr><th style="text-align:left;">Portfolio</th>'
+        # Compact table with smaller cells
+        html = '''<div style="overflow-x: auto; font-size: 0.85em;">
+        <table style="border-collapse: collapse; width: auto;">
+        <thead><tr><th style="text-align:left; padding: 6px 10px;">Portfolio</th>'''
+
         for ticker in sorted_tickers:
-            html += f'<th>{ticker}</th>'
+            html += f'<th style="padding: 6px 8px; min-width: 50px;">{ticker}</th>'
         html += '</tr></thead>'
 
         html += '<tbody>'
         for row_dict in portfolio_rows:
             p_name = row_dict['Portfolio']
-            html += f'<tr><td style="font-weight:bold; text-align:left; background-color: #f8f9fa;">{p_name}</td>'
+            html += f'<tr><td style="font-weight:600; text-align:left; padding: 5px 10px; white-space: nowrap;">{p_name}</td>'
 
             for ticker in sorted_tickers:
                 val = row_dict.get(ticker, 0.0)
-
                 if val > 0.001:
-                    display_val = f"{val*100:.1f}%"
-                    style = 'style="font-weight:500;"'
+                    html += f'<td style="padding: 5px 8px; text-align: center;">{val*100:.0f}%</td>'
                 else:
-                    display_val = "-"
-                    style = 'style="color: #ccc;"'
-
-                html += f'<td {style}>{display_val}</td>'
+                    html += '<td style="padding: 5px 8px; text-align: center; color: #ddd;">-</td>'
             html += '</tr>'
         html += '</tbody></table></div>'
 
@@ -223,38 +222,36 @@ class PortfolioVisualizer:
         if start_date and end_date:
             date_str = f"<p style='color: #666; margin-top: -15px;'>Analysis Period: <b>{start_date}</b> to <b>{end_date}</b></p>"
 
-        # Build performance metrics table with VOLATILITY and STRATEGY columns
+        # Build performance metrics table with VOLATILITY column
         table_html = f"""
         <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 20px; background: #f9f9f9; color: #333; }}
-            details {{ background: white; padding: 20px; margin-bottom: 15px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 1px solid #eaeaea; }}
-            summary {{ cursor: pointer; font-weight: 600; font-size: 1.1em; padding-bottom: 5px; outline: none; list-style: none; }}
-            summary:after {{ content: "+"; float: right; font-weight: bold; }}
-            details[open] summary:after {{ content: "-"; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 20px; background: #f9f9f9; color: #333; }}
+            details {{ background: white; padding: 15px 20px; margin-bottom: 12px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 1px solid #eaeaea; }}
+            summary {{ cursor: pointer; font-weight: 600; font-size: 1.05em; outline: none; list-style: none; }}
+            summary::-webkit-details-marker {{ display: none; }}
+            summary:after {{ content: " ▶"; font-size: 0.8em; }}
+            details[open] summary:after {{ content: " ▼"; }}
 
-            table {{ width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 0.85em; }}
-            th, td {{ border-bottom: 1px solid #eee; padding: 10px 6px; text-align: right; }}
-            th {{ background-color: #f8f9fa; color: #666; font-weight: 600; text-align: center; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.82em; }}
+            th, td {{ border-bottom: 1px solid #eee; padding: 8px 6px; text-align: right; }}
+            th {{ background-color: #f8f9fa; color: #555; font-weight: 600; text-align: center; font-size: 0.9em; }}
             td:first-child {{ text-align: left; font-weight: 600; color: #2c3e50; }}
-
-            .allocation-table th {{ background-color: #e3f2fd; color: #1565c0; }}
-            .allocation-table tr:hover {{ background-color: #f5f5f5; }}
+            small {{ color: #888; font-weight: normal; }}
 
             .pos-val {{ color: #27ae60; }}
             .neg-val {{ color: #c0392b; }}
             .warn-val {{ color: #f39c12; }}
-            .strategy-col {{ font-size: 0.8em; color: #666; }}
         </style>
-        <h1>Portfolio Analysis Report</h1>
+        <h1 style="margin-bottom: 5px;">Portfolio Analysis Report</h1>
         {date_str}
         <details open><summary>Performance Metrics Summary</summary>
         <table>
         <tr>
-            <th>Portfolio</th>
+            <th style="text-align:left;">Portfolio</th>
             <th>Type</th>
             <th>Sim CAGR</th>
             <th>Hist CAGR</th>
-            <th>Volatility</th>
+            <th>Vol</th>
             <th>Sharpe</th>
             <th>Sortino</th>
             <th>Max DD</th>
@@ -271,15 +268,8 @@ class PortfolioVisualizer:
             hist_cagr = m['CAGR']
             volatility = m['Stdev']
 
-            # Contribution type
-            contrib_type = self._get_contribution_info(item)
-            strategy = self._get_strategy_info(item)
-
-            # Combine into type column
-            if strategy != 'Buy and Hold' and strategy != 'Static DCA':
-                type_str = f"{contrib_type}<br><span class='strategy-col'>{strategy}</span>"
-            else:
-                type_str = contrib_type
+            # Single combined type column
+            type_str = self._get_type_info(item)
 
             # Calculate delta and flag large discrepancies
             delta = sim_cagr - hist_cagr
@@ -316,7 +306,7 @@ class PortfolioVisualizer:
         """
 
         html_content = f"{table_html}" \
-                       f"<details open><summary>Asset Allocation Details</summary>{allocation_table_html}</details>" \
+                       f"<details><summary>Asset Allocation Details</summary>{allocation_table_html}</details>" \
                        f"<details open><summary>Historical Backtest</summary>{pio.to_html(bt_fig, full_html=False, include_plotlyjs='cdn')}</details>" \
                        f"<details open><summary>Monte Carlo Simulation</summary>{pio.to_html(mc_fig, full_html=False, include_plotlyjs=False)}</details>"
 
