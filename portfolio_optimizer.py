@@ -33,13 +33,13 @@ class PortfolioOptimizer:
             return self._data_cache[cache_key]
 
         try:
-            df = self.simulator._prepare_multivariate_data(assets, start_date_override=start_date_override)
+            # Note: _prepare_multivariate_data already returns daily returns, NOT prices
+            returns = self.simulator._prepare_multivariate_data(assets, start_date_override=start_date_override)
         except ValueError as e:
             print(f"Optimization Skipped: {e}")
             return None, None, None
 
-        df = df.ffill()
-        returns = df.pct_change()
+        # Clean any remaining issues (but do NOT call pct_change - data is already returns!)
         returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
 
         if len(returns) < 50:
@@ -68,15 +68,25 @@ class PortfolioOptimizer:
         initial_guess = np.array(num_assets * [1. / num_assets,])
 
         try:
-            # Relaxed tolerances for faster convergence (still accurate enough for portfolio optimization)
-            opts = {'ftol': 1e-6, 'maxiter': 200}
+            # Tighter tolerance for better convergence
+            opts = {'ftol': 1e-9, 'maxiter': 500}
 
             result = sco.minimize(fun, initial_guess, args=args, method='SLSQP',
                                   bounds=bounds, constraints=constraints, options=opts)
 
             best_result = result
-            # Random restarts (reduced from 10 to 3 for speed)
-            for _ in range(3):
+
+            # Try starting points that favor single assets (helps find global optimum)
+            for i in range(num_assets):
+                concentrated_guess = np.ones(num_assets) * 0.01
+                concentrated_guess[i] = 1.0 - 0.01 * (num_assets - 1)
+                res = sco.minimize(fun, concentrated_guess, args=args, method='SLSQP',
+                                   bounds=bounds, constraints=constraints, options=opts)
+                if res.success and res.fun < best_result.fun:
+                    best_result = res
+
+            # Random restarts for additional exploration
+            for _ in range(5):
                 rand_guess = np.random.random(num_assets)
                 rand_guess /= np.sum(rand_guess)
                 res = sco.minimize(fun, rand_guess, args=args, method='SLSQP',
