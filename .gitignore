@@ -22,6 +22,7 @@ Gemfile.lock
 __pycache__/
 .venv/
 .vscode
+*.sqlite
 
 # Personal portfolio configurations (IMPORTANT!)
 config/*.py
