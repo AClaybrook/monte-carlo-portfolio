@@ -30,7 +30,12 @@ Portfolio analysis tool inspired by [PortfolioVisualizer.com](https://www.portfo
 
 ## Essential Commands
 
+
+
 ```bash
+# Activate virtual environment
+source venv/bin/activate
+
 # Install dependencies
 pip install -r requirements.txt
 
@@ -140,3 +145,7 @@ See `.claude/docs/` for detailed patterns:
 ### Known Issues
 - yfinance may heavily rate limit downloads, especially on WSL/Linux
 - For best results, use explicit `end_date` matching your cached data (check with `python data_utils.py coverage`)
+
+### Tests
+- Run: python -m pytest tests/ -v
+- Run tests after code changes to python files
