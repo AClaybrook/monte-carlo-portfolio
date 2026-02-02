@@ -151,13 +151,30 @@ Reduced full example_config runtime from ~3min to ~1.3min:
 - Fixed overflow in `portfolio_simulator.py` using float64 for cumprod operations
 - Fixed single-asset covariance with `np.atleast_2d()`
 
-### Testing
+### Quick Test Config
 - `config/quick_test.py` - Fast config for iteration (~10s, 2000 sims, no optimization)
+
+## Testing
+
+```bash
+# Run all tests
+python -m pytest tests/ -v
+
+# Run specific test file
+python -m pytest tests/test_simulator.py -v
+
+# Run with coverage
+python -m pytest tests/ -v --cov=. --cov-report=term-missing
+```
+
+### Test Files
+- `test_metrics.py` - CAGR, Sharpe, Sortino, drawdown calculations
+- `test_simulator.py` - Monte Carlo simulation engine
+- `test_optimizer.py` - Portfolio optimization (Sharpe, min vol, risk parity)
+- `test_backtest.py` - Historical backtesting
+- `test_dca_strategies.py` - DCA and dynamic allocation strategies
+- `test_historical_validation.py` - Validates against cached market data (VOO, BND, BTC-USD, etc.)
 
 ### Known Issues
 - yfinance may heavily rate limit downloads, especially on WSL/Linux
 - For best results, use explicit `end_date` matching your cached data (check with `python data_utils.py coverage`)
-
-### Tests
-- Run: python -m pytest tests/ -v
-- Run tests after code changes to python files

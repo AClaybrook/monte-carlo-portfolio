@@ -4,8 +4,11 @@ Historical Validation Tests
 Tests that verify asset characteristics and optimizer behavior match known real-world patterns.
 These tests help ensure the simulator produces sensible results that align with market reality.
 
-Note: These tests require network access to fetch real market data.
-Tests are marked as 'slow' and will skip if data cannot be fetched.
+Uses CACHED data from the database only (no yfinance calls).
+Tests will skip if required ticker data isn't in the local database.
+
+Available tickers in DB: VOO, QQQ, BTC-USD, SPXL, SHV, VGT, BND, VTI, GLD, TLT, etc.
+Cached date range: ~2016 to late 2025
 """
 import pytest
 import numpy as np
@@ -21,12 +24,20 @@ from data_manager import DataManager
 
 
 def fetch_data(ticker: str, start: str, end: str) -> pd.DataFrame:
-    """Helper to fetch historical data using DataManager."""
+    """
+    Fetch historical data from LOCAL DATABASE ONLY (no yfinance calls).
+    Skips test if ticker not in database.
+    """
     dm = DataManager()
     try:
-        data = dm.get_prices([ticker], start, end)
+        # Use _get_from_db directly to avoid any yfinance calls
+        data = dm._get_from_db(ticker, start, end)
         if data is not None and not data.empty:
-            return data
+            # Return DataFrame with ticker as column name (using Adj Close)
+            result = pd.DataFrame({ticker: data['Adj Close']})
+            result.index = data.index
+            return result
+        pytest.skip(f"No cached data for {ticker} in date range {start} to {end}")
     except Exception as e:
         pytest.skip(f"Could not fetch data for {ticker}: {e}")
     finally:
@@ -35,7 +46,10 @@ def fetch_data(ticker: str, start: str, end: str) -> pd.DataFrame:
 
 
 class TestAssetCharacteristics:
-    """Tests verifying individual asset behaviors match expectations."""
+    """
+    Tests verifying individual asset behaviors match expectations.
+    Uses tickers available in local database: VOO, BND, SHV, BTC-USD, QQQ, VGT, etc.
+    """
 
     def calculate_volatility(self, prices: pd.Series) -> float:
         """Calculate annualized volatility from price series."""
@@ -51,7 +65,6 @@ class TestAssetCharacteristics:
             return 0.0
         return (prices.iloc[-1] / prices.iloc[0]) ** (1 / years) - 1
 
-    @pytest.mark.slow
     def test_shv_low_volatility(self):
         """SHV (short-term treasury ETF) should have very low volatility."""
         data = fetch_data("SHV", "2020-01-01", "2024-12-31")
@@ -60,7 +73,6 @@ class TestAssetCharacteristics:
         # SHV is essentially cash - volatility should be < 2%
         assert vol < 0.02, f"SHV volatility {vol:.2%} should be < 2% (cash-like)"
 
-    @pytest.mark.slow
     def test_btc_high_volatility(self):
         """BTC should have high volatility (>40% annualized)."""
         data = fetch_data("BTC-USD", "2020-01-01", "2024-12-31")
@@ -69,29 +81,26 @@ class TestAssetCharacteristics:
         # Bitcoin is highly volatile
         assert vol > 0.40, f"BTC volatility {vol:.2%} should be > 40%"
 
-    @pytest.mark.slow
-    def test_spy_moderate_volatility(self):
-        """SPY should have moderate volatility (10-25%)."""
-        data = fetch_data("SPY", "2020-01-01", "2024-12-31")
-        vol = self.calculate_volatility(data['SPY'])
+    def test_voo_moderate_volatility(self):
+        """VOO (S&P 500 ETF) should have moderate volatility (10-25%)."""
+        data = fetch_data("VOO", "2020-01-01", "2024-12-31")
+        vol = self.calculate_volatility(data['VOO'])
 
-        assert 0.10 < vol < 0.30, f"SPY volatility {vol:.2%} should be 10-30%"
+        assert 0.10 < vol < 0.30, f"VOO volatility {vol:.2%} should be 10-30%"
 
-    @pytest.mark.slow
-    def test_agg_low_volatility(self):
-        """AGG (bond fund) should have lower volatility than stocks."""
-        spy_data = fetch_data("SPY", "2020-01-01", "2024-12-31")
-        agg_data = fetch_data("AGG", "2020-01-01", "2024-12-31")
+    def test_bnd_lower_volatility_than_stocks(self):
+        """BND (bond fund) should have lower volatility than stocks."""
+        voo_data = fetch_data("VOO", "2020-01-01", "2024-12-31")
+        bnd_data = fetch_data("BND", "2020-01-01", "2024-12-31")
 
-        spy_vol = self.calculate_volatility(spy_data['SPY'])
-        agg_vol = self.calculate_volatility(agg_data['AGG'])
+        voo_vol = self.calculate_volatility(voo_data['VOO'])
+        bnd_vol = self.calculate_volatility(bnd_data['BND'])
 
-        assert agg_vol < spy_vol, f"AGG vol {agg_vol:.2%} should be < SPY vol {spy_vol:.2%}"
+        assert bnd_vol < voo_vol, f"BND vol {bnd_vol:.2%} should be < VOO vol {voo_vol:.2%}"
 
-    @pytest.mark.slow
     def test_volatility_ordering(self):
-        """Test typical volatility ordering: SHV < AGG < SPY < BTC."""
-        tickers = ["SHV", "AGG", "SPY", "BTC-USD"]
+        """Test typical volatility ordering: SHV < BND < VOO < BTC."""
+        tickers = ["SHV", "BND", "VOO", "BTC-USD"]
         vols = {}
 
         for ticker in tickers:
@@ -103,53 +112,52 @@ class TestAssetCharacteristics:
                 continue
 
         if len(vols) >= 3:
-            # At minimum, verify SHV < SPY < BTC if all available
-            if "SHV" in vols and "SPY" in vols:
-                assert vols["SHV"] < vols["SPY"], "SHV should be less volatile than SPY"
-            if "SPY" in vols and "BTC-USD" in vols:
-                assert vols["SPY"] < vols["BTC-USD"], "SPY should be less volatile than BTC"
+            # Verify SHV < VOO < BTC if all available
+            if "SHV" in vols and "VOO" in vols:
+                assert vols["SHV"] < vols["VOO"], "SHV should be less volatile than VOO"
+            if "VOO" in vols and "BTC-USD" in vols:
+                assert vols["VOO"] < vols["BTC-USD"], "VOO should be less volatile than BTC"
 
 
 class TestHistoricalBenchmarks:
-    """Tests verifying known historical events are captured correctly."""
+    """
+    Tests verifying known historical events are captured correctly.
+    Uses VOO (S&P 500 ETF) instead of SPY, BND instead of AGG.
+    """
 
-    @pytest.mark.slow
-    def test_2022_spy_negative_return(self):
-        """2022 was a down year for SPY (~-18%)."""
-        data = fetch_data("SPY", "2022-01-01", "2022-12-31")
+    def test_2022_voo_negative_return(self):
+        """2022 was a down year for VOO (~-18%)."""
+        data = fetch_data("VOO", "2022-01-01", "2022-12-31")
 
-        annual_return = data['SPY'].iloc[-1] / data['SPY'].iloc[0] - 1
+        annual_return = data['VOO'].iloc[-1] / data['VOO'].iloc[0] - 1
 
-        # 2022 SPY return was approximately -18%
-        assert annual_return < 0, f"2022 SPY should be negative, got {annual_return:.2%}"
-        assert annual_return > -0.30, f"2022 SPY was ~-18%, got {annual_return:.2%}"
+        # 2022 VOO return was approximately -18%
+        assert annual_return < 0, f"2022 VOO should be negative, got {annual_return:.2%}"
+        assert annual_return > -0.30, f"2022 VOO was ~-18%, got {annual_return:.2%}"
 
-    @pytest.mark.slow
-    def test_2022_agg_negative_return(self):
-        """2022 was also bad for bonds (AGG ~-13%)."""
-        data = fetch_data("AGG", "2022-01-01", "2022-12-31")
+    def test_2022_bnd_negative_return(self):
+        """2022 was also bad for bonds (BND ~-13%)."""
+        data = fetch_data("BND", "2022-01-01", "2022-12-31")
 
-        annual_return = data['AGG'].iloc[-1] / data['AGG'].iloc[0] - 1
+        annual_return = data['BND'].iloc[-1] / data['BND'].iloc[0] - 1
 
         # 2022 was historic for bonds being down with stocks
-        assert annual_return < 0, f"2022 AGG should be negative, got {annual_return:.2%}"
+        assert annual_return < 0, f"2022 BND should be negative, got {annual_return:.2%}"
 
-    @pytest.mark.slow
     def test_2020_covid_recovery(self):
-        """SPY recovered from COVID crash by end of 2020."""
-        data = fetch_data("SPY", "2020-01-01", "2020-12-31")
+        """VOO recovered from COVID crash by end of 2020."""
+        data = fetch_data("VOO", "2020-01-01", "2020-12-31")
 
-        annual_return = data['SPY'].iloc[-1] / data['SPY'].iloc[0] - 1
+        annual_return = data['VOO'].iloc[-1] / data['VOO'].iloc[0] - 1
 
         # Despite COVID crash, 2020 ended positive
-        assert annual_return > 0, f"2020 SPY should be positive overall, got {annual_return:.2%}"
+        assert annual_return > 0, f"2020 VOO should be positive overall, got {annual_return:.2%}"
 
-    @pytest.mark.slow
     def test_2020_covid_drawdown(self):
-        """SPY had ~34% drawdown during COVID crash (Feb-Mar 2020)."""
-        data = fetch_data("SPY", "2020-01-01", "2020-04-30")
+        """VOO had ~34% drawdown during COVID crash (Feb-Mar 2020)."""
+        data = fetch_data("VOO", "2020-01-01", "2020-04-30")
 
-        prices = data['SPY']
+        prices = data['VOO']
         peak = prices.expanding().max()
         drawdown = (prices - peak) / peak
         max_drawdown = drawdown.min()
@@ -158,15 +166,14 @@ class TestHistoricalBenchmarks:
         assert max_drawdown < -0.25, f"COVID drawdown should be > 25%, got {max_drawdown:.2%}"
         assert max_drawdown > -0.45, f"COVID drawdown was ~34%, got {max_drawdown:.2%}"
 
-    @pytest.mark.slow
     def test_2021_strong_bull_market(self):
         """2021 was a strong year for equities."""
-        data = fetch_data("SPY", "2021-01-01", "2021-12-31")
+        data = fetch_data("VOO", "2021-01-01", "2021-12-31")
 
-        annual_return = data['SPY'].iloc[-1] / data['SPY'].iloc[0] - 1
+        annual_return = data['VOO'].iloc[-1] / data['VOO'].iloc[0] - 1
 
-        # 2021 SPY return was approximately +27%
-        assert annual_return > 0.15, f"2021 SPY should be strongly positive, got {annual_return:.2%}"
+        # 2021 VOO return was approximately +27%
+        assert annual_return > 0.15, f"2021 VOO should be strongly positive, got {annual_return:.2%}"
 
 
 class TestPVCompatibility:
