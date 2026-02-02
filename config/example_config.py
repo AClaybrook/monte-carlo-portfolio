@@ -78,7 +78,9 @@ config = RunConfig(
         years=30,
         simulations=10000,
         method='geometric_brownian',
-        lookback_years=10,
+        start_date='2017-01-01',
+        end_date='2025-12-01',
+        # lookback_years=10,  # Not needed when using explicit dates
         contribution_amount=0.0,
         contribution_frequency=21  # trading days
     ),

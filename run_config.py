@@ -80,14 +80,80 @@ class OptimizationConfig:
 
 @dataclass
 class SimulationConfig:
+    """
+    Configuration for Monte Carlo simulations and historical data.
+
+    Date range options (in order of precedence):
+    1. start_date + end_date: Explicit date range (format: 'YYYY-MM-DD')
+    2. end_date + lookback_years: End date with lookback period
+    3. lookback_years only: Uses today as end_date with lookback period
+
+    Examples:
+        # Use explicit date range
+        SimulationConfig(start_date='2020-01-01', end_date='2024-12-31')
+
+        # Use lookback from specific end date
+        SimulationConfig(end_date='2024-12-31', lookback_years=5)
+
+        # Use lookback from today (default behavior)
+        SimulationConfig(lookback_years=10)
+    """
     initial_capital: float = 100000
     years: int = 10
     simulations: int = 10000
     method: Literal['bootstrap', 'geometric_brownian', 'parametric'] = 'bootstrap'
-    end_date: Optional[str] = None
-    lookback_years: int = 10
+
+    # Date range options
+    start_date: Optional[str] = None  # Format: 'YYYY-MM-DD'
+    end_date: Optional[str] = None    # Format: 'YYYY-MM-DD', defaults to today
+    lookback_years: int = 10          # Used if start_date not specified
+
     contribution_amount: float = 0.0
     contribution_frequency: int = 21  # trading days (~monthly)
+
+    def __post_init__(self):
+        from datetime import date as dt_date
+
+        # Validate dates if provided
+        if self.start_date:
+            try:
+                dt_date.fromisoformat(self.start_date)
+            except ValueError:
+                raise ValueError(f"start_date must be YYYY-MM-DD format, got: {self.start_date}")
+
+        if self.end_date:
+            try:
+                dt_date.fromisoformat(self.end_date)
+            except ValueError:
+                raise ValueError(f"end_date must be YYYY-MM-DD format, got: {self.end_date}")
+
+        # Validate start < end if both provided
+        if self.start_date and self.end_date:
+            start = dt_date.fromisoformat(self.start_date)
+            end = dt_date.fromisoformat(self.end_date)
+            if start >= end:
+                raise ValueError(f"start_date ({self.start_date}) must be before end_date ({self.end_date})")
+
+    def get_date_range(self) -> tuple:
+        """
+        Calculate the effective start and end dates.
+        Returns (start_date, end_date) as date objects.
+        """
+        from datetime import date as dt_date, timedelta
+
+        # Determine end date
+        if self.end_date:
+            end = dt_date.fromisoformat(self.end_date)
+        else:
+            end = dt_date.today()
+
+        # Determine start date
+        if self.start_date:
+            start = dt_date.fromisoformat(self.start_date)
+        else:
+            start = end - timedelta(days=365 * self.lookback_years)
+
+        return (start, end)
 
 @dataclass
 class VisualizationConfig:

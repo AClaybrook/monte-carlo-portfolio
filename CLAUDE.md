@@ -48,6 +48,14 @@ python main.py --coverage-report
 
 # Skip optimization step
 python main.py --no-optimize
+
+# Data management utility (data_utils.py)
+python data_utils.py list                      # List all tickers in DB
+python data_utils.py coverage                  # Show data coverage report
+python data_utils.py sync --since 2024-12-05   # Update all tickers stale since Dec 5
+python data_utils.py sync --dry-run            # Preview what would be updated
+python data_utils.py download VOO,QQQ,BND      # Bulk download specific tickers
+python data_utils.py info VOO                  # Show ticker info and gaps
 ```
 
 ## Configuration
@@ -57,9 +65,22 @@ All configuration uses type-safe dataclasses. Create configs in `config/my_*.py`
 Key config classes ([run_config.py:8-129](run_config.py#L8-L129)):
 - `RunConfig` - Top-level container
 - `PortfolioConfig` - Portfolio name, allocations, optional strategy
-- `SimulationConfig` - Capital, years, simulation count, method (bootstrap/geometric_brownian)
+- `SimulationConfig` - Capital, years, simulation count, method, **start_date/end_date**
 - `OptimizationConfig` - Assets to optimize, strategies (max_sharpe, min_volatility, etc.)
 - `StrategyConfig` - Dynamic allocation strategy type and params
+
+### SimulationConfig Date Options
+
+```python
+# Option 1: Explicit date range (most control)
+SimulationConfig(start_date='2020-01-01', end_date='2024-12-31')
+
+# Option 2: End date with lookback period
+SimulationConfig(end_date='2024-12-31', lookback_years=5)
+
+# Option 3: Lookback from today (default behavior)
+SimulationConfig(lookback_years=10)
+```
 
 ## Key Module Entry Points
 

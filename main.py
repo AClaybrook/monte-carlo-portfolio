@@ -90,10 +90,9 @@ def main():
     all_tickers = list(collect_all_tickers(config))
     print(f"Tickers to load: {', '.join(sorted(all_tickers))}")
 
-    # Calculate date range
-    lookback_years = config.simulation.lookback_years
-    end_date = date.today()
-    start_date = end_date - timedelta(days=365 * lookback_years)
+    # Calculate date range from config
+    start_date, end_date = config.simulation.get_date_range()
+    print(f"Date range: {start_date} to {end_date}")
 
     # Bulk download all data at once (or use cache only in offline mode)
     if args.offline:

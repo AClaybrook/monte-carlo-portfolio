@@ -8,6 +8,8 @@ Commands:
     download  - Bulk download tickers
     clear     - Clear data for a ticker
     info      - Show ticker info and inception date
+    list      - List all tickers in database
+    sync      - Update all tickers with stale data (catch-up after downtime)
 """
 
 import argparse
@@ -197,6 +199,100 @@ def cmd_list(args):
     dm.close()
 
 
+def cmd_sync(args):
+    """
+    Sync/update all tickers that have stale data.
+
+    Finds tickers where last_valid_date < today and downloads missing data.
+    Useful for catching up after a period of not running the system.
+    """
+    dm = DataManager(args.db)
+
+    today = date.today()
+    stale_since = date.fromisoformat(args.since) if args.since else today - timedelta(days=1)
+
+    print(f"\n{'='*60}")
+    print("DATA SYNC")
+    print(f"{'='*60}")
+    print(f"Finding tickers with data older than: {stale_since}")
+    print(f"Will update through: {today}")
+    print()
+
+    # Get all tickers and their metadata
+    all_tickers = dm.list_all_tickers()
+
+    if args.tickers:
+        # Filter to specific tickers if provided
+        filter_tickers = set(t.strip().upper() for t in args.tickers.split(','))
+        all_tickers = [t for t in all_tickers if t.upper() in filter_tickers]
+
+    stale_tickers = []
+    up_to_date_tickers = []
+
+    for ticker in all_tickers:
+        tracker = dm._get_interval_tracker(ticker)
+        bounds = tracker.bounds
+
+        if bounds is None:
+            # No data - consider stale
+            stale_tickers.append((ticker, None))
+        elif bounds[1] < stale_since:
+            # Last data is before our stale threshold
+            stale_tickers.append((ticker, bounds[1]))
+        else:
+            up_to_date_tickers.append((ticker, bounds[1]))
+
+    print(f"Up to date: {len(up_to_date_tickers)} tickers")
+    print(f"Need update: {len(stale_tickers)} tickers")
+
+    if args.dry_run:
+        print("\n[DRY RUN - No downloads will be performed]\n")
+        if stale_tickers:
+            print("Stale tickers:")
+            for ticker, last_date in stale_tickers:
+                print(f"  {ticker}: last data {last_date or 'NONE'}")
+        return
+
+    if not stale_tickers:
+        print("\n✓ All tickers are up to date!")
+        dm.close()
+        return
+
+    print(f"\n{'─'*60}")
+    print("DOWNLOADING MISSING DATA")
+    print(f"{'─'*60}\n")
+
+    # Download updates for stale tickers
+    tickers_to_update = [t for t, _ in stale_tickers]
+
+    results = dm.bulk_download(
+        tickers_to_update,
+        start_date=stale_since,
+        end_date=today,
+        force_update=args.force,
+        sequential=args.sequential
+    )
+
+    print(f"\n{'='*60}")
+    print("SYNC SUMMARY")
+    print(f"{'='*60}")
+
+    success_count = 0
+    fail_count = 0
+
+    for ticker, last_date in stale_tickers:
+        if ticker in results and len(results[ticker]) > 0:
+            new_rows = len(results[ticker])
+            print(f"  ✓ {ticker}: updated (last was {last_date or 'NONE'})")
+            success_count += 1
+        else:
+            print(f"  ⚠ {ticker}: no new data available")
+            fail_count += 1
+
+    print(f"\n{success_count} updated, {fail_count} unchanged")
+    dm.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description='Data Management Utility')
     parser.add_argument('--db', default='stock_data.db', help='Database path')
@@ -235,6 +331,15 @@ def main():
     # List command
     p_list = subparsers.add_parser('list', help='List all tickers in database')
 
+    # Sync command - update all stale tickers
+    p_sync = subparsers.add_parser('sync', help='Sync/update all tickers with stale data')
+    p_sync.add_argument('--since', help='Consider data stale if last update before this date (YYYY-MM-DD, default: yesterday)')
+    p_sync.add_argument('--tickers', help='Only sync these comma-separated tickers (default: all)')
+    p_sync.add_argument('--dry-run', action='store_true', help='Show what would be updated without downloading')
+    p_sync.add_argument('--force', action='store_true', help='Force re-download even if data exists')
+    p_sync.add_argument('--sequential', '-s', action='store_true',
+                        help='Download one at a time (slower but avoids rate limits)')
+
     args = parser.parse_args()
 
     if args.command == 'coverage':
@@ -249,6 +354,8 @@ def main():
         cmd_info(args)
     elif args.command == 'list':
         cmd_list(args)
+    elif args.command == 'sync':
+        cmd_sync(args)
     else:
         parser.print_help()
 
