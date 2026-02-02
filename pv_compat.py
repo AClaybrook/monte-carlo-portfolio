@@ -153,3 +153,40 @@ def generate_pv_url(allocations: dict, start_year: int = 2017, end_year: int = 2
         params.append(f'allocation{i}_1={weight*100:.0f}')
 
     return f"{base}?{'&'.join(params)}"
+
+
+def generate_mc_url(allocations: dict, initial_amount: int = 1000000,
+                    years: int = 30, periodic_amount: int = 0) -> str:
+    """
+    Generate Portfolio Visualizer Monte Carlo simulation URL using tickers.
+
+    Args:
+        allocations: Dict of {ticker: weight}
+        initial_amount: Starting portfolio value
+        years: Simulation time horizon
+        periodic_amount: Periodic contribution/withdrawal amount
+
+    Returns:
+        URL string that opens PV Monte Carlo with the portfolio pre-configured
+    """
+    base = "https://www.portfoliovisualizer.com/monte-carlo-simulation"
+
+    params = [
+        's=y',
+        f'initialAmount={initial_amount}',
+        f'years={years}',
+        'inflationAdjusted=true',
+        'simulationModel=1',  # Historical returns
+        'frequency=4',  # Annual
+    ]
+
+    if periodic_amount != 0:
+        params.append(f'periodicAmount={periodic_amount}')
+        params.append('adjustmentType=2')  # Inflation-adjusted contributions
+
+    for i, (ticker, weight) in enumerate(sorted(allocations.items()), 1):
+        pv_ticker = to_pv_ticker(ticker)
+        params.append(f'symbol{i}={pv_ticker}')
+        params.append(f'allocation{i}={weight*100:.0f}')
+
+    return f"{base}?{'&'.join(params)}"

@@ -10,7 +10,7 @@ import pandas as pd
 from scipy import stats
 import base64
 
-from pv_compat import export_portfolio_csv, save_portfolio_csv, generate_pv_url
+from pv_compat import export_portfolio_csv, save_portfolio_csv, generate_pv_url, generate_mc_url
 
 class PortfolioVisualizer:
     def __init__(self, simulator):
@@ -86,14 +86,31 @@ class PortfolioVisualizer:
 
         sorted_tickers = sorted(list(all_tickers))
 
+        # Button styles
+        btn_style = '''
+            display: inline-block;
+            padding: 4px 8px;
+            margin: 2px;
+            border-radius: 4px;
+            font-size: 0.75em;
+            font-weight: 500;
+            text-decoration: none;
+            border: 1px solid;
+            cursor: pointer;
+            transition: all 0.2s;
+        '''
+        csv_btn_style = f'{btn_style} background: #f8f9fa; color: #495057; border-color: #dee2e6;'
+        backtest_btn_style = f'{btn_style} background: #e3f2fd; color: #1565c0; border-color: #90caf9;'
+        mc_btn_style = f'{btn_style} background: #f3e5f5; color: #7b1fa2; border-color: #ce93d8;'
+
         # Compact table with smaller cells and export column
-        html = '''<div style="overflow-x: auto; font-size: 0.85em;">
+        html = f'''<div style="overflow-x: auto; font-size: 0.85em;">
         <table style="border-collapse: collapse; width: auto;">
         <thead><tr><th style="text-align:left; padding: 6px 10px;">Portfolio</th>'''
 
         for ticker in sorted_tickers:
             html += f'<th style="padding: 6px 8px; min-width: 50px;">{ticker}</th>'
-        html += '<th style="padding: 6px 8px;">Export</th></tr></thead>'
+        html += '<th style="padding: 6px 12px;">Export</th></tr></thead>'
 
         html += '<tbody>'
         for row_dict in portfolio_rows:
@@ -103,7 +120,7 @@ class PortfolioVisualizer:
             for ticker in sorted_tickers:
                 val = row_dict.get(ticker, 0.0)
                 if val > 0.001:
-                    html += f'<td style="padding: 5px 8px; text-align: center;">{val*100:.0f}%</td>'
+                    html += f'<td style="padding: 5px 8px; text-align: center;">{val*100:.1f}%</td>'
                 else:
                     html += '<td style="padding: 5px 8px; text-align: center; color: #ddd;">-</td>'
 
@@ -121,17 +138,20 @@ class PortfolioVisualizer:
             csv_b64 = base64.b64encode(csv_content.encode()).decode()
             data_uri = f"data:text/csv;base64,{csv_b64}"
 
-            # Generate PV URL
+            # Generate PV URLs
             pv_url = generate_pv_url(row_allocations)
+            mc_url = generate_mc_url(row_allocations)
 
             # Safe filename
             safe_name = "".join(c if c.isalnum() or c in '_-' else '_' for c in p_name)
 
-            html += f'''<td style="padding: 5px 8px; text-align: center;">
+            html += f'''<td style="padding: 5px 8px; text-align: center; white-space: nowrap;">
                 <a href="{data_uri}" download="{safe_name}.csv"
-                   style="text-decoration:none; margin-right:4px;" title="Download CSV for Portfolio Visualizer">📥</a>
+                   style="{csv_btn_style}" title="Download CSV for Portfolio Visualizer import">CSV</a>
                 <a href="{pv_url}" target="_blank"
-                   style="text-decoration:none;" title="Open in Portfolio Visualizer">📊</a>
+                   style="{backtest_btn_style}" title="Open Backtest in Portfolio Visualizer">Backtest</a>
+                <a href="{mc_url}" target="_blank"
+                   style="{mc_btn_style}" title="Open Monte Carlo in Portfolio Visualizer">MC Sim</a>
             </td>'''
             html += '</tr>'
         html += '</tbody></table></div>'
@@ -256,32 +276,34 @@ class PortfolioVisualizer:
 
         allocation_table_html = self.create_allocation_table_html(portfolio_results)
 
-        date_str = ""
-        if start_date and end_date:
-            date_str = f"<p style='color: #666; margin-top: -15px;'>Analysis Period: <b>{start_date}</b> to <b>{end_date}</b></p>"
-
         # Build performance metrics table with VOLATILITY column
         table_html = f"""
         <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 20px; background: #f9f9f9; color: #333; }}
-            details {{ background: white; padding: 15px 20px; margin-bottom: 12px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 1px solid #eaeaea; }}
-            summary {{ cursor: pointer; font-weight: 600; font-size: 1.05em; outline: none; list-style: none; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 16px 20px; background: #f9f9f9; color: #333; }}
+            details {{ background: white; padding: 12px 16px; margin-bottom: 10px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 1px solid #eaeaea; }}
+            summary {{ cursor: pointer; font-weight: 600; font-size: 1em; outline: none; list-style: none; }}
             summary::-webkit-details-marker {{ display: none; }}
-            summary:after {{ content: " ▶"; font-size: 0.8em; }}
+            summary:after {{ content: " ▶"; font-size: 0.75em; color: #888; }}
             details[open] summary:after {{ content: " ▼"; }}
 
-            table {{ width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.82em; }}
-            th, td {{ border-bottom: 1px solid #eee; padding: 8px 6px; text-align: right; }}
-            th {{ background-color: #f8f9fa; color: #555; font-weight: 600; text-align: center; font-size: 0.9em; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.82em; }}
+            th, td {{ border-bottom: 1px solid #eee; padding: 6px 8px; text-align: right; }}
+            th {{ background-color: #f8f9fa; color: #555; font-weight: 600; text-align: center; font-size: 0.85em; }}
             td:first-child {{ text-align: left; font-weight: 600; color: #2c3e50; }}
             small {{ color: #888; font-weight: normal; }}
 
             .pos-val {{ color: #27ae60; }}
             .neg-val {{ color: #c0392b; }}
             .warn-val {{ color: #f39c12; }}
+
+            .header-row {{ display: flex; align-items: baseline; gap: 16px; margin-bottom: 8px; flex-wrap: wrap; }}
+            .header-row h1 {{ margin: 0; font-size: 1.5em; }}
+            .header-row p {{ margin: 0; color: #666; font-size: 0.9em; }}
         </style>
-        <h1 style="margin-bottom: 5px;">Portfolio Analysis Report</h1>
-        {date_str}
+        <div class="header-row">
+            <h1>Portfolio Analysis Report</h1>
+            {f"<p>Analysis Period: <b>{start_date}</b> to <b>{end_date}</b></p>" if start_date and end_date else ""}
+        </div>
         <details open><summary>Performance Metrics Summary</summary>
         <table>
         <tr>
@@ -335,10 +357,8 @@ class PortfolioVisualizer:
 
         # Add MC vs Historical explanation
         table_html += """
-        <p style="font-size: 0.8em; color: #888; margin-top: 15px;">
-            <b>Note:</b> Sim CAGR = Monte Carlo median. Hist CAGR = actual backtest.
-            Large differences may indicate: different time periods, DCA effects not captured in MC, or strategy-specific behavior.
-            Volatility = annualized standard deviation of returns.
+        <p style="font-size: 0.75em; color: #999; margin: 8px 0 0 0;">
+            <b>Note:</b> Sim CAGR = Monte Carlo median. Hist CAGR = actual backtest. Vol = annualized stdev.
         </p>
         </details>
         """
