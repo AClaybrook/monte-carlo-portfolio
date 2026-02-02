@@ -8,6 +8,9 @@ import numpy as np
 import plotly.io as pio
 import pandas as pd
 from scipy import stats
+import base64
+
+from pv_compat import export_portfolio_csv, save_portfolio_csv, generate_pv_url
 
 class PortfolioVisualizer:
     def __init__(self, simulator):
@@ -61,7 +64,7 @@ class PortfolioVisualizer:
         return contrib_str
 
     def create_allocation_table_html(self, portfolio_results):
-        """Creates a compact allocation table"""
+        """Creates a compact allocation table with PV export buttons"""
         all_tickers = set()
         portfolio_rows = []
 
@@ -83,14 +86,14 @@ class PortfolioVisualizer:
 
         sorted_tickers = sorted(list(all_tickers))
 
-        # Compact table with smaller cells
+        # Compact table with smaller cells and export column
         html = '''<div style="overflow-x: auto; font-size: 0.85em;">
         <table style="border-collapse: collapse; width: auto;">
         <thead><tr><th style="text-align:left; padding: 6px 10px;">Portfolio</th>'''
 
         for ticker in sorted_tickers:
             html += f'<th style="padding: 6px 8px; min-width: 50px;">{ticker}</th>'
-        html += '</tr></thead>'
+        html += '<th style="padding: 6px 8px;">Export</th></tr></thead>'
 
         html += '<tbody>'
         for row_dict in portfolio_rows:
@@ -103,6 +106,33 @@ class PortfolioVisualizer:
                     html += f'<td style="padding: 5px 8px; text-align: center;">{val*100:.0f}%</td>'
                 else:
                     html += '<td style="padding: 5px 8px; text-align: center; color: #ddd;">-</td>'
+
+            # Build allocations dict for export (only non-zero weights)
+            row_allocations = {t: row_dict.get(t, 0) for t in sorted_tickers if row_dict.get(t, 0) > 0.001}
+
+            # Save CSV to output/portfolios/
+            try:
+                save_portfolio_csv(row_allocations, p_name)
+            except Exception:
+                pass  # Don't fail if save doesn't work
+
+            # Generate CSV data URI for browser download
+            csv_content = export_portfolio_csv(row_allocations, p_name)
+            csv_b64 = base64.b64encode(csv_content.encode()).decode()
+            data_uri = f"data:text/csv;base64,{csv_b64}"
+
+            # Generate PV URL
+            pv_url = generate_pv_url(row_allocations)
+
+            # Safe filename
+            safe_name = "".join(c if c.isalnum() or c in '_-' else '_' for c in p_name)
+
+            html += f'''<td style="padding: 5px 8px; text-align: center;">
+                <a href="{data_uri}" download="{safe_name}.csv"
+                   style="text-decoration:none; margin-right:4px;" title="Download CSV for Portfolio Visualizer">📥</a>
+                <a href="{pv_url}" target="_blank"
+                   style="text-decoration:none;" title="Open in Portfolio Visualizer">📊</a>
+            </td>'''
             html += '</tr>'
         html += '</tbody></table></div>'
 

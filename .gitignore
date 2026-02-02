@@ -31,3 +31,7 @@ config/*.py
 # But keep the example config
 !config/example_config.py
 !config/__init__.py
+
+# Output portfolios (keep directory structure)
+output/portfolios/*.csv
+!output/portfolios/.gitkeep
