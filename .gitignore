@@ -23,6 +23,7 @@ __pycache__/
 .venv/
 .vscode
 *.sqlite
+*.prof
 
 # Personal portfolio configurations (IMPORTANT!)
 config/*.py

@@ -129,11 +129,19 @@ class PortfolioVisualizer:
             fill_color = self._hex_to_rgba(color, 0.15)
             grp = f"mc_{idx}"
 
-            # 1. Trajectory
-            p5 = np.percentile(res['portfolio_values'], 5, axis=0)
-            p50 = np.median(res['portfolio_values'], axis=0)
-            p95 = np.percentile(res['portfolio_values'], 95, axis=0)
-            days = np.arange(len(p50))
+            # 1. Trajectory (downsample for faster percentile computation)
+            pv = res['portfolio_values']
+            n_days = pv.shape[1]
+            # Sample every 5 days for charts (still 500+ points for smooth lines)
+            step = max(1, n_days // 500)
+            sample_idx = np.arange(0, n_days, step)
+            if sample_idx[-1] != n_days - 1:
+                sample_idx = np.append(sample_idx, n_days - 1)  # Always include last day
+            pv_sampled = pv[:, sample_idx]
+            p5 = np.percentile(pv_sampled, 5, axis=0)
+            p50 = np.median(pv_sampled, axis=0)
+            p95 = np.percentile(pv_sampled, 95, axis=0)
+            days = sample_idx
 
             fig.add_trace(go.Scatter(x=days, y=p95, mode='lines', line=dict(width=0), showlegend=False, legendgroup=grp, hoverinfo='skip'), row=1, col=1)
             fig.add_trace(go.Scatter(x=days, y=p5, mode='lines', line=dict(width=0), fill='tonexty', fillcolor=fill_color, showlegend=False, legendgroup=grp, hoverinfo='skip'), row=1, col=1)

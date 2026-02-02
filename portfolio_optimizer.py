@@ -18,11 +18,20 @@ class PortfolioOptimizer:
     def __init__(self, simulator: PortfolioSimulator, data_manager):
         self.simulator = simulator
         self.data_manager = data_manager
+        self._data_cache = {}  # Cache for aligned returns/covariance
+        # Use fewer simulations during optimization for speed (full sim done later for final results)
+        self._optimization_sims = min(1000, simulator.simulations)
 
     def _get_data(self, assets, start_date_override=None):
         """
         Helper to get aligned covariance and returns with strict cleaning.
+        Results are cached to avoid redundant computation across optimization strategies.
         """
+        # Check cache first
+        cache_key = (tuple(a['ticker'] for a in assets), start_date_override)
+        if cache_key in self._data_cache:
+            return self._data_cache[cache_key]
+
         try:
             df = self.simulator._prepare_multivariate_data(assets, start_date_override=start_date_override)
         except ValueError as e:
@@ -41,7 +50,9 @@ class PortfolioOptimizer:
              print(f"Optimization Skipped: Data still contains NaNs or Infinite values after cleaning.")
              return None, None, None
 
-        return returns, returns.mean(), returns.cov()
+        result = (returns, returns.mean(), returns.cov())
+        self._data_cache[cache_key] = result
+        return result
 
     def _minimize(self, fun, assets, args, label, bounds=None, min_weight=0.0, max_weight=1.0):
         """Generic minimizer with RANDOM RESTARTS and configurable bounds"""
@@ -57,18 +68,19 @@ class PortfolioOptimizer:
         initial_guess = np.array(num_assets * [1. / num_assets,])
 
         try:
+            # Relaxed tolerances for faster convergence (still accurate enough for portfolio optimization)
+            opts = {'ftol': 1e-6, 'maxiter': 200}
+
             result = sco.minimize(fun, initial_guess, args=args, method='SLSQP',
-                                  bounds=bounds, constraints=constraints,
-                                  options={'ftol': 1e-9, 'maxiter': 1000})
+                                  bounds=bounds, constraints=constraints, options=opts)
 
             best_result = result
-            # Random restarts
-            for _ in range(10):
+            # Random restarts (reduced from 10 to 3 for speed)
+            for _ in range(3):
                 rand_guess = np.random.random(num_assets)
                 rand_guess /= np.sum(rand_guess)
                 res = sco.minimize(fun, rand_guess, args=args, method='SLSQP',
-                                   bounds=bounds, constraints=constraints,
-                                   options={'ftol': 1e-9, 'maxiter': 1000})
+                                   bounds=bounds, constraints=constraints, options=opts)
                 if res.success and res.fun < best_result.fun:
                     best_result = res
 
@@ -82,12 +94,17 @@ class PortfolioOptimizer:
         """Return a safe 'failed' result so the script continues"""
         num = len(assets)
         alloc = np.array([1/num]*num)
+        # Use reduced simulations for speed
+        original_sims = self.simulator.simulations
+        self.simulator.simulations = self._optimization_sims
+        sim_results = self.simulator.simulate_portfolio(assets, alloc)
+        self.simulator.simulations = original_sims
         return {
             'label': f"{label} (FAILED: {reason})",
             'score': 0,
             'allocations': alloc,
-            'stats': self.simulator.simulate_portfolio(assets, alloc)['stats'],
-            'results': self.simulator.simulate_portfolio(assets, alloc)
+            'stats': sim_results['stats'],
+            'results': sim_results
         }
 
     def optimize_sharpe_ratio(self, assets, risk_free_rate=0.04, start_date_override=None):
@@ -267,14 +284,18 @@ class PortfolioOptimizer:
         )
 
     def _package_result(self, scipy_result, assets, label):
-        """Package results and run a final simulation check"""
+        """Package results and run a fast simulation check (reduced sims for speed)"""
         allocations = scipy_result.x / np.sum(scipy_result.x)
 
         # Clean tiny allocations
         allocations[allocations < 0.001] = 0
         allocations = allocations / np.sum(allocations)
 
+        # Use reduced simulations for optimization phase (full sim done in main.py)
+        original_sims = self.simulator.simulations
+        self.simulator.simulations = self._optimization_sims
         sim_results = self.simulator.simulate_portfolio(assets, allocations)
+        self.simulator.simulations = original_sims
 
         # Print allocation
         alloc_str = " | ".join([f"{a['ticker']}: {w*100:.1f}%"

@@ -116,59 +116,82 @@ class PortfolioSimulator:
             return self._simulate_time_stepped(aligned_returns_df, weights, method, assets, strategy)
 
     def _simulate_fast_vectorized(self, aligned_returns_df, weights, method, assets):
-        """Legacy fast method for Lump Sum only."""
-        mean_returns = aligned_returns_df.mean().values
-        cov_matrix = aligned_returns_df.cov().values
+        """
+        Optimized vectorized Monte Carlo simulation.
+        - Uses float32 for 2x memory efficiency
+        - Single-pass drawdown calculation
+        - Minimized intermediate allocations
+        """
+        # Use float32 for speed (less memory bandwidth)
+        historical_returns = aligned_returns_df.values.astype(np.float32)
+        weights_f32 = weights.astype(np.float32)
         n_assets = len(assets)
+        n_days = self.trading_days
+        n_sims = self.simulations
 
+        # Pre-compute for GBM/parametric
         if method in ['geometric_brownian', 'parametric']:
+            mean_returns = np.mean(historical_returns, axis=0).astype(np.float32)
+            cov_matrix = np.atleast_2d(np.cov(historical_returns, rowvar=False)).astype(np.float32)
             try:
-                L = np.linalg.cholesky(cov_matrix)
+                L = np.linalg.cholesky(cov_matrix).astype(np.float32)
             except np.linalg.LinAlgError:
                 U, S, V = np.linalg.svd(cov_matrix)
-                L = U @ np.sqrt(np.diag(S))
+                L = (U @ np.sqrt(np.diag(S))).astype(np.float32)
             variances = np.diag(cov_matrix)
-            drift = (mean_returns - 0.5 * variances).reshape(n_assets, 1, 1)
+            mean_returns = np.atleast_1d(mean_returns)
+            drift = (mean_returns - 0.5 * variances).astype(np.float32)
 
-        BATCH_SIZE = 1000
-        total_sims = self.simulations
-        portfolio_values_list = []
-        all_final_values = []
-        all_max_drawdowns = []
+        # Allocate output arrays upfront
+        portfolio_values = np.empty((n_sims, n_days + 1), dtype=np.float32)
+        portfolio_values[:, 0] = self.initial_capital
+        max_drawdowns = np.empty(n_sims, dtype=np.float32)
 
-        for i in range(0, total_sims, BATCH_SIZE):
-            current_batch_size = min(BATCH_SIZE, total_sims - i)
+        # Process in batches to manage memory
+        BATCH_SIZE = min(2000, n_sims)  # Larger batches = less overhead
 
+        for batch_start in range(0, n_sims, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, n_sims)
+            batch_size = batch_end - batch_start
+
+            # Generate returns
             if method == 'bootstrap':
-                random_indices = np.random.randint(0, len(aligned_returns_df), (current_batch_size, self.trading_days))
-                asset_returns = aligned_returns_df.values[random_indices].transpose(2, 0, 1)
-            elif method in ['geometric_brownian', 'parametric']:
-                uncorrelated = np.random.normal(0, 1, (n_assets, current_batch_size, self.trading_days))
-                correlated = np.einsum('ij,jkl->ikl', L, uncorrelated)
-                batch_returns = drift + correlated
-                asset_returns = np.exp(batch_returns) - 1 if method == 'geometric_brownian' else batch_returns
+                # Vectorized bootstrap - sample and weight in one go
+                indices = np.random.randint(0, len(historical_returns), (batch_size, n_days))
+                sampled = historical_returns[indices]  # (batch, days, assets)
+                portfolio_returns = sampled @ weights_f32  # (batch, days)
+            else:
+                # GBM: generate correlated returns
+                uncorrelated = np.random.standard_normal((batch_size, n_days, n_assets)).astype(np.float32)
+                correlated = uncorrelated @ L.T  # (batch, days, assets)
+                daily_returns = drift + correlated
+                if method == 'geometric_brownian':
+                    daily_returns = np.exp(daily_returns) - 1
+                portfolio_returns = daily_returns @ weights_f32
 
-            weighted_returns = np.sum(asset_returns * weights.reshape(n_assets, 1, 1), axis=0)
-            del asset_returns
-            cumulative_growth = np.cumprod(1 + weighted_returns, axis=1)
-            batch_values = np.column_stack([np.ones(current_batch_size), cumulative_growth]) * self.initial_capital
+            # Cumulative product in-place
+            np.cumprod(1 + portfolio_returns, axis=1, out=portfolio_returns)
+            portfolio_values[batch_start:batch_end, 1:] = portfolio_returns * self.initial_capital
 
-            portfolio_values_list.append(batch_values)
-            all_final_values.append(batch_values[:, -1])
-
+            # Single-pass max drawdown calculation
+            batch_values = portfolio_values[batch_start:batch_end]
             running_max = np.maximum.accumulate(batch_values, axis=1)
-            drawdowns = (batch_values - running_max) / running_max
-            all_max_drawdowns.append(np.min(drawdowns, axis=1))
+            # Avoid division - use multiplication by reciprocal
+            np.divide(batch_values - running_max, running_max, out=running_max,
+                     where=running_max > 0)
+            max_drawdowns[batch_start:batch_end] = np.min(running_max, axis=1)
 
-        portfolio_values = np.vstack(portfolio_values_list)
-        final_values = np.concatenate(all_final_values)
-        max_drawdowns = np.concatenate(all_max_drawdowns)
-        cagr = (final_values / self.initial_capital) ** (1 / self.years) - 1
+        # Final calculations
+        final_values = portfolio_values[:, -1].astype(np.float64)  # Back to float64 for precision
+        cagr = (final_values / self.initial_capital) ** (1.0 / self.years) - 1.0
 
         return {
-            'portfolio_values': portfolio_values, 'final_values': final_values,
-            'cagr': cagr, 'max_drawdowns': max_drawdowns,
-            'assets': assets, 'allocations': list(weights),
+            'portfolio_values': portfolio_values,
+            'final_values': final_values,
+            'cagr': cagr,
+            'max_drawdowns': max_drawdowns.astype(np.float64),
+            'assets': assets,
+            'allocations': list(weights),
             'probabilities': self._calculate_probabilities(portfolio_values),
             'stats': self.calculate_statistics(final_values, cagr, max_drawdowns)
         }

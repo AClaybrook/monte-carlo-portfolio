@@ -50,6 +50,7 @@ def main():
     parser.add_argument('--no-optimize', action='store_true', help='Skip optimization step')
     parser.add_argument('--force-download', action='store_true', help='Force re-download all data')
     parser.add_argument('--coverage-report', action='store_true', help='Show data coverage report')
+    parser.add_argument('--offline', action='store_true', help='Use cached data only (no yfinance calls)')
     args = parser.parse_args()
 
     config_path = find_config_file(args.config)
@@ -94,13 +95,23 @@ def main():
     end_date = date.today()
     start_date = end_date - timedelta(days=365 * lookback_years)
 
-    # Bulk download all data at once
-    bulk_data = data_manager.bulk_download(
-        all_tickers,
-        start_date=start_date,
-        end_date=end_date,
-        force_update=args.force_download
-    )
+    # Bulk download all data at once (or use cache only in offline mode)
+    if args.offline:
+        print("OFFLINE MODE - using cached data only (no yfinance calls)")
+        # Use cached end date instead of today
+        end_date = date(2025, 12, 5)  # Last cached date
+        bulk_data = {}
+        for ticker in all_tickers:
+            df = data_manager._get_from_db(ticker, start_date, end_date)
+            if df is not None and not df.empty:
+                bulk_data[ticker] = df
+    else:
+        bulk_data = data_manager.bulk_download(
+            all_tickers,
+            start_date=start_date,
+            end_date=end_date,
+            force_update=args.force_download
+        )
 
     print(f"\n✓ Loaded data for {len(bulk_data)} tickers")
 
