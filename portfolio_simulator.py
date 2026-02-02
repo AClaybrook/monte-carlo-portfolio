@@ -169,9 +169,11 @@ class PortfolioSimulator:
                     daily_returns = np.exp(daily_returns) - 1
                 portfolio_returns = daily_returns @ weights_f32
 
-            # Cumulative product in-place
-            np.cumprod(1 + portfolio_returns, axis=1, out=portfolio_returns)
-            portfolio_values[batch_start:batch_end, 1:] = portfolio_returns * self.initial_capital
+            # Cumulative product - use float64 to prevent overflow with long simulations
+            # (30 years = 7560 days, high-growth assets can overflow float32)
+            portfolio_returns_f64 = (1 + portfolio_returns).astype(np.float64)
+            np.cumprod(portfolio_returns_f64, axis=1, out=portfolio_returns_f64)
+            portfolio_values[batch_start:batch_end, 1:] = (portfolio_returns_f64 * self.initial_capital).astype(np.float32)
 
             # Single-pass max drawdown calculation
             batch_values = portfolio_values[batch_start:batch_end]

@@ -258,10 +258,16 @@ class PortfolioOptimizer:
                 p_daily = returns.dot(w)
 
                 if 'drawdown' in obj_weights and obj_weights['drawdown'] > 0:
-                    cum_ret = (1 + p_daily).cumprod()
-                    running_max = np.maximum.accumulate(cum_ret)
-                    dd = (cum_ret - running_max) / running_max
-                    max_dd = abs(dd.min())
+                    # Use log-returns to avoid overflow with cumprod over many days
+                    # log(1+r) cumsum is equivalent to log of cumprod, but numerically stable
+                    log_returns = np.log1p(p_daily.clip(lower=-0.99))  # Clip to avoid log(0)
+                    log_cumulative = log_returns.cumsum()
+                    log_running_max = np.maximum.accumulate(log_cumulative)
+                    # Drawdown in log space: log(current) - log(peak) = log(current/peak)
+                    log_dd = log_cumulative - log_running_max
+                    # Convert back: dd = exp(log_dd) - 1, but for max_dd we just need the min log_dd
+                    # Since log is monotonic, min(log_dd) corresponds to max drawdown
+                    max_dd = 1 - np.exp(log_dd.min())  # Convert log drawdown to percentage
                     # Normalize: typical max DD is 0.1-0.5
                     score += obj_weights['drawdown'] * (max_dd * 5)  # Scale to ~1 for 20% DD
 

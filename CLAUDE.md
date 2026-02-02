@@ -124,3 +124,19 @@ Reports saved to `output/` as interactive HTML dashboards with:
 
 See `.claude/docs/` for detailed patterns:
 - [architectural_patterns.md](.claude/docs/architectural_patterns.md) - Design patterns and code conventions
+
+## Recent Improvements (2026-02)
+
+### Data Management
+- Added `sync` command to `data_utils.py` for bulk updating stale data
+- Added `start_date` and `end_date` to `SimulationConfig` for explicit date ranges
+- Use `--offline` flag to skip yfinance calls and use cached data only
+
+### Performance & Stability
+- Fixed overflow in `portfolio_optimizer.py` custom_objective using log-returns for drawdown
+- Fixed overflow in `portfolio_simulator.py` using float64 for cumprod operations
+- yfinance rate limiting is aggressive - use `--sequential` flag or try during off-peak hours
+
+### Known Issues
+- yfinance may heavily rate limit downloads, especially on WSL/Linux
+- For best results, use explicit `end_date` matching your cached data (check with `python data_utils.py coverage`)
