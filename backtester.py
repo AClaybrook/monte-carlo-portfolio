@@ -298,7 +298,7 @@ class Backtester:
             'Active Return': active_rets.mean() * 252,
             'Tracking Error': tracking_error,
             'Info Ratio': info_ratio,
-            'Correlation': portfolio_daily_rets.corr(bench_rets),
+            'Correlation': portfolio_daily_rets.corr(bench_rets) if ann_std > 0 else 0.0,
             'Benchmark': benchmark_ticker
         }
 
@@ -344,7 +344,7 @@ class Backtester:
             'Active Return': active_rets.mean() * 252,
             'Tracking Error': tracking_error,
             'Info Ratio': info_ratio,
-            'Correlation': portfolio_daily_rets.corr(bench_rets),
+            'Correlation': portfolio_daily_rets.corr(bench_rets) if ann_std > 0 else 0.0,
             'Benchmark': benchmark_ticker
         }
 

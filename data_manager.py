@@ -13,8 +13,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from sqlalchemy import create_engine, Column, String, Float, Date, Integer, UniqueConstraint, DateTime, Boolean
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.pool import StaticPool
 from datetime import datetime, timedelta, date
 import time

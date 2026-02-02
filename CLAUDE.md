@@ -23,7 +23,9 @@ Portfolio analysis tool inspired by [PortfolioVisualizer.com](https://www.portfo
 ├── visualizations.py          # Plotly HTML report generation
 ├── config/                    # Portfolio configuration files
 │   ├── example_config.py      # Example with optimization
+│   ├── quick_test.py          # Fast testing config (~10s)
 │   └── strategy_example.py    # Example with dynamic strategies
+├── repair_metadata.py         # Fix DB metadata sync issues
 ├── output/                    # Generated HTML reports
 └── stock_data.db              # SQLite cache for market data
 ```
@@ -136,11 +138,21 @@ See `.claude/docs/` for detailed patterns:
 - Added `sync` command to `data_utils.py` for bulk updating stale data
 - Added `start_date` and `end_date` to `SimulationConfig` for explicit date ranges
 - Use `--offline` flag to skip yfinance calls and use cached data only
+- `repair_metadata.py` - Fixes ticker_metadata sync issues when DB has data but missing/stale metadata
 
-### Performance & Stability
+### Performance Optimizations
+Reduced full example_config runtime from ~3min to ~1.3min:
+- **portfolio_simulator.py**: float32 arrays, 2000 batch size, pre-allocation, vectorized bootstrap
+- **portfolio_optimizer.py**: Data caching across strategies, 1000 sims during optimization (full sims done for final results), concentrated starting points for better convergence
+- **visualizations.py**: Downsampled percentile calculations (~500 points)
+
+### Stability Fixes
 - Fixed overflow in `portfolio_optimizer.py` custom_objective using log-returns for drawdown
 - Fixed overflow in `portfolio_simulator.py` using float64 for cumprod operations
-- yfinance rate limiting is aggressive - use `--sequential` flag or try during off-peak hours
+- Fixed single-asset covariance with `np.atleast_2d()`
+
+### Testing
+- `config/quick_test.py` - Fast config for iteration (~10s, 2000 sims, no optimization)
 
 ### Known Issues
 - yfinance may heavily rate limit downloads, especially on WSL/Linux
