@@ -12,7 +12,7 @@ Key improvements:
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from sqlalchemy import create_engine, Column, String, Float, Date, Integer, UniqueConstraint, DateTime, Boolean
+from sqlalchemy import create_engine, Column, String, Float, Date, Integer, UniqueConstraint, DateTime, Boolean, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.pool import StaticPool
 from datetime import datetime, timedelta, date
@@ -63,7 +63,7 @@ class TickerMetadata(Base):
     last_valid_date = Column(Date, nullable=True)
     last_updated = Column(DateTime, default=datetime.now)
     is_valid = Column(Boolean, default=True)
-    data_intervals_json = Column(String(2000), nullable=True)  # JSON representation of intervals
+    data_intervals_json = Column(Text, nullable=True)  # JSON representation of intervals
 
 
 class OptimizationResult(Base):
@@ -260,6 +260,11 @@ class DataManager:
         # In-memory cache of interval trackers
         self._interval_cache: Dict[str, IntervalTracker] = {}
 
+        # Track failed download attempts to avoid retrying too soon
+        # Key: (ticker, start_iso, end_iso), Value: datetime of last failure
+        self._failed_downloads: Dict[tuple, datetime] = {}
+        self.FAILED_COOLDOWN_HOURS = 1
+
         # Known ETF/Stock inception dates (avoid querying before these)
         self._known_inception_dates = {
             'TQQQ': date(2010, 2, 11),
@@ -356,6 +361,21 @@ class DataManager:
 
         return None
 
+    def _is_on_cooldown(self, ticker: str, start: date, end: date) -> bool:
+        """Check if a download attempt is on cooldown due to recent failure."""
+        key = (ticker.upper(), start.isoformat(), end.isoformat())
+        if key in self._failed_downloads:
+            failed_at = self._failed_downloads[key]
+            if datetime.now() - failed_at < timedelta(hours=self.FAILED_COOLDOWN_HOURS):
+                return True
+            del self._failed_downloads[key]
+        return False
+
+    def _record_failure(self, ticker: str, start: date, end: date):
+        """Record a failed download attempt."""
+        key = (ticker.upper(), start.isoformat(), end.isoformat())
+        self._failed_downloads[key] = datetime.now()
+
     def get_data(self, ticker: str, start_date: date = None, end_date: date = None,
                  force_update: bool = False) -> pd.DataFrame:
         """
@@ -394,6 +414,9 @@ class DataManager:
         if missing_intervals:
             print(f"↓ {ticker}: Downloading {len(missing_intervals)} interval(s)...")
             for interval_start, interval_end in missing_intervals:
+                if self._is_on_cooldown(ticker, interval_start, interval_end):
+                    print(f"  ⏸ Skipping {ticker} [{interval_start} to {interval_end}] (failed recently, cooldown active)")
+                    continue
                 self._download_and_save(ticker, interval_start, interval_end, tracker)
 
             # Save updated tracker
@@ -412,6 +435,7 @@ class DataManager:
 
             if df.empty:
                 print(f"  ⚠ No data returned for {ticker} [{start} to {end}]")
+                self._record_failure(ticker, start, end)
                 return
 
             # Normalize index
@@ -546,19 +570,47 @@ class DataManager:
         if tickers_to_download:
             all_tickers_needing_data = list(tickers_to_download.keys())
 
-            if sequential or len(all_tickers_needing_data) == 1:
-                # Sequential download - one at a time with delays
-                print(f"↓ Sequential download for {len(all_tickers_needing_data)} tickers...")
+            # Print download plan so user can see what will be fetched
+            print(f"\nDownload plan:")
+            for ticker in sorted(tickers_to_download.keys()):
+                intervals = tickers_to_download[ticker]
+                interval_strs = [f"{s} to {e}" for s, e in intervals]
+                print(f"  {ticker}: {', '.join(interval_strs)}")
+            print()
+
+            # Decide: bulk yf.download() only when all tickers need the same full range
+            # (e.g., force_update or fresh database). Otherwise, sequential per-ticker
+            # interval-targeted downloads are more efficient and avoid wasted API calls.
+            all_need_full_range = (
+                not sequential
+                and len(all_tickers_needing_data) > 1
+                and all(
+                    len(intervals) == 1
+                    and intervals[0][0] <= start_date
+                    and intervals[0][1] >= end_date
+                    for intervals in tickers_to_download.values()
+                )
+            )
+
+            if all_need_full_range:
+                # True bulk download - all tickers need the same full range
+                print(f"↓ Bulk downloading {len(all_tickers_needing_data)} tickers (full range)...")
+                self._bulk_download_and_save(
+                    all_tickers_needing_data, start_date, end_date,
+                    ticker_intervals=tickers_to_download
+                )
+            else:
+                # Sequential with per-ticker intervals (most efficient for catch-up)
+                print(f"↓ Downloading {len(all_tickers_needing_data)} tickers (interval-targeted)...")
                 for ticker in all_tickers_needing_data:
                     tracker = self._get_interval_tracker(ticker)
                     for interval_start, interval_end in tickers_to_download[ticker]:
-                        time.sleep(1 + random.random())  # Delay between tickers
+                        if self._is_on_cooldown(ticker, interval_start, interval_end):
+                            print(f"  ⏸ Skipping {ticker} [{interval_start} to {interval_end}] (cooldown)")
+                            continue
+                        time.sleep(1 + random.random())
                         self._download_and_save(ticker, interval_start, interval_end, tracker)
                     self._save_interval_tracker(ticker, tracker)
-            else:
-                # Bulk download
-                print(f"↓ Bulk downloading {len(all_tickers_needing_data)} tickers...")
-                self._bulk_download_and_save(all_tickers_needing_data, start_date, end_date)
 
         # Retrieve all data from database
         for ticker in tickers:
@@ -573,10 +625,15 @@ class DataManager:
 
         return results
 
-    def _bulk_download_and_save(self, tickers: List[str], start: date, end: date):
-        """Use yf.download() for efficient bulk downloading with rate limit handling"""
+    def _bulk_download_and_save(self, tickers: List[str], start: date, end: date,
+                                ticker_intervals: Dict[str, List[Tuple[date, date]]] = None):
+        """Use yf.download() for efficient bulk downloading with rate limit handling.
+
+        Args:
+            ticker_intervals: Per-ticker missing intervals dict, used for fallback
+                to sequential downloads if bulk fails.
+        """
         try:
-            # yf.download for multiple tickers
             end_buffered = end + timedelta(days=1)
 
             # Add delay to avoid rate limiting (especially on WSL/Linux)
@@ -607,6 +664,7 @@ class DataManager:
                         ticker_df = df[ticker].dropna(how='all')
 
                     if ticker_df.empty:
+                        self._record_failure(ticker, start, end)
                         continue
 
                     # Normalize columns
@@ -635,13 +693,19 @@ class DataManager:
                 print(f"  ⏳ Rate limited on bulk download, switching to sequential...")
                 time.sleep(5)  # Wait before retrying
 
-            # Fallback to individual downloads with delays
+            # Fallback: use per-ticker intervals if available, otherwise global range
             for ticker in tickers:
                 try:
+                    intervals = (ticker_intervals.get(ticker, [(start, end)])
+                                 if ticker_intervals else [(start, end)])
                     print(f"  → Downloading {ticker} individually...")
-                    time.sleep(2 + random.random() * 2)  # 2-4 second delay between requests
                     tracker = self._get_interval_tracker(ticker)
-                    self._download_and_save(ticker, start, end, tracker)
+                    for interval_start, interval_end in intervals:
+                        if self._is_on_cooldown(ticker, interval_start, interval_end):
+                            print(f"    ⏸ Skipping [{interval_start} to {interval_end}] (cooldown)")
+                            continue
+                        time.sleep(2 + random.random() * 2)
+                        self._download_and_save(ticker, interval_start, interval_end, tracker)
                     self._save_interval_tracker(ticker, tracker)
                 except Exception as e2:
                     print(f"  ✗ {ticker} fallback failed: {e2}")
@@ -830,6 +894,30 @@ class DataManager:
             .order_by(OptimizationResult.optimization_score.desc())
             .limit(limit).all()
         ]
+
+    def get_latest_cached_date(self, tickers: List[str] = None) -> Optional[date]:
+        """Get the latest date for which we have cached data across given tickers.
+
+        Returns the minimum of the latest dates across tickers (so all tickers
+        have data through this date), or None if no data exists.
+        """
+        if tickers is None:
+            tickers = self.list_all_tickers()
+
+        if not tickers:
+            return None
+
+        latest_dates = []
+        for ticker in tickers:
+            tracker = self._get_interval_tracker(ticker.upper())
+            bounds = tracker.bounds
+            if bounds:
+                latest_dates.append(bounds[1])
+
+        if not latest_dates:
+            return None
+
+        return min(latest_dates)
 
     def list_all_tickers(self) -> List[str]:
         """List all tickers in database"""

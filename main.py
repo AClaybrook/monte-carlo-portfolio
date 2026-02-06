@@ -97,8 +97,13 @@ def main():
     # Bulk download all data at once (or use cache only in offline mode)
     if args.offline:
         print("OFFLINE MODE - using cached data only (no yfinance calls)")
-        # Use cached end date instead of today
-        end_date = date(2025, 12, 5)  # Last cached date
+        cached_end = data_manager.get_latest_cached_date(all_tickers)
+        if cached_end is None:
+            print("✗ No cached data found for any tickers. Cannot run offline.")
+            data_manager.close()
+            return 1
+        end_date = cached_end
+        print(f"  Using cached data through: {end_date}")
         bulk_data = {}
         for ticker in all_tickers:
             df = data_manager._get_from_db(ticker, start_date, end_date)

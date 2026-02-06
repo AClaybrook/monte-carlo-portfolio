@@ -31,7 +31,7 @@ def migrate_database(db_path: str = 'stock_data.db'):
     migrations = [
         ("last_valid_date", "DATE"),
         ("is_valid", "BOOLEAN DEFAULT 1"),
-        ("data_intervals_json", "VARCHAR(2000)"),
+        ("data_intervals_json", "TEXT"),
     ]
 
     for col_name, col_type in migrations:

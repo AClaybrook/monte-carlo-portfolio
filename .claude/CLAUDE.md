@@ -131,6 +131,7 @@ Reports saved to `output/` as interactive HTML dashboards with:
 
 See `.claude/docs/` for detailed patterns:
 - [architectural_patterns.md](.claude/docs/architectural_patterns.md) - Design patterns and code conventions
+- [last_worked.md](.claude/docs/last_worked.md) - Notes on recent changes and data fetching architecture
 
 ## Recent Improvements (2026-02)
 
@@ -139,6 +140,15 @@ See `.claude/docs/` for detailed patterns:
 - Added `start_date` and `end_date` to `SimulationConfig` for explicit date ranges
 - Use `--offline` flag to skip yfinance calls and use cached data only
 - `repair_metadata.py` - Fixes ticker_metadata sync issues when DB has data but missing/stale metadata
+
+### Data Fetching Fixes
+- Fixed `bulk_download()` to use per-ticker missing intervals instead of global date range
+- Fixed `_bulk_download_and_save()` fallback to use per-ticker intervals
+- Fixed offline mode to dynamically detect latest cached date (was hardcoded)
+- Added download failure cooldown (1hr) to prevent repeated failed API calls
+- Added download plan summary printed before any yfinance API calls
+- Changed `data_intervals_json` column from `String(2000)` to `Text`
+- Added `test_data_manager.py` with IntervalTracker and DataManager unit tests
 
 ### Performance Optimizations
 Reduced full example_config runtime from ~3min to ~1.3min:
