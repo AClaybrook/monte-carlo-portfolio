@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, date
 import time
 import json
 import random
+import os
 import requests
 import portion as P
 from typing import Dict, List, Optional, Tuple, Set
@@ -244,7 +245,10 @@ class DataManager:
     - Automatically detects and fills gaps in data
     """
 
-    def __init__(self, db_path: str = 'stock_data.db'):
+    def __init__(self, db_path: str = 'stock_data.db', data_source: str = 'yfinance'):
+        if data_source not in ('yfinance', 'fmp'):
+            raise ValueError(f"Unknown data_source: {data_source}. Valid: yfinance, fmp")
+        self.data_source = data_source
         self.db_path = db_path
         self.engine = create_engine(
             f'sqlite:///{db_path}',
@@ -256,6 +260,16 @@ class DataManager:
         Session = sessionmaker(bind=self.engine)
         self.session = Session()
         self.yf_session = self._setup_session()
+
+        # FMP API key (loaded from environment when using FMP data source)
+        self.fmp_api_key = None
+        if self.data_source == 'fmp':
+            self.fmp_api_key = os.environ.get('FMP_API_KEY')
+            if not self.fmp_api_key:
+                raise ValueError(
+                    "FMP_API_KEY environment variable is required when using --data-source fmp. "
+                    "Get a free key at https://site.financialmodelingprep.com/developer/docs"
+                )
 
         # In-memory cache of interval trackers
         self._interval_cache: Dict[str, IntervalTracker] = {}
@@ -463,6 +477,9 @@ class DataManager:
     def _smart_download(self, ticker: str, start: date, end: date,
                         max_retries: int = 5) -> pd.DataFrame:
         """Download with exponential backoff and rate limit handling"""
+        if self.data_source == 'fmp':
+            return self._fmp_download(ticker, start, end, max_retries)
+
         delay = 2.0  # Start with longer delay
 
         for attempt in range(max_retries):
@@ -488,6 +505,71 @@ class DataManager:
                     # Rate limited - wait longer
                     wait_time = delay * 2 + random.random() * 5
                     print(f"  ⏳ Rate limited, waiting {wait_time:.1f}s...")
+                    time.sleep(wait_time)
+                    delay *= 2
+                elif attempt == max_retries - 1:
+                    raise
+                else:
+                    time.sleep(delay + random.random())
+                    delay *= 2
+
+        return pd.DataFrame()
+
+    def _fmp_download(self, ticker: str, start: date, end: date,
+                      max_retries: int = 5) -> pd.DataFrame:
+        """Download from Financial Modeling Prep API with retry logic."""
+        delay = 2.0
+
+        for attempt in range(max_retries):
+            try:
+                time.sleep(0.5 + random.random())
+
+                url = "https://financialmodelingprep.com/stable/historical-price-eod/full"
+                params = {
+                    'symbol': ticker,
+                    'from': start.isoformat(),
+                    'to': end.isoformat(),
+                }
+                headers = {'apikey': self.fmp_api_key}
+
+                response = self.yf_session.get(url, params=params, headers=headers, timeout=30)
+                response.raise_for_status()
+
+                data = response.json()
+
+                if not data or not isinstance(data, list):
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+
+                df = pd.DataFrame(data)
+                df['date'] = pd.to_datetime(df['date'])
+                df = df.set_index('date').sort_index()
+
+                # Rename columns to match yfinance format expected by _save_to_db
+                column_map = {
+                    'open': 'Open',
+                    'high': 'High',
+                    'low': 'Low',
+                    'close': 'Close',
+                    'adjClose': 'Adj Close',
+                    'volume': 'Volume',
+                }
+                df = df.rename(columns=column_map)
+                keep_cols = ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
+                df = df[[c for c in keep_cols if c in df.columns]]
+
+                if not df.empty:
+                    return df
+
+                time.sleep(delay)
+                delay *= 2
+
+            except Exception as e:
+                error_str = str(e).lower()
+                if 'rate' in error_str or 'limit' in error_str or '429' in error_str:
+                    wait_time = delay * 2 + random.random() * 5
+                    print(f"  ⏳ FMP rate limited, waiting {wait_time:.1f}s...")
                     time.sleep(wait_time)
                     delay *= 2
                 elif attempt == max_retries - 1:
@@ -582,7 +664,8 @@ class DataManager:
             # (e.g., force_update or fresh database). Otherwise, sequential per-ticker
             # interval-targeted downloads are more efficient and avoid wasted API calls.
             all_need_full_range = (
-                not sequential
+                self.data_source == 'yfinance'  # FMP has no bulk endpoint
+                and not sequential
                 and len(all_tickers_needing_data) > 1
                 and all(
                     len(intervals) == 1
@@ -633,6 +716,20 @@ class DataManager:
             ticker_intervals: Per-ticker missing intervals dict, used for fallback
                 to sequential downloads if bulk fails.
         """
+        # Bulk download only supported for yfinance; fall through to sequential
+        if self.data_source != 'yfinance':
+            for ticker in tickers:
+                tracker = self._get_interval_tracker(ticker)
+                intervals = (ticker_intervals.get(ticker, [(start, end)])
+                             if ticker_intervals else [(start, end)])
+                for interval_start, interval_end in intervals:
+                    if self._is_on_cooldown(ticker, interval_start, interval_end):
+                        continue
+                    time.sleep(1 + random.random())
+                    self._download_and_save(ticker, interval_start, interval_end, tracker)
+                self._save_interval_tracker(ticker, tracker)
+            return
+
         try:
             end_buffered = end + timedelta(days=1)
 
@@ -943,7 +1040,8 @@ class DataManager:
 
 # Convenience function for quick data access
 def get_stock_data(tickers: List[str], start_date: date = None,
-                   end_date: date = None, db_path: str = 'stock_data.db') -> Dict[str, pd.DataFrame]:
+                   end_date: date = None, db_path: str = 'stock_data.db',
+                   data_source: str = 'yfinance') -> Dict[str, pd.DataFrame]:
     """
     Quick helper to get data for multiple tickers.
 
@@ -951,7 +1049,7 @@ def get_stock_data(tickers: List[str], start_date: date = None,
         data = get_stock_data(['VOO', 'QQQ', 'BND'], start_date=date(2015, 1, 1))
         voo_prices = data['VOO']
     """
-    dm = DataManager(db_path)
+    dm = DataManager(db_path, data_source=data_source)
     try:
         return dm.bulk_download(tickers, start_date, end_date)
     finally:

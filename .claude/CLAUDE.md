@@ -56,6 +56,11 @@ python main.py --coverage-report
 # Skip optimization step
 python main.py --no-optimize
 
+# Use Financial Modeling Prep instead of yfinance (requires FMP_API_KEY env var)
+export FMP_API_KEY=your_key_here
+python main.py --data-source fmp
+python data_utils.py --data-source fmp download GBTC,VOO
+
 # Data management utility (data_utils.py)
 python data_utils.py list                      # List all tickers in DB
 python data_utils.py coverage                  # Show data coverage report
@@ -118,6 +123,17 @@ Strategies modify DCA allocation based on market conditions ([strategies.py:61-6
 - `drawdown_protection` - Shift to defensive allocation during crashes
 - `relative_value` - Buy most beaten-down assets
 
+## Data Sources
+
+Two market data providers are supported via the `--data-source` flag:
+
+| Source | Flag | Notes |
+|--------|------|-------|
+| **yfinance** (default) | `--data-source yfinance` | Free, supports bulk downloads, may rate-limit on WSL/Linux |
+| **FMP** | `--data-source fmp` | Requires `FMP_API_KEY` env var. Free tier: 250 req/day. Sequential downloads only (no bulk endpoint) |
+
+Both sources write to the same SQLite cache in yfinance column format (`Open`, `High`, `Low`, `Close`, `Adj Close`, `Volume`). FMP columns are automatically mapped. The `--data-source` flag works with both `main.py` and `data_utils.py`.
+
 ## Output
 
 Reports saved to `output/` as interactive HTML dashboards with:
@@ -136,6 +152,8 @@ See `.claude/docs/` for detailed patterns:
 ## Recent Improvements (2026-02)
 
 ### Data Management
+- Added Financial Modeling Prep (FMP) as alternative data source via `--data-source fmp` flag
+- FMP support in `main.py`, `data_utils.py`, and `data_manager.py` with API key from `FMP_API_KEY` env var
 - Added `sync` command to `data_utils.py` for bulk updating stale data
 - Added `start_date` and `end_date` to `SimulationConfig` for explicit date ranges
 - Use `--offline` flag to skip yfinance calls and use cached data only

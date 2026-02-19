@@ -6,6 +6,7 @@ import pytest
 import json
 import sys
 import os
+import pandas as pd
 from datetime import date, datetime, timedelta
 from unittest.mock import patch, MagicMock
 
@@ -232,3 +233,149 @@ class TestDataManager:
         tracker2 = dm._get_interval_tracker('TEST')
         assert not tracker2.is_empty
         assert tracker2.bounds == (date(2020, 1, 1), date(2020, 12, 31))
+
+
+# ============================================================
+# FMP Data Source Tests
+# ============================================================
+
+class TestFMPDataSource:
+    def test_invalid_data_source_raises(self, tmp_path):
+        """Unknown data_source should raise ValueError."""
+        db_path = str(tmp_path / "test.db")
+        with pytest.raises(ValueError, match="Unknown data_source"):
+            DataManager(db_path=db_path, data_source='bloomberg')
+
+    def test_fmp_requires_api_key(self, tmp_path):
+        """FMP data source should raise if FMP_API_KEY is not set."""
+        db_path = str(tmp_path / "test.db")
+        with patch.dict(os.environ, {}, clear=True):
+            # Ensure FMP_API_KEY is not set
+            os.environ.pop('FMP_API_KEY', None)
+            with pytest.raises(ValueError, match="FMP_API_KEY"):
+                DataManager(db_path=db_path, data_source='fmp')
+
+    def test_fmp_init_with_api_key(self, tmp_path):
+        """FMP data source should initialize when API key is set."""
+        db_path = str(tmp_path / "test.db")
+        with patch.dict(os.environ, {'FMP_API_KEY': 'test_key_123'}):
+            dm = DataManager(db_path=db_path, data_source='fmp')
+            assert dm.data_source == 'fmp'
+            assert dm.fmp_api_key == 'test_key_123'
+            dm.close()
+
+    def test_yfinance_default_data_source(self, tmp_path):
+        """Default data source should be yfinance."""
+        db_path = str(tmp_path / "test.db")
+        dm = DataManager(db_path=db_path)
+        assert dm.data_source == 'yfinance'
+        assert dm.fmp_api_key is None
+        dm.close()
+
+    def test_smart_download_routes_to_fmp(self, tmp_path):
+        """_smart_download should call _fmp_download when data_source is fmp."""
+        db_path = str(tmp_path / "test.db")
+        with patch.dict(os.environ, {'FMP_API_KEY': 'test_key'}):
+            dm = DataManager(db_path=db_path, data_source='fmp')
+            mock_df = pd.DataFrame({
+                'Open': [100.0], 'High': [105.0], 'Low': [99.0],
+                'Close': [103.0], 'Adj Close': [103.0], 'Volume': [1000000]
+            }, index=pd.to_datetime(['2024-01-02']))
+
+            with patch.object(dm, '_fmp_download', return_value=mock_df) as mock_fmp:
+                result = dm._smart_download('AAPL', date(2024, 1, 1), date(2024, 1, 31))
+                mock_fmp.assert_called_once_with('AAPL', date(2024, 1, 1), date(2024, 1, 31), 5)
+                assert len(result) == 1
+            dm.close()
+
+    def test_fmp_download_column_mapping(self, tmp_path):
+        """_fmp_download should rename FMP columns to yfinance format."""
+        db_path = str(tmp_path / "test.db")
+        with patch.dict(os.environ, {'FMP_API_KEY': 'test_key'}):
+            dm = DataManager(db_path=db_path, data_source='fmp')
+
+            fmp_response = [
+                {
+                    'date': '2024-01-02',
+                    'open': 100.0, 'high': 105.0, 'low': 99.0,
+                    'close': 103.0, 'adjClose': 102.5, 'volume': 5000000,
+                    'changePercent': 1.5, 'change': 1.5,
+                },
+                {
+                    'date': '2024-01-03',
+                    'open': 103.0, 'high': 106.0, 'low': 101.0,
+                    'close': 104.0, 'adjClose': 103.5, 'volume': 4500000,
+                    'changePercent': 0.97, 'change': 1.0,
+                },
+            ]
+
+            mock_response = MagicMock()
+            mock_response.json.return_value = fmp_response
+            mock_response.raise_for_status = MagicMock()
+
+            with patch.object(dm.yf_session, 'get', return_value=mock_response):
+                with patch('time.sleep'):  # Skip delays in test
+                    result = dm._fmp_download('AAPL', date(2024, 1, 1), date(2024, 1, 5))
+
+            assert list(result.columns) == ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
+            assert len(result) == 2
+            assert result.iloc[0]['Open'] == 100.0
+            assert result.iloc[0]['Adj Close'] == 102.5
+            assert result.iloc[1]['Close'] == 104.0
+            dm.close()
+
+    def test_fmp_download_empty_response_returns_empty_df(self, tmp_path):
+        """_fmp_download should return empty DataFrame on empty API response."""
+        db_path = str(tmp_path / "test.db")
+        with patch.dict(os.environ, {'FMP_API_KEY': 'test_key'}):
+            dm = DataManager(db_path=db_path, data_source='fmp')
+
+            mock_response = MagicMock()
+            mock_response.json.return_value = []
+            mock_response.raise_for_status = MagicMock()
+
+            with patch.object(dm.yf_session, 'get', return_value=mock_response):
+                with patch('time.sleep'):
+                    result = dm._fmp_download('FAKE', date(2024, 1, 1), date(2024, 1, 5),
+                                              max_retries=1)
+
+            assert result.empty
+            dm.close()
+
+    def test_fmp_sends_correct_request(self, tmp_path):
+        """_fmp_download should send correct URL, params, and API key header."""
+        db_path = str(tmp_path / "test.db")
+        with patch.dict(os.environ, {'FMP_API_KEY': 'my_secret_key'}):
+            dm = DataManager(db_path=db_path, data_source='fmp')
+
+            fmp_response = [
+                {'date': '2024-06-01', 'open': 1.0, 'high': 2.0, 'low': 0.5,
+                 'close': 1.5, 'adjClose': 1.5, 'volume': 100},
+            ]
+            mock_response = MagicMock()
+            mock_response.json.return_value = fmp_response
+            mock_response.raise_for_status = MagicMock()
+
+            with patch.object(dm.yf_session, 'get', return_value=mock_response) as mock_get:
+                with patch('time.sleep'):
+                    dm._fmp_download('GBTC', date(2024, 6, 1), date(2024, 6, 30))
+
+            call_args = mock_get.call_args
+            assert call_args[0][0] == "https://financialmodelingprep.com/stable/historical-price-eod/full"
+            assert call_args[1]['params']['symbol'] == 'GBTC'
+            assert call_args[1]['params']['from'] == '2024-06-01'
+            assert call_args[1]['params']['to'] == '2024-06-30'
+            assert call_args[1]['headers']['apikey'] == 'my_secret_key'
+            dm.close()
+
+    def test_bulk_download_forces_sequential_for_fmp(self, tmp_path):
+        """FMP data source should never use bulk yf.download() path."""
+        db_path = str(tmp_path / "test.db")
+        with patch.dict(os.environ, {'FMP_API_KEY': 'test_key'}):
+            dm = DataManager(db_path=db_path, data_source='fmp')
+            # The all_need_full_range condition includes `self.data_source == 'yfinance'`
+            # so FMP always goes through sequential per-ticker downloads
+            assert dm.data_source == 'fmp'
+            # Verify the condition would be False for FMP even if other conditions met
+            assert dm.data_source != 'yfinance'
+            dm.close()

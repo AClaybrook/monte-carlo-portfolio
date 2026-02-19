@@ -51,6 +51,8 @@ def main():
     parser.add_argument('--force-download', action='store_true', help='Force re-download all data')
     parser.add_argument('--coverage-report', action='store_true', help='Show data coverage report')
     parser.add_argument('--offline', action='store_true', help='Use cached data only (no yfinance calls)')
+    parser.add_argument('--data-source', choices=['yfinance', 'fmp'], default='yfinance',
+                        help='Data source for market data (default: yfinance)')
     args = parser.parse_args()
 
     config_path = find_config_file(args.config)
@@ -63,7 +65,10 @@ def main():
         return 1
 
     # Initialize data manager
-    data_manager = DataManager(db_path=config.database.path)
+    data_source = getattr(args, 'data_source', 'yfinance')
+    data_manager = DataManager(db_path=config.database.path, data_source=data_source)
+    if data_source != 'yfinance':
+        print(f"  Data source: {data_source.upper()}")
 
     # Coverage report mode
     if args.coverage_report:

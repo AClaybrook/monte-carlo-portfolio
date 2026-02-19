@@ -20,7 +20,7 @@ import json
 
 def cmd_coverage(args):
     """Show data coverage report"""
-    dm = DataManager(args.db)
+    dm = DataManager(args.db, data_source=args.data_source)
 
     if args.tickers:
         tickers = [t.strip().upper() for t in args.tickers.split(',')]
@@ -60,7 +60,7 @@ def cmd_coverage(args):
 
 def cmd_gaps(args):
     """Find gaps in data"""
-    dm = DataManager(args.db)
+    dm = DataManager(args.db, data_source=args.data_source)
 
     ticker = args.ticker.upper()
     start = date.fromisoformat(args.start) if args.start else date.today() - timedelta(days=365*10)
@@ -86,7 +86,7 @@ def cmd_gaps(args):
 
 def cmd_download(args):
     """Bulk download tickers"""
-    dm = DataManager(args.db)
+    dm = DataManager(args.db, data_source=args.data_source)
 
     tickers = [t.strip().upper() for t in args.tickers.split(',')]
     start = date.fromisoformat(args.start) if args.start else date.today() - timedelta(days=365*10)
@@ -121,7 +121,7 @@ def cmd_download(args):
 
 def cmd_clear(args):
     """Clear data for a ticker"""
-    dm = DataManager(args.db)
+    dm = DataManager(args.db, data_source=args.data_source)
 
     ticker = args.ticker.upper()
 
@@ -139,7 +139,7 @@ def cmd_clear(args):
 
 def cmd_info(args):
     """Show ticker info"""
-    dm = DataManager(args.db)
+    dm = DataManager(args.db, data_source=args.data_source)
 
     ticker = args.ticker.upper()
 
@@ -182,7 +182,7 @@ def cmd_info(args):
 
 def cmd_list(args):
     """List all tickers in database"""
-    dm = DataManager(args.db)
+    dm = DataManager(args.db, data_source=args.data_source)
 
     tickers = sorted(dm.list_all_tickers())
 
@@ -206,7 +206,7 @@ def cmd_sync(args):
     Finds tickers where last_valid_date < today and downloads missing data.
     Useful for catching up after a period of not running the system.
     """
-    dm = DataManager(args.db)
+    dm = DataManager(args.db, data_source=args.data_source)
 
     today = date.today()
     stale_since = date.fromisoformat(args.since) if args.since else today - timedelta(days=1)
@@ -296,6 +296,8 @@ def cmd_sync(args):
 def main():
     parser = argparse.ArgumentParser(description='Data Management Utility')
     parser.add_argument('--db', default='stock_data.db', help='Database path')
+    parser.add_argument('--data-source', choices=['yfinance', 'fmp'],
+                        default='yfinance', help='Data source for market data (default: yfinance)')
 
     subparsers = parser.add_subparsers(dest='command', help='Command')
 
