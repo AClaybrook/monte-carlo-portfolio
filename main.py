@@ -221,8 +221,9 @@ def main():
             asset_map[ticker] = asset
 
             if not returns.empty:
-                start_dates.append(returns.index.min())
-                print(f"  ✓ {ticker}: {len(df)} days, {returns.index.min().date()} to {returns.index.max().date()}")
+                # First PRICE date: the first return's date would silently drop day one
+                start_dates.append(df.index.min())
+                print(f"  ✓ {ticker}: {len(df)} days, {df.index.min().date()} to {df.index.max().date()}")
         else:
             print(f"  ⚠ {ticker}: No data available")
 
