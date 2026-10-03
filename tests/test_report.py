@@ -55,7 +55,7 @@ def test_main_synthetic_report(tmp_path):
             assert label in page
         assert 'signal rebalances' in page
         figs = json.loads(re.search(r'const FIGS = (\{.*?\});\nconst CMAP', page, re.S).group(1))
-        assert {'c-growth', 'c-mcfan', 'c-corr', 'c-allocation', 'c-sweep0', 'c-wfgrowth'} <= set(figs)
+        assert {'c-growth', 'c-mcfan', 'c-corr', 'c-allocation', 'c-sweep0', 'c-wfgrowth', 'c-frontier'} <= set(figs)
         # Every PV backtest link has whole-percent weights summing to exactly 100
         urls = re.findall(r'href="(https://www.portfoliovisualizer.com/backtest-portfolio[^"]+)"', page)
         assert len(urls) == 5

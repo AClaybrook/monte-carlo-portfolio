@@ -280,3 +280,67 @@ class PortfolioOptimizer:
         return {'label': label,
                 'score': -scipy_result.fun if scipy_result.success else 0,
                 'allocations': allocations}
+
+    # ------------------------------------------------------------------
+    # Efficient frontier
+    # ------------------------------------------------------------------
+
+    def efficient_frontier(self, assets, start_date_override=None, n_points=40):
+        """Long-only mean-variance frontier.
+
+        Return = annualized arithmetic mean of daily returns, risk = annualized
+        stdev of daily returns (the space the optimizers work in, not CAGR).
+        """
+        returns, mean_rets, cov_mat = self._get_data(assets, start_date_override=start_date_override)
+        if returns is None:
+            return None
+        ppy = self.periods_per_year
+        mu = mean_rets.values * ppy
+        cov = np.atleast_2d(cov_mat.values) * ppy
+        n = len(assets)
+        bounds = tuple((0.0, 1.0) for _ in range(n))
+        budget = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
+
+        def vol(w):
+            return np.sqrt(max(w @ cov @ w, 0.0))
+
+        def solve(constraints, x0):
+            res = sco.minimize(vol, x0, method='SLSQP', bounds=bounds, constraints=constraints,
+                               options={'ftol': 1e-12, 'maxiter': 500})
+            return res.x if res.success else None
+
+        w_min = solve([budget], np.full(n, 1 / n))
+        if w_min is None:
+            return None
+        targets = np.linspace(w_min @ mu, mu.max(), n_points)
+        points, x0 = [], w_min
+        for target in targets:
+            w = solve([budget, {'type': 'eq', 'fun': lambda w, t=target: w @ mu - t}], x0)
+            if w is None:
+                continue
+            w = np.clip(w, 0, None)
+            w /= w.sum()
+            points.append((vol(w), float(w @ mu), w))
+            x0 = w
+        return {
+            'tickers': [a['ticker'] for a in assets],
+            'vol': [p[0] for p in points],
+            'ret': [p[1] for p in points],
+            'weights': [p[2] for p in points],
+            'asset_vol': np.sqrt(np.diag(cov)).tolist(),
+            'asset_ret': mu.tolist(),
+            'mu': mu,
+            'cov': cov,
+            'start': returns.index[0].date(),
+            'end': returns.index[-1].date(),
+        }
+
+    @staticmethod
+    def frontier_point(frontier, allocations: dict):
+        """(risk, return) of fixed weights in the frontier's space, or None if they
+        use assets outside it."""
+        tickers = frontier['tickers']
+        if any(t not in tickers for t, w in allocations.items() if w > 1e-9):
+            return None
+        w = np.array([allocations.get(t, 0.0) for t in tickers], dtype=float)
+        return float(np.sqrt(max(w @ frontier['cov'] @ w, 0.0))), float(w @ frontier['mu'])

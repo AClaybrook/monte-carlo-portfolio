@@ -318,6 +318,22 @@ def main():
                         print(f"  Walk-forward ({len(wf['schedule'])} refits): CAGR {mo['CAGR']*100:.2f}% "
                               f"vs in-sample {mi['CAGR']*100:.2f}% over the same window")
 
+    frontier = None
+    if config.optimization and config.optimization.efficient_frontier and not args.no_optimize:
+        opt_assets = [asset_map[t.upper()] for t in config.optimization.assets if t.upper() in asset_map]
+        if len(opt_assets) >= 2:
+            frontier = optimizer.efficient_frontier(opt_assets, start_date_override=global_start_date)
+        if frontier is not None:
+            frontier['portfolios'] = []
+            for item in portfolio_results:
+                if item['backtest'].get('strategy_config'):
+                    continue   # dynamic weights have no single point
+                alloc = {a['ticker'].upper(): w for a, w in
+                         zip(item['results']['assets'], item['results']['allocations'])}
+                point = optimizer.frontier_point(frontier, alloc)
+                if point is not None:
+                    frontier['portfolios'].append({'label': item['label'], 'vol': point[0], 'ret': point[1]})
+
     sweep_results = []
     if config.sweeps:
         print("\n" + "="*60)
@@ -360,6 +376,7 @@ def main():
         embed_plotlyjs=config.visualization.embed_plotlyjs or args.embed_plotlyjs,
         sweeps=sweep_results,
         walk_forward=walk_forward_results,
+        frontier=frontier,
     )
     print(f"✓ Report saved to: {output_path}")
 

@@ -598,6 +598,35 @@ class PortfolioVisualizer:
                 f'<h3>Walk-forward weights</h3><div class="chart" id="c-wfweights"></div>'
                 f'<p class="caption">Vertical lines mark refits.</p>')
 
+    def _frontier(self, frontier, items, styles):
+        fig = go.Figure()
+        hover_w = ['<br>'.join(f"{t} {w:.0%}" for t, w in zip(frontier['tickers'], ws) if w > 0.005)
+                   for ws in frontier['weights']]
+        fig.add_trace(go.Scatter(
+            x=frontier['vol'], y=frontier['ret'], mode='lines', name='Efficient frontier',
+            line=dict(color=self._chrome('text2'), width=2), customdata=hover_w,
+            hovertemplate='Risk %{x:.1%}<br>Return %{y:.1%}<br>%{customdata}<extra>Frontier</extra>'))
+        fig.add_trace(go.Scatter(
+            x=frontier['asset_vol'], y=frontier['asset_ret'], mode='markers+text', name='Assets',
+            text=frontier['tickers'], textposition='middle right',
+            textfont=dict(color=self._chrome('muted'), size=11),
+            marker=dict(size=8, color=self._chrome('muted'), line=dict(width=2, color=self._chrome('surface'))),
+            hovertemplate='%{text}<br>Risk %{x:.1%}<br>Return %{y:.1%}<extra></extra>'))
+        by_label = {it['label']: st for it, st in zip(items, styles)}
+        for p in frontier.get('portfolios', []):
+            st = by_label.get(p['label'])
+            if st is None:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[p['vol']], y=[p['ret']], mode='markers', name=p['label'],
+                marker=dict(size=11, color=self._c(st['pair']), line=dict(width=2, color=self._chrome('surface'))),
+                hovertemplate='Risk %{x:.1%}<br>Return %{y:.1%}<extra>' + esc(p['label']) + '</extra>'))
+        fig.update_layout(**self._layout(height=440, yfmt='.0%', hover='closest',
+                                         ytitle='Expected annual return (arithmetic mean)',
+                                         xtitle='Annualized volatility (daily returns)',
+                                         xaxis=dict(self._layout()['xaxis'], tickformat='.0%', rangemode='tozero')))
+        return fig
+
     def _events_section(self, items):
         blocks = []
         for i, it in enumerate(items):
@@ -623,7 +652,8 @@ class PortfolioVisualizer:
                              title: str = 'Portfolio Analysis', assumptions: Optional[Dict[str, str]] = None,
                              synthetic: bool = False, embed_plotlyjs: bool = False,
                              sweeps: Optional[List[Dict]] = None,
-                             walk_forward: Optional[List[Dict]] = None):
+                             walk_forward: Optional[List[Dict]] = None,
+                             frontier: Optional[Dict] = None):
         items = [it for it in portfolio_results if it.get('backtest') and it.get('results')]
         if not items:
             raise ValueError("No results to report")
@@ -646,6 +676,8 @@ class PortfolioVisualizer:
         corr = self._correlation(items)
         if corr is not None:
             figs['corr'] = corr[0]
+        if frontier:
+            figs['frontier'] = self._frontier(frontier, items, styles)
 
         # Open the allocation chart on the most interesting portfolio
         alloc_default = next((i for i, it in enumerate(items)
@@ -703,7 +735,8 @@ class PortfolioVisualizer:
                 <h3>Largest drawdowns</h3>{self._drawdown_table(items)}'''),
             ('risk', 'Risk', f'''
                 <h2>Risk vs return</h2>{chart('riskret', 'Annualized stdev of monthly returns vs CAGR, historical.')}
-                {('<h2>Asset correlations</h2>' + chart('corr', 'Correlation of monthly returns over each pair’s overlapping history.')) if corr is not None else ''}'''),
+                {('<h2>Asset correlations</h2>' + chart('corr', 'Correlation of monthly returns over each pair’s overlapping history.')) if corr is not None else ''}
+                {('<h2>Efficient frontier</h2>' + chart('frontier', f"Long-only mean-variance frontier of the optimization assets, {frontier['start']} to {frontier['end']}. Fixed-weight portfolios built only from these assets are placed by their target weights; strategy portfolios have no single point. In-sample, like the optimizers.")) if frontier else ''}'''),
             ('allocation', 'Allocation', f'''
                 <h2>Allocation over time</h2>{selector('allocation', portfolio_options(alloc_default))}
                 {chart('allocation', 'Weekly snapshot of holdings weights. Vertical lines mark signal- or band-triggered rebalances.')}
