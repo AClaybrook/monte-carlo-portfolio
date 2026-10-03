@@ -14,6 +14,12 @@ flowchart LR
     Engine --> Strat["strategies.py"]
     BT --> QA["quant_analytics.py<br/>compute_performance"]
     Opt["portfolio_optimizer.py"] -->|weights| Eval
+    Opt --> WF["walk_forward.py<br/>out-of-sample refits"]
+    WF --> BT
+    Sweeps["sweeps.py<br/>parameter grids"] --> BT
+    Sweeps --> MC
+    WF --> Viz
+    Sweeps --> Viz
     BT --> Viz["visualizations.py"]
     MC --> Viz
     Viz --> HTML["output/*.html"]
@@ -45,7 +51,9 @@ Inflation (`inflation_rate`) deflates every simulated return, so results are in 
 
 ```mermaid
 flowchart TD
-    main --> run_config & data_manager & synthetic_data & portfolio_simulator & backtester & portfolio_optimizer & visualizations & pv_compat
+    main --> run_config & data_manager & synthetic_data & portfolio_simulator & backtester & portfolio_optimizer & visualizations & pv_compat & sweeps & walk_forward
+    sweeps --> backtester & portfolio_simulator
+    walk_forward --> backtester & engine
     backtester --> engine & quant_analytics & run_config
     portfolio_simulator --> engine & quant_analytics & run_config
     portfolio_optimizer --> portfolio_simulator & quant_analytics

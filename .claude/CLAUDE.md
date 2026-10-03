@@ -18,7 +18,9 @@ backtester.py            Backtester.run_backtest: one historical path through th
 portfolio_simulator.py   PortfolioSimulator.simulate_portfolio: N simulated paths through the engine
 quant_analytics.py       Every metric (compute_performance, CAGR, Sharpe, drawdowns, XIRR, ...)
 strategies.py            AllocationStrategy subclasses + STRATEGY_BUILDERS registry
-portfolio_optimizer.py   SLSQP optimizers (max Sharpe, min vol, risk parity, Sortino, custom)
+portfolio_optimizer.py   SLSQP optimizers (max Sharpe, min vol, risk parity, Sortino, custom) + efficient_frontier
+sweeps.py                run_sweep: strategy parameter grid (SweepConfig) -> backtest (+MC) per cell
+walk_forward.py          run_walk_forward: refit on trailing window, trade out of sample (ScheduledWeightsStrategy)
 visualizations.py        PortfolioVisualizer.generate_html_report (presentation only)
 data_manager.py          Downloads + interval-tracked SQLite cache; data_utils.py is its CLI
 synthetic_data.py        Deterministic generated prices (SyntheticDataManager) for offline runs/tests
@@ -64,6 +66,8 @@ python -m pytest tests -q
 - `PortfolioConfig.rebalance` overrides the default: a `RebalanceConfig(frequency, threshold, transaction_cost_bps)` or a frequency string.
 - `StrategyConfig(type, params, apply_to='contributions'|'rebalance'|'both', check_frequency='monthly')`. Types are the keys of `strategies.STRATEGY_BUILDERS`.
 - `RunConfig.benchmark_ticker` (defaults to `optimization.benchmark_ticker`).
+- `RunConfig.sweeps`: list of `SweepConfig(name, allocations, strategy, grid={1-2 params: values}, rebalance, simulations)`.
+- `OptimizationConfig.walk_forward` / `train_years` / `test_years` / `efficient_frontier`.
 - `VisualizationConfig.embed_plotlyjs` for offline reports.
 
 ## Data Notes
@@ -75,7 +79,7 @@ python -m pytest tests -q
 
 ## Testing
 
-- `tests/test_performance.py`: golden metric values; `test_engine.py`: rebalancing, signals, costs, alignment, MC/backtest consistency; `test_monte_carlo.py`: generators, seeds, inflation; `test_report.py`: end-to-end synthetic run.
+- `tests/test_performance.py`: golden metric values; `test_engine.py`: rebalancing, signals, costs, alignment, MC/backtest consistency; `test_monte_carlo.py`: generators, seeds, inflation; `test_sweeps.py`, `test_walk_forward.py`, `test_frontier.py`; `test_report.py`: end-to-end synthetic run.
 - `test_pv_benchmark.py` / `test_historical_validation.py` compare against Portfolio Visualizer reference numbers and need `stock_data.db`; they skip otherwise.
 - Test data that means "trading days" should use business-day dates (`freq='B'`); calendar-day dates are annualized as 365/yr.
 

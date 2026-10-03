@@ -1,5 +1,17 @@
 # Last Worked Notes
 
+## 2026-10 (cont.): Research tools
+
+- `sweeps.py` + `SweepConfig`: 1-2 parameter strategy grids, heatmaps vs the no-strategy baseline,
+  optional Monte Carlo per cell with a shared seed (common random numbers).
+- `walk_forward.py`: optimizer refit on the trailing `train_years`, traded for `test_years`, compared
+  with full-history weights over the same window. Uses `ScheduledWeightsStrategy` through the engine.
+- Optimizer data cache now keys on each asset's data span (it reused stale data for sliced windows).
+- `PortfolioOptimizer.efficient_frontier` + report chart.
+- `examples/timing_analysis.py` uses calendar dates and `quant_analytics`.
+- Skipped on purpose: moving modules into a package (would break `from run_config import ...` in
+  personal configs for no functional gain).
+
 ## 2026-10: Engine, metrics and report overhaul
 
 Why: report numbers were often wrong, and the same portfolio produced different

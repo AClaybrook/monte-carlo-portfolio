@@ -34,6 +34,7 @@ report that opens without internet.
 | `--coverage-report` | Show cached data coverage for the config's tickers |
 | `python data_utils.py list / coverage / sync / download VOO,QQQ / info VOO` | Cache management |
 | `python examples/compare_strategies.py [--synthetic]` | Strategy comparison scenarios |
+| `python examples/timing_analysis.py --ticker VOO [--synthetic]` | Entry-point sensitivity and lump sum vs DCA |
 | `python -m pytest tests -q` | Test suite |
 
 ## Configuration
@@ -104,6 +105,35 @@ whenever any weight drifts that far from target, with or without a calendar.
 
 Indicators are computed from prices, never from holdings, so contributions can't fake a drawdown or a recovery.
 
+### Parameter sweeps
+
+Grid-search one or two strategy parameters on a fixed allocation. Every cell is a full backtest
+(optionally plus a Monte Carlo) with the run's contributions and rebalancing, shown as a heatmap
+against the same allocation without the strategy:
+
+```python
+from run_config import SweepConfig
+config = RunConfig(
+    ...,
+    sweeps=[SweepConfig(
+        name='Drawdown protection thresholds',
+        allocations={'VOO': 0.8, 'BND': 0.2},
+        strategy=StrategyConfig('drawdown_protection', apply_to='rebalance', check_frequency='daily',
+                                params={'risk_off_allocation': {'BND': 1.0}}),
+        grid={'threshold': [0.08, 0.12, 0.16, 0.20], 'recovery_threshold': [0.0, 0.03, 0.06]},
+        simulations=300,     # optional: Monte Carlo per cell, same seed for every cell
+    )],
+)
+```
+
+Cells are fit to the same history they're scored on: prefer parameters inside a broad good region over the single best cell.
+
+### Optimizer checks
+
+With `optimization` configured, the report also includes:
+- **Walk-forward:** at each refit the optimizer sees only the previous `train_years` (default 3), and its weights are traded for the next `test_years` (default 1). This is compared with the full-history optimum over the same window, which shows how much of the optimized rows' performance is hindsight. Turn it off with `walk_forward=False`.
+- **Efficient frontier:** the long-only mean-variance frontier of the optimization assets, with every fixed-weight portfolio built from them placed on the chart (`efficient_frontier=False` to skip).
+
 ## How the numbers are computed
 
 One engine ([`engine.py`](engine.py)) runs both the historical backtest (one path) and the
@@ -136,7 +166,9 @@ backtester.py            historical runs on the engine + metrics
 portfolio_simulator.py   Monte Carlo runs on the engine + percentile stats
 quant_analytics.py       every performance metric
 strategies.py            dynamic strategies + registry
-portfolio_optimizer.py   SciPy SLSQP optimization (in-sample)
+portfolio_optimizer.py   SciPy SLSQP optimization (in-sample) + efficient frontier
+sweeps.py                strategy parameter grid search
+walk_forward.py          out-of-sample refit check for the optimizers
 visualizations.py        HTML report
 data_manager.py          download + SQLite cache;  data_utils.py: cache CLI
 synthetic_data.py        generated prices for offline runs/tests
