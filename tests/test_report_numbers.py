@@ -170,7 +170,7 @@ def test_summary_table_matches_raw_prices(report, independent, name):
     row = rows_by_name(table(tables, 'Final balance'))[name]
     exp = independent[name]
     assert num(row['Final balance']) == pytest.approx(exp['End'], abs=0.51)
-    assert num(row['Contributions']) == pytest.approx(exp['Contrib'], abs=0.51)
+    assert num(row['Invested']) == pytest.approx(10000 + exp['Contrib'], abs=0.51)
     for col, key in (('CAGR', 'CAGR'), ('IRR', 'IRR'), ('Stdev', 'Stdev'), ('Max drawdown', 'MaxDD')):
         assert num(row[col]) == pytest.approx(exp[key], abs=0.00005 + 1e-9), col   # shown to 0.01%
     for col, key in (('Sharpe', 'Sharpe'), ('Sortino', 'Sortino')):
@@ -215,7 +215,7 @@ def test_growth_chart_ends_at_final_balance(report):
     for name, row in rows_by_name(table(tables, 'Final balance')).items():
         y = decode(traces(figs, 'growth', name)[0]['y'])
         assert y[-1] == pytest.approx(num(row['Final balance']), abs=0.51), name
-        assert y[0] == pytest.approx(num(row['Initial']), abs=0.51), name
+        assert y[0] == pytest.approx(10000, abs=0.51), name
 
 
 def test_drawdown_chart_matches_table(report):

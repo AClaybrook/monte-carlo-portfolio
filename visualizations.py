@@ -383,27 +383,27 @@ class PortfolioVisualizer:
 
     def _summary_table(self, items):
         has_dca = any(it['backtest']['metrics']['Total Contributions'] for it in items)
-        headers = ['Portfolio', 'Initial', 'Contributions', 'Final balance', 'CAGR'] + \
+        headers = ['Portfolio', 'Invested', 'Final balance', 'CAGR'] + \
                   (['IRR'] if has_dca else []) + \
-                  ['Stdev', 'Best year', 'Worst year', 'Max drawdown', 'Sharpe', 'Sortino', 'Calmar']
+                  ['Stdev', 'Best year', 'Worst year', 'Max drawdown', 'Sharpe', 'Sortino']
         rows = []
         for i, it in enumerate(items):
             m = it['backtest']['metrics']
             rows.append([self._name_cell(i, it['label'], it['backtest']['strategy']),
-                         money(m['Start Balance']), money(m['Total Contributions']), money(m['End Balance']),
+                         money(m['Start Balance'] + m['Total Contributions']), money(m['End Balance']),
                          pct(m['CAGR'])] + ([pct(m['IRR'])] if has_dca else []) +
                         [pct(m['Stdev']), pct(m['Best Year']), pct(m['Worst Year']), pct(m['Max Drawdown']),
-                         num(m['Sharpe']), num(m['Sortino']), num(m['Calmar'])])
+                         num(m['Sharpe']), num(m['Sortino'])])
         return self._table(headers, rows, first_col_html=True)
 
     def _risk_table(self, items):
-        headers = ['Portfolio', 'Beta', 'Alpha', 'R²', 'Correlation', 'Upside capture', 'Downside capture',
+        headers = ['Portfolio', 'Calmar', 'Beta', 'Alpha', 'R²', 'Correlation', 'Upside capture', 'Downside capture',
                    'Tracking error', 'Info ratio', 'VaR 5%', 'CVaR 5%', 'Skew', 'Excess kurtosis',
                    'Positive periods', 'Rebalances', 'Costs']
         rows = []
         for i, it in enumerate(items):
             m = it['backtest']['metrics']
-            rows.append([self._name_cell(i, it['label']), num(m.get('Beta')), pct(m.get('Alpha')),
+            rows.append([self._name_cell(i, it['label']), num(m['Calmar']), num(m.get('Beta')), pct(m.get('Alpha')),
                          pct(m.get('R2'), 1), num(m.get('Correlation')), pct(m.get('Upside Capture'), 1),
                          pct(m.get('Downside Capture'), 1), pct(m.get('Tracking Error')),
                          num(m.get('Info Ratio')), pct(m['VaR 5%']), pct(m['CVaR 5%']), num(m['Skewness']),
@@ -679,6 +679,7 @@ class PortfolioVisualizer:
         if frontier:
             figs['frontier'] = self._frontier(frontier, items, styles)
 
+        first_portfolio = next((i for i, it in enumerate(items) if not it.get('is_benchmark')), 0)
         # Open the allocation chart on the most interesting portfolio
         alloc_default = next((i for i, it in enumerate(items)
                               if any(e['trigger'] != 'calendar' for e in it['backtest']['events'])),
@@ -715,6 +716,7 @@ class PortfolioVisualizer:
         sections = [
             ('summary', 'Summary', f'''
                 <h2>Performance summary</h2>
+                <dl class="assumptions">{assumption_html}</dl>
                 <p class="lede">Historical backtest over {esc(start_date)} to {esc(end_date)}. Return metrics are
                 time-weighted, so contributions never count as returns. IRR is the money-weighted return
                 including contributions.</p>
@@ -728,7 +730,7 @@ class PortfolioVisualizer:
             ('returns', 'Returns', f'''
                 <h2>Annual returns</h2>{chart('annual', '† partial calendar year (measured from the first or to the last available date).')}
                 <details><summary>Annual returns table</summary>{self._annual_table(items)}</details>
-                <h2>Monthly returns</h2>{selector('monthly')}{chart('monthly')}
+                <h2>Monthly returns</h2>{selector('monthly', portfolio_options(first_portfolio))}{chart('monthly')}
                 <h2>Rolling returns</h2>{selector('rolling', window_opts, 'Window')}{chart('rolling')}'''),
             ('drawdowns', 'Drawdowns', f'''
                 <h2>Drawdowns</h2>{chart('drawdowns')}
@@ -748,7 +750,7 @@ class PortfolioVisualizer:
                 {esc(items[0]['results'].get('history_start'))} to {esc(items[0]['results'].get('history_end'))}.
                 Balances in {mc_units}.</p>
                 {self._mc_table(items)}
-                <h3>Range of outcomes</h3>{selector('mcfan')}{chart('mcfan')}
+                <h3>Range of outcomes</h3>{selector('mcfan', portfolio_options(first_portfolio))}{chart('mcfan')}
                 <h3>Median balance</h3>{chart('mcmedian')}
                 <h3>Annualized return distribution</h3>{chart('mcbox', 'Box = 25th–75th percentile, whiskers = 10th–90th, line = median.')}
                 <h3>Probability of loss</h3>{chart('mcloss', 'Share of paths whose balance is below the money invested so far.')}'''),
@@ -756,14 +758,14 @@ class PortfolioVisualizer:
               if walk_forward else []),
             *([('sweeps', 'Sweeps', self._sweeps_section(sweeps, figs))] if sweeps else []),
             ('notes', 'Notes', f'''
-                <h2>Assumptions and methodology</h2>
-                <dl class="assumptions">{assumption_html}</dl>
+                <h2>Methodology</h2>
                 <ul class="notes">
                   <li><b>CAGR</b> is time-weighted and annualized by calendar span, so 24/7 crypto and 5-day equity calendars compare correctly.</li>
                   <li><b>Stdev, Sharpe, Sortino, beta, capture ratios, VaR</b> use monthly returns (Portfolio Visualizer's convention); histories under a year fall back to daily. Sharpe and Sortino subtract the configured risk-free rate.</li>
                   <li><b>Max drawdown</b> uses daily values, so it can be deeper than Portfolio Visualizer's month-end figure.</li>
                   <li><b>Best/Worst year</b> are calendar-year returns over full years.</li>
-                  <li><b>Upside/Downside capture</b> are ratios (1.00 = matches the benchmark).</li>
+                  <li><b>Upside/Downside capture</b> compare geometric average returns in the benchmark's up and down months (100% = moves with the benchmark).</li>
+                  <li><b>Invested</b> is the starting balance plus all contributions.</li>
                   <li><b>Optimized portfolios</b> are fit to the same history they are tested on (in-sample); expect worse results going forward.</li>
                   <li><b>Monte Carlo</b> resamples or fits the common history of each portfolio's assets; it cannot produce regimes that history doesn't contain.</li>
                 </ul>'''),
@@ -831,8 +833,8 @@ h3 {{ font-size: 14px; font-weight: 600; margin: 20px 0 6px; color: var(--text2)
 .banner {{ max-width: 1208px; margin: 8px auto 0; padding: 10px 14px; border-radius: 8px; border: 1px solid #fab219; background: rgba(250,178,25,0.12); }}
 .table-wrap {{ overflow-x: auto; margin: 4px 0 8px; }}
 table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
-th, td {{ padding: 6px 10px; text-align: right; border-bottom: 1px solid var(--grid); white-space: nowrap; font-variant-numeric: tabular-nums; }}
-th {{ color: var(--text2); font-weight: 600; font-size: 12px; position: sticky; top: 0; background: var(--surface); }}
+th, td {{ padding: 6px 8px; text-align: right; border-bottom: 1px solid var(--grid); white-space: nowrap; font-variant-numeric: tabular-nums; }}
+th {{ color: var(--text2); font-weight: 600; font-size: 12px; position: sticky; top: 0; background: var(--surface); white-space: normal; vertical-align: bottom; min-width: 56px; }}
 th:first-child, td:first-child {{ text-align: left; }}
 td:first-child {{ white-space: normal; min-width: 180px; }}
 .key {{ display: inline-block; width: 12px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 8px; }}
@@ -850,6 +852,11 @@ dl.assumptions {{ display: grid; grid-template-columns: repeat(auto-fill, minmax
 dl.assumptions dt {{ color: var(--muted); font-size: 12px; }}
 dl.assumptions dd {{ margin: 0; }}
 ul.notes {{ color: var(--text2); padding-left: 18px; max-width: 90ch; }}
+@media (max-width: 600px) {{
+  main {{ padding: 4px 8px 32px; }}
+  section {{ padding: 12px; border-radius: 8px; }}
+  dl.assumptions {{ grid-template-columns: 1fr 1fr; }}
+}}
 </style>
 <style id="dark-keys" media="not all">{key_css_dark}</style>
 </head>
