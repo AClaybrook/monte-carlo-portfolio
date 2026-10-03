@@ -181,6 +181,16 @@ class SimulationConfig:
     # int = every N trading days, or 'monthly' / 'quarterly' / 'annual'
     contribution_frequency: Union[int, str] = 21
 
+    # Withdrawals (retirement / decumulation). Sold pro-rata; a path that runs out is "depleted".
+    withdrawal_amount: float = 0.0               # taken out each period, as a positive number
+    withdrawal_frequency: Union[int, str] = 'monthly'
+    withdrawal_start_years: float = 0.0          # e.g. 20 = contribute first, retire after 20 years
+    contribution_years: Optional[float] = None   # stop contributions after this many years
+    # Annual growth applied to every contribution and withdrawal, e.g. 0.03 to keep pace with
+    # inflation in nominal dollars. Leave 0 when inflation_rate > 0 (Monte Carlo is then in
+    # today's dollars, so constant amounts are already inflation-adjusted).
+    cash_flow_growth: float = 0.0
+
     # Default rebalancing for portfolios that do not set their own (PV default: annual)
     rebalance: Union[RebalanceConfig, str] = field(default_factory=RebalanceConfig)
     risk_free_rate: float = 0.02      # Annual, used for Sharpe/Sortino/alpha
@@ -192,6 +202,11 @@ class SimulationConfig:
         if isinstance(self.contribution_frequency, str) and \
                 self.contribution_frequency not in CALENDAR_FREQUENCIES:
             raise ValueError(f"Unknown contribution_frequency: {self.contribution_frequency}")
+        if isinstance(self.withdrawal_frequency, str) and \
+                self.withdrawal_frequency not in CALENDAR_FREQUENCIES:
+            raise ValueError(f"Unknown withdrawal_frequency: {self.withdrawal_frequency}")
+        if self.withdrawal_amount < 0 or self.contribution_amount < 0:
+            raise ValueError("contribution_amount and withdrawal_amount must be >= 0")
         if self.method not in ('bootstrap', 'block_bootstrap', 'geometric_brownian', 'parametric'):
             raise ValueError(f"Unknown simulation method: {self.method}")
 
@@ -214,6 +229,16 @@ class SimulationConfig:
             end = dt_date.fromisoformat(self.end_date)
             if start >= end:
                 raise ValueError(f"start_date ({self.start_date}) must be before end_date ({self.end_date})")
+
+    def cash_flow_settings(self) -> dict:
+        """Keyword arguments for Backtester.run_backtest describing every cash flow."""
+        return dict(contribution_amount=self.contribution_amount,
+                    contribution_frequency=self.contribution_frequency,
+                    withdrawal_amount=self.withdrawal_amount,
+                    withdrawal_frequency=self.withdrawal_frequency,
+                    withdrawal_start_years=self.withdrawal_start_years,
+                    contribution_years=self.contribution_years,
+                    cash_flow_growth=self.cash_flow_growth)
 
     def get_date_range(self) -> tuple:
         """

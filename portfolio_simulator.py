@@ -6,7 +6,7 @@ from datetime import date, timedelta
 import numpy as np
 
 import quant_analytics as qa
-from engine import (SimulatedReturns, aligned_returns, contribution_schedule,
+from engine import (SimulatedReturns, aligned_returns, build_cash_flows,
                     run_engine, simulated_schedule, vectorized_irr)
 from run_config import RebalanceConfig
 
@@ -79,14 +79,17 @@ class PortfolioSimulator:
             block_size=getattr(self.config, 'block_size', 21),
             inflation_per_day=(1 + inflation) ** (1 / dpy) - 1,
         )
-        contrib_days = (contribution_schedule(self.contrib_freq, n_days, days_per_year=dpy)
-                        if self.contrib_amount > 0 else np.zeros(n_days, dtype=bool))
+        cfg = self.config
+        flows = build_cash_flows(
+            n_days, np.arange(1, n_days + 1) / dpy, self.contrib_amount, self.contrib_freq,
+            getattr(cfg, 'withdrawal_amount', 0.0), getattr(cfg, 'withdrawal_frequency', 'monthly'),
+            getattr(cfg, 'withdrawal_start_years', 0.0), getattr(cfg, 'contribution_years', None),
+            getattr(cfg, 'cash_flow_growth', 0.0), days_per_year=dpy)
         record_steps = np.unique(np.round(np.linspace(0, n_days, self.years * 12 + 1)).astype(int))
 
         res = run_engine(
             source, n_days, allocations, tickers, self.initial_capital,
-            contribution_amount=self.contrib_amount,
-            contribution_days=contrib_days,
+            cash_flows=flows,
             rebalance_days=simulated_schedule(n_days, rebalance.frequency, dpy),
             rebalance_threshold=rebalance.threshold,
             transaction_cost_bps=rebalance.transaction_cost_bps,
@@ -98,14 +101,19 @@ class PortfolioSimulator:
         final_values = res.values[:, -1]
         twr_final = np.maximum(res.twr[:, -1], 1e-12)
         cagr = twr_final ** (1 / self.years) - 1
-        total_invested = self.initial_capital + self.contrib_amount * len(res.contribution_steps)
-        if self.contrib_amount > 0:
-            irr = vectorized_irr(self.initial_capital, self.contrib_amount,
-                                 res.contribution_steps / dpy, final_values, self.years)
+        total_invested = self.initial_capital + float(flows[flows > 0].sum())
+        if len(res.flow_steps):
+            irr = vectorized_irr(self.initial_capital, res.flow_steps / dpy, res.flow_amounts,
+                                 final_values, self.years)
         else:
             irr = cagr
+        has_withdrawals = bool((flows < 0).any())
+        withdrawn = -np.minimum(res.flow_amounts, 0).sum(axis=1) if has_withdrawals else np.zeros(len(cagr))
 
         record_years = record_steps / dpy
+        # Money in the portfolio from outside, at each record point (for the report)
+        cum_in = np.concatenate([[0.0], np.cumsum(np.maximum(flows, 0))])[record_steps]
+        cum_net = np.concatenate([[0.0], np.cumsum(flows)])[record_steps]
         out = {
             'portfolio_values': res.values,
             'twr_paths': res.twr,
@@ -122,26 +130,41 @@ class PortfolioSimulator:
             'method': method,
             'days_per_year': dpy,
             'total_invested': total_invested,
+            'invested_curve': self.initial_capital + cum_in,
+            'net_invested_curve': self.initial_capital + cum_net,
+            'has_withdrawals': has_withdrawals,
+            'withdrawn': withdrawn,
+            'depleted_at_years': np.where(res.depleted_at >= 0, res.depleted_at / dpy, np.nan),
             'real_dollars': inflation > 0,
             'history_start': hist.index[0].date(),
             'history_end': hist.index[-1].date(),
         }
-        out['probabilities'] = self._calculate_probabilities(res, contrib_days, dpy)
+        out['probabilities'] = self._calculate_probabilities(res, flows, dpy)
         out['stats'] = self.calculate_statistics(final_values, cagr, res.max_drawdown,
                                                  irr=irr, volatility=res.volatility,
                                                  total_invested=total_invested)
+        if has_withdrawals:
+            depleted = res.depleted_at >= 0
+            out['stats'].update({
+                'success_rate': float(np.mean(~depleted)),
+                'median_withdrawn': float(np.median(withdrawn)),
+                'median_depletion_year': (float(np.median(res.depleted_at[depleted] / dpy))
+                                          if depleted.any() else None),
+            })
         return out
 
-    def _calculate_probabilities(self, res, contrib_days, dpy):
+    def _calculate_probabilities(self, res, flows, dpy):
         years = np.arange(1, self.years + 1)
         pos = np.searchsorted(res.record_steps, years * dpy)
-        prob_loss, prob_high = [], []
+        added = np.cumsum(np.maximum(flows, 0))
+        prob_loss, prob_high, survival = [], [], []
         for y, p in zip(years, pos):
-            invested = self.initial_capital + self.contrib_amount * contrib_days[:y * dpy].sum()
+            invested = self.initial_capital + added[y * dpy - 1]
             prob_loss.append(np.mean(res.values[:, p] < invested))
             prob_high.append(np.mean(res.twr[:, p] ** (1 / y) - 1 > 0.10))
+            survival.append(np.mean((res.depleted_at < 0) | (res.depleted_at > y * dpy)))
         return {'years': years, 'prob_loss': np.array(prob_loss),
-                'prob_high_return': np.array(prob_high)}
+                'prob_high_return': np.array(prob_high), 'survival': np.array(survival)}
 
     def calculate_statistics(self, final_values, cagr, max_drawdowns, irr=None,
                              volatility=None, total_invested=None):

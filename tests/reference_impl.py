@@ -38,10 +38,13 @@ def first_trading_days(dates: pd.DatetimeIndex, frequency: str) -> set:
 def reference_backtest(prices: pd.DataFrame, weights, initial: float,
                        contribution: float = 0.0, contribution_dates: set = (),
                        rebalance_dates: set = (), threshold: float = None,
-                       cost_bps: float = 0.0, target_by_date=None):
-    """Share-based simulation. Order each day: mark to market, contribute,
-    rebalance (calendar, band breach or target change), record.
+                       cost_bps: float = 0.0, target_by_date=None, flows_by_date: dict = None):
+    """Share-based simulation. Order each day: mark to market, cash flow, rebalance
+    (calendar, band breach or target change), record.
 
+    Cash flows: `contribution` on `contribution_dates`, or any signed amounts in
+    flows_by_date {date: amount}. Positive amounts buy at the base weights;
+    negative amounts sell every holding pro-rata, capped at the balance.
     target_by_date: optional callable(date) -> target weights (signal strategy).
     Returns (balance Series, time-weighted index Series, number of trades).
     """
@@ -52,25 +55,34 @@ def reference_backtest(prices: pd.DataFrame, weights, initial: float,
     balance, twr = [initial], [1.0]
     trades = 0
     prev_value = initial
+    if flows_by_date is None:
+        flows_by_date = {d: contribution for d in contribution_dates} if contribution else {}
     for d in dates[1:]:
         px = prices.loc[d].values
         flow = 0.0
         new_target = target if target_by_date is None else np.asarray(target_by_date(d), dtype=float)
-        if d in contribution_dates and contribution:
-            shares = shares + w * contribution / px
-            flow = contribution
+        amount = flows_by_date.get(d, 0.0)
+        if amount > 0:
+            shares = shares + w * amount / px
+            flow = amount
+        elif amount < 0:
+            value = float(shares @ px)
+            take = min(-amount, value)
+            shares = shares * ((value - take) / value if value > 0 else 0.0)
+            flow = -take
         value = float(shares @ px)
-        current_w = shares * px / value
-        do_trade = (d in rebalance_dates
-                    or (threshold is not None and np.max(np.abs(current_w - new_target)) > threshold)
-                    or np.max(np.abs(new_target - target)) > 1e-12)
+        current_w = shares * px / value if value > 0 else target
+        do_trade = value > 0 and (
+            d in rebalance_dates
+            or (threshold is not None and np.max(np.abs(current_w - new_target)) > threshold)
+            or np.max(np.abs(new_target - target)) > 1e-12)
         target = new_target
         if do_trade:
             cost = cost_bps / 1e4 * np.sum(np.abs(target * value - shares * px))
             shares = target * (value - cost) / px
             trades += 1
         end_value = float(shares @ px)
-        twr.append(twr[-1] * (end_value - flow) / prev_value)
+        twr.append(twr[-1] * ((end_value - flow) / prev_value if prev_value > 0 else 1.0))
         balance.append(end_value)
         prev_value = end_value
     return pd.Series(balance, index=dates), pd.Series(twr, index=dates), trades

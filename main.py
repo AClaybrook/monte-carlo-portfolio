@@ -49,12 +49,11 @@ def evaluate_portfolio(sim, backtester, sim_cfg, label, assets, weights, start=N
     bt_res = backtester.run_backtest(
         assets, weights, sim_cfg.initial_capital,
         start_date_override=start, end_date=end,
-        strategy=strategy, contribution_amount=sim_cfg.contribution_amount,
-        contribution_frequency=sim_cfg.contribution_frequency,
+        strategy=strategy, **sim_cfg.cash_flow_settings(),
         rebalance=rebalance, apply_to=apply_to, check_frequency=check,
         risk_free_rate=sim_cfg.risk_free_rate, benchmark=benchmark)
     m = bt_res['metrics']
-    irr = f" | IRR: {m['IRR']*100:.2f}%" if m['Total Contributions'] else ""
+    irr = f" | IRR: {m['IRR']*100:.2f}%" if m['Total Contributions'] or m['Total Withdrawals'] else ""
     print(f"  {bt_res['strategy']}")
     print(f"  CAGR: {m['CAGR']*100:.2f}%{irr} | Max DD: {m['Max Drawdown']*100:.2f}% | "
           f"Sharpe: {m['Sharpe']:.2f}")
@@ -77,6 +76,13 @@ def describe_assumptions(config, args) -> dict:
     return {
         'Initial capital': f"${sim.initial_capital:,.0f}",
         'Contributions': contrib,
+        **({'Withdrawals': f"${sim.withdrawal_amount:,.0f} every "
+                           + (f"{sim.withdrawal_frequency} trading days"
+                              if isinstance(sim.withdrawal_frequency, int) else period[sim.withdrawal_frequency])
+                           + (f" from year {sim.withdrawal_start_years:g}" if sim.withdrawal_start_years else '')}
+           if sim.withdrawal_amount else {}),
+        **({'Contribution period': f"First {sim.contribution_years:g} years"} if sim.contribution_years else {}),
+        **({'Cash flow growth': f"{sim.cash_flow_growth:.2%} per year"} if sim.cash_flow_growth else {}),
         'Default rebalancing': rebalance,
         'Risk-free rate': f"{sim.risk_free_rate:.2%}",
         'Benchmark': config.benchmark_ticker or 'First asset of each portfolio',

@@ -1,5 +1,16 @@
 # Last Worked Notes
 
+## 2026-10 (cont.): Verification + withdrawals
+
+- Independent verification layer: tests/reference_impl.py (share-based simulator, plain-Python metrics),
+  randomized cross-checks (mutation-tested), Monte Carlo vs closed form, report HTML parsed and checked.
+- Fixed: main dropped the first trading day (start taken from first return date); engine counted
+  calendar rebalances on emptied portfolios.
+- Report: Invested column, Calmar moved to risk table, assumptions at top, selectors default to the
+  first real portfolio, compact money ticks, linear axes + survival chart for withdrawal runs.
+- Withdrawals: signed cash flows in the engine, accumulate-then-retire phases, cash_flow_growth,
+  success rate / survival / median withdrawn, generalized per-path IRR. config/retirement_demo.py.
+
 ## 2026-10 (cont.): Research tools
 
 - `sweeps.py` + `SweepConfig`: 1-2 parameter strategy grids, heatmaps vs the no-strategy baseline,

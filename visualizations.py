@@ -134,10 +134,10 @@ class PortfolioVisualizer:
             xaxis=dict(axis, title=dict(axis['title'], text=xtitle)),
             yaxis=dict(axis, title=dict(axis['title'], text=ytitle), tickformat=yfmt),
         )
+        if yfmt == '$,.0f':
+            layout['yaxis']['tickformat'] = '$~s'   # $20k, $1.5M
         if ylog:
             layout['yaxis'].update(type='log', dtick='D2')
-            if yfmt == '$,.0f':
-                layout['yaxis']['tickformat'] = '$~s'
         layout.update(extra)
         return layout
 
@@ -154,10 +154,12 @@ class PortfolioVisualizer:
             fig.add_trace(go.Scatter(x=bal.index, y=bal.values, name=it['label'], line=self._line(st),
                                      hovertemplate='%{y:$,.0f}'))
         ref = next((it['backtest'] for it in items if not it.get('is_benchmark')), items[0]['backtest'])
-        if ref['metrics']['Total Contributions'] > 0:
-            invested = ref['metrics']['Start Balance'] + ref['contributions'].reindex(
-                ref['balance'].index).fillna(0).cumsum()
-            fig.add_trace(go.Scatter(x=invested.index, y=invested.values, name='Invested capital',
+        withdrawals = ref['metrics'].get('Total Withdrawals', 0) > 0
+        if ref['metrics']['Total Contributions'] > 0 or withdrawals:
+            flows = ref['cash_flows'] if withdrawals else ref['contributions']
+            invested = ref['metrics']['Start Balance'] + flows.reindex(ref['balance'].index).fillna(0).cumsum()
+            fig.add_trace(go.Scatter(x=invested.index, y=invested.values,
+                                     name='Net invested' if withdrawals else 'Invested capital',
                                      line=dict(color=self._chrome('muted'), width=1.5, shape='hv'),
                                      hovertemplate='%{y:$,.0f}'))
         fig.update_layout(**self._layout(height=440, yfmt='$,.0f', ytitle='Balance (log scale)', ylog=True))
@@ -305,24 +307,27 @@ class PortfolioVisualizer:
                                      line=self._line(st), hovertemplate='Median: %{y:$,.0f}'))
         invested = self._invested_curve(items)
         if invested is not None:
-            fig.add_trace(go.Scatter(x=invested[0], y=invested[1], meta='all', name='Invested capital',
+            fig.add_trace(go.Scatter(x=invested[0], y=invested[1], meta='all',
+                                     name='Net invested' if items[0]['results'].get('has_withdrawals') else 'Invested capital',
                                      line=dict(color=self._chrome('muted'), width=1.5, shape='hv'),
                                      hovertemplate='Invested: %{y:$,.0f}'))
-        fig.update_layout(**self._layout(height=440, yfmt='$,.0f', ytitle='Balance (log scale)', ylog=True,
+        wd = any(it['results'].get('has_withdrawals') for it in items)
+        # Paths that run dry hit $0, which a log axis cannot show
+        fig.update_layout(**self._layout(height=440, yfmt='$,.0f', ylog=not wd,
+                                         ytitle='Balance' if wd else 'Balance (log scale)',
                                          xtitle='Years'))
         return fig
 
-    def _invested_curve(self, items):
-        sim = self.simulator
-        if sim is None or not sim.contrib_amount:
-            return None
+    @staticmethod
+    def _invested_curve(items):
+        """(years, dollars) of money put in from outside; net of withdrawals when there are any."""
         res = items[0]['results']
-        dpy = res['days_per_year']
-        steps = np.round(np.asarray(res['record_years']) * dpy).astype(int)
-        from engine import contribution_schedule
-        sched = contribution_schedule(sim.contrib_freq, int(steps[-1]), days_per_year=dpy)
-        cum = np.concatenate([[0], np.cumsum(sched)])[steps]
-        return res['record_years'], sim.initial_capital + sim.contrib_amount * cum
+        if res.get('has_withdrawals'):
+            return None   # net invested goes negative once withdrawals exceed deposits
+        curve = res['invested_curve']
+        if np.allclose(curve, curve[0]):
+            return None
+        return res['record_years'], curve
 
     def _mc_medians(self, items, styles):
         fig = go.Figure()
@@ -330,7 +335,9 @@ class PortfolioVisualizer:
             res = it['results']
             fig.add_trace(go.Scatter(x=res['record_years'], y=np.median(res['portfolio_values'], axis=0),
                                      name=it['label'], line=self._line(st), hovertemplate='%{y:$,.0f}'))
-        fig.update_layout(**self._layout(yfmt='$,.0f', ytitle='Median balance (log scale)', ylog=True,
+        wd = any(it['results'].get('has_withdrawals') for it in items)
+        fig.update_layout(**self._layout(yfmt='$,.0f', ylog=not wd,
+                                         ytitle='Median balance' if wd else 'Median balance (log scale)',
                                          xtitle='Years'))
         return fig
 
@@ -350,15 +357,15 @@ class PortfolioVisualizer:
                                                     showgrid=False)))
         return fig
 
-    def _prob_loss(self, items, styles):
+    def _prob_loss(self, items, styles, key='prob_loss', ytitle='P(balance < invested)'):
         fig = go.Figure()
         for it, st in zip(items, styles):
             pr = it['results']['probabilities']
-            fig.add_trace(go.Scatter(x=pr['years'], y=pr['prob_loss'], name=it['label'],
+            fig.add_trace(go.Scatter(x=pr['years'], y=pr[key], name=it['label'],
                                      line=self._line(st), mode='lines+markers',
                                      marker=dict(size=7, line=dict(width=2, color=self._chrome('surface'))),
                                      hovertemplate='%{y:.1%}'))
-        fig.update_layout(**self._layout(yfmt='.0%', ytitle='P(balance < invested)', xtitle='Years',
+        fig.update_layout(**self._layout(yfmt='.0%', ytitle=ytitle, xtitle='Years',
                                          yaxis=dict(self._layout()['yaxis'], tickformat='.0%', rangemode='tozero')))
         return fig
 
@@ -383,17 +390,20 @@ class PortfolioVisualizer:
 
     def _summary_table(self, items):
         has_dca = any(it['backtest']['metrics']['Total Contributions'] for it in items)
-        headers = ['Portfolio', 'Invested', 'Final balance', 'CAGR'] + \
-                  (['IRR'] if has_dca else []) + \
-                  ['Stdev', 'Best year', 'Worst year', 'Max drawdown', 'Sharpe', 'Sortino']
+        has_wd = any(it['backtest']['metrics'].get('Total Withdrawals', 0) for it in items)
+        headers = (['Portfolio', 'Invested'] + (['Withdrawn'] if has_wd else []) + ['Final balance', 'CAGR']
+                   + (['IRR'] if has_dca or has_wd else [])
+                   + ['Stdev', 'Best year', 'Worst year', 'Max drawdown', 'Sharpe', 'Sortino'])
         rows = []
         for i, it in enumerate(items):
             m = it['backtest']['metrics']
             rows.append([self._name_cell(i, it['label'], it['backtest']['strategy']),
-                         money(m['Start Balance'] + m['Total Contributions']), money(m['End Balance']),
-                         pct(m['CAGR'])] + ([pct(m['IRR'])] if has_dca else []) +
-                        [pct(m['Stdev']), pct(m['Best Year']), pct(m['Worst Year']), pct(m['Max Drawdown']),
-                         num(m['Sharpe']), num(m['Sortino'])])
+                         money(m['Start Balance'] + m['Total Contributions'])]
+                        + ([money(m['Total Withdrawals'])] if has_wd else [])
+                        + [money(m['End Balance']), pct(m['CAGR'])]
+                        + ([pct(m['IRR'])] if has_dca or has_wd else [])
+                        + [pct(m['Stdev']), pct(m['Best Year']), pct(m['Worst Year']), pct(m['Max Drawdown']),
+                           num(m['Sharpe']), num(m['Sortino'])])
         return self._table(headers, rows, first_col_html=True)
 
     def _risk_table(self, items):
@@ -440,19 +450,23 @@ class PortfolioVisualizer:
     def _mc_table(self, items):
         has_dca = any(it['results']['stats']['total_invested'] > it['results']['portfolio_values'][0, 0]
                       for it in items)
+        has_wd = any(it['results'].get('has_withdrawals') for it in items)
         headers = ['Portfolio'] + [f'Balance p{q}' for q in PCTS] + ['Median CAGR', 'CAGR p10–p90'] + \
-                  (['Median IRR'] if has_dca else []) + \
-                  ['Median max DD', 'Max DD p5', 'Median stdev', 'P(loss)', 'P(2× invested)']
+                  (['Median IRR'] if has_dca or has_wd else []) + \
+                  (['Success rate', 'Median withdrawn'] if has_wd else []) + \
+                  ['Median max DD', 'Max DD p5', 'Median stdev'] + \
+                  ([] if has_wd else ['P(loss)', 'P(2× invested)'])
         rows = []
         for i, it in enumerate(items):
             s = it['results']['stats']
             pc = s['percentiles']
             rows.append([self._name_cell(i, it['label'])] + [money(pc['final_value'][q]) for q in PCTS] +
                         [pct(s['median_cagr']), f"{pct(pc['cagr'][10], 1)} to {pct(pc['cagr'][90], 1)}"] +
-                        ([pct(s['median_irr'])] if has_dca else []) +
+                        ([pct(s['median_irr'])] if has_dca or has_wd else []) +
+                        ([pct(s.get('success_rate'), 1), money(s.get('median_withdrawn'))] if has_wd else []) +
                         [pct(s['median_max_drawdown']), pct(s['max_drawdown_95']),
-                         pct(s.get('median_volatility')), pct(s['probability_loss'], 1),
-                         pct(s['probability_double'], 1)])
+                         pct(s.get('median_volatility'))] +
+                        ([] if has_wd else [pct(s['probability_loss'], 1), pct(s['probability_double'], 1)]))
         return self._table(headers, rows, first_col_html=True)
 
     def _allocation_table(self, items, start_year, end_year):
@@ -671,7 +685,10 @@ class PortfolioVisualizer:
             'mcfan': self._mc_fan(items, styles),
             'mcmedian': self._mc_medians(items, styles),
             'mcbox': self._mc_cagr_boxes(items, styles),
-            'mcloss': self._prob_loss(items, styles),
+            **({} if any(it['results'].get('has_withdrawals') for it in items)
+               else {'mcloss': self._prob_loss(items, styles)}),
+            **({'mcsurvival': self._prob_loss(items, styles, 'survival', 'Share of paths not yet depleted')}
+               if any(it['results'].get('has_withdrawals') for it in items) else {}),
         }
         corr = self._correlation(items)
         if corr is not None:
@@ -703,6 +720,10 @@ class PortfolioVisualizer:
         def chart(chart_id, caption=''):
             cap = f'<p class="caption">{caption}</p>' if caption else ''
             return f'<div class="chart" id="c-{chart_id}"></div>{cap}'
+
+        survival_html = ('<h3>Portfolio survival</h3>' + chart('mcsurvival', 'Share of paths that have '
+                         'not run out of money by each year; the last point is the success rate.')
+                         if 'mcsurvival' in figs else '')
 
         assumptions = assumptions or {}
         assumption_html = ''.join(f'<div><dt>{esc(k)}</dt><dd>{esc(v)}</dd></div>' for k, v in assumptions.items())
@@ -753,7 +774,8 @@ class PortfolioVisualizer:
                 <h3>Range of outcomes</h3>{selector('mcfan', portfolio_options(first_portfolio))}{chart('mcfan')}
                 <h3>Median balance</h3>{chart('mcmedian')}
                 <h3>Annualized return distribution</h3>{chart('mcbox', 'Box = 25th–75th percentile, whiskers = 10th–90th, line = median.')}
-                <h3>Probability of loss</h3>{chart('mcloss', 'Share of paths whose balance is below the money invested so far.')}'''),
+                {survival_html}
+                {('<h3>Probability of loss</h3>' + chart('mcloss', 'Share of paths whose balance is below the money invested so far.')) if 'mcloss' in figs else ''}'''),
             *([('walkforward', 'Walk-forward', self._walk_forward_section(walk_forward, figs))]
               if walk_forward else []),
             *([('sweeps', 'Sweeps', self._sweeps_section(sweeps, figs))] if sweeps else []),
