@@ -1,26 +1,26 @@
 """
-Portfolio optimization using SciPy with Enhanced Methods.
-FIXED:
-- Min volatility now excludes leveraged ETFs by default
-- Custom weighted objective normalized properly
-- Better constraint handling
+Portfolio optimization using SciPy (SLSQP with multi-start).
 """
 import numpy as np
 import scipy.optimize as sco
-from portfolio_simulator import PortfolioSimulator
 
-# Leveraged ETFs that shouldn't dominate "min volatility" portfolios
-LEVERAGED_ETFS = {'TQQQ', 'SQQQ', 'SPXL', 'SPXS', 'UPRO', 'TMF', 'TMV', 'UDOW', 'SDOW',
-                  'QLD', 'QID', 'SSO', 'SDS', 'UVXY', 'SVXY', 'SOXL', 'SOXS'}
-LEVERAGED_ETFS = {}
+import quant_analytics as qa
+from portfolio_simulator import PortfolioSimulator
 
 class PortfolioOptimizer:
     def __init__(self, simulator: PortfolioSimulator, data_manager):
         self.simulator = simulator
         self.data_manager = data_manager
         self._data_cache = {}  # Cache for aligned returns/covariance
-        # Use fewer simulations during optimization for speed (full sim done later for final results)
-        self._optimization_sims = min(1000, simulator.simulations)
+        self.periods_per_year = 252.0
+        self.verbose = True
+
+    @staticmethod
+    def _span(asset):
+        data = asset.get('full_data')
+        if data is None or data.empty:
+            data = asset['historical_returns']
+        return (data.index[0], data.index[-1], len(data))
 
     def _get_data(self, assets, start_date_override=None):
         """
@@ -28,9 +28,12 @@ class PortfolioOptimizer:
         Results are cached to avoid redundant computation across optimization strategies.
         """
         # Check cache first
-        cache_key = (tuple(a['ticker'] for a in assets), start_date_override)
+        # Key on each asset's data span too: walk-forward refits pass sliced copies
+        cache_key = (tuple((a['ticker'], *self._span(a)) for a in assets), start_date_override)
         if cache_key in self._data_cache:
-            return self._data_cache[cache_key]
+            cached = self._data_cache[cache_key]
+            self.periods_per_year = qa.infer_periods_per_year(cached[0].index)
+            return cached
 
         try:
             # Note: _prepare_multivariate_data already returns daily returns, NOT prices
@@ -50,6 +53,8 @@ class PortfolioOptimizer:
              print(f"Optimization Skipped: Data still contains NaNs or Infinite values after cleaning.")
              return None, None, None
 
+        # Objectives annualize with the observed calendar (365 for crypto-only sets)
+        self.periods_per_year = qa.infer_periods_per_year(returns.index)
         result = (returns, returns.mean(), returns.cov())
         self._data_cache[cache_key] = result
         return result
@@ -101,21 +106,10 @@ class PortfolioOptimizer:
             return self._package_fail(assets, label, str(e))
 
     def _package_fail(self, assets, label, reason):
-        """Return a safe 'failed' result so the script continues"""
+        """Equal weights, labelled as failed, so the run continues."""
         num = len(assets)
-        alloc = np.array([1/num]*num)
-        # Use reduced simulations for speed
-        original_sims = self.simulator.simulations
-        self.simulator.simulations = self._optimization_sims
-        sim_results = self.simulator.simulate_portfolio(assets, alloc)
-        self.simulator.simulations = original_sims
-        return {
-            'label': f"{label} (FAILED: {reason})",
-            'score': 0,
-            'allocations': alloc,
-            'stats': sim_results['stats'],
-            'results': sim_results
-        }
+        return {'label': f"{label} (FAILED: {reason})", 'score': 0,
+                'allocations': np.full(num, 1 / num)}
 
     def optimize_sharpe_ratio(self, assets, risk_free_rate=0.04, start_date_override=None):
         """Maximize Sharpe Ratio"""
@@ -124,49 +118,24 @@ class PortfolioOptimizer:
         if returns is None: return self._package_fail(assets, "Max Sharpe", "No Data")
 
         def neg_sharpe(weights, mean_rets, cov_mat, rf):
-            p_ret = np.sum(mean_rets * weights) * 252
-            p_vol = np.sqrt(np.dot(weights.T, np.dot(cov_mat, weights))) * np.sqrt(252)
+            p_ret = np.sum(mean_rets * weights) * self.periods_per_year
+            p_vol = np.sqrt(np.dot(weights.T, np.dot(cov_mat, weights))) * np.sqrt(self.periods_per_year)
             if p_vol == 0: return 0
             return - (p_ret - rf) / p_vol
 
         return self._minimize(neg_sharpe, assets, args=(mean_rets, cov_mat, risk_free_rate),
                               label="Max Sharpe Ratio")
 
-    def optimize_min_volatility(self, assets, start_date_override=None,
-                                 exclude_leveraged=True, max_leveraged_weight=0.10):
-        """
-        Minimize Volatility
-
-        Parameters:
-            exclude_leveraged: If True, cap leveraged ETF weights (they shouldn't dominate min vol)
-            max_leveraged_weight: Maximum weight for any single leveraged ETF
-        """
+    def optimize_min_volatility(self, assets, start_date_override=None):
+        """Minimize Volatility"""
         returns, mean_rets, cov_mat = self._get_data(assets, start_date_override=start_date_override)
 
         if returns is None: return self._package_fail(assets, "Min Volatility", "No Data")
 
         def port_vol(weights, cov_mat):
-            return np.sqrt(np.dot(weights.T, np.dot(cov_mat, weights))) * np.sqrt(252)
+            return np.sqrt(np.dot(weights.T, np.dot(cov_mat, weights))) * np.sqrt(self.periods_per_year)
 
-        # Build custom bounds - cap leveraged ETFs
-        bounds = []
-        for asset in assets:
-            ticker = asset['ticker'].upper()
-            if exclude_leveraged and ticker in LEVERAGED_ETFS:
-                bounds.append((0.0, max_leveraged_weight))
-            else:
-                bounds.append((0.0, 1.0))
-
-        result = self._minimize(port_vol, assets, args=(cov_mat,), label="Min Volatility",
-                                bounds=tuple(bounds))
-
-        # Verify result makes sense
-        allocations = result['allocations']
-        for i, asset in enumerate(assets):
-            if asset['ticker'].upper() in LEVERAGED_ETFS and allocations[i] > 0.15:
-                print(f"  ⚠ Warning: {asset['ticker']} at {allocations[i]*100:.1f}% in Min Vol portfolio")
-
-        return result
+        return self._minimize(port_vol, assets, args=(cov_mat,), label="Min Volatility")
 
     def optimize_sortino_ratio(self, assets, risk_free_rate=0.04, start_date_override=None):
         """Maximize Sortino Ratio"""
@@ -176,7 +145,7 @@ class PortfolioOptimizer:
 
         def neg_sortino(weights, returns, rf):
             p_daily_rets = returns.dot(weights)
-            ann_ret = np.mean(p_daily_rets) * 252
+            ann_ret = np.mean(p_daily_rets) * self.periods_per_year
             downside = p_daily_rets[p_daily_rets < 0]
 
             # Need enough downside days for meaningful calculation
@@ -185,7 +154,7 @@ class PortfolioOptimizer:
                 # Can't calculate meaningful Sortino
                 return 100  # Return LARGE positive = bad score for minimizer
 
-            downside_std = np.std(downside) * np.sqrt(252)
+            downside_std = np.std(downside) * np.sqrt(self.periods_per_year)
             if downside_std < 0.001:
                 # Near-zero downside vol means we can't trust Sortino
                 return 100
@@ -230,13 +199,13 @@ class PortfolioOptimizer:
 
         # Pre-compute baseline metrics for normalization
         equal_w = np.ones(len(assets)) / len(assets)
-        baseline_ret = np.sum(mean_rets * equal_w) * 252
-        baseline_vol = np.sqrt(np.dot(equal_w.T, np.dot(cov_mat, equal_w))) * np.sqrt(252)
+        baseline_ret = np.sum(mean_rets * equal_w) * self.periods_per_year
+        baseline_vol = np.sqrt(np.dot(equal_w.T, np.dot(cov_mat, equal_w))) * np.sqrt(self.periods_per_year)
 
         def custom_objective(w, returns, mean_rets, cov_mat, rf, obj_weights, baseline_ret, baseline_vol):
             # Calculate metrics
-            p_ret = np.sum(mean_rets * w) * 252
-            p_vol = np.sqrt(np.dot(w.T, np.dot(cov_mat, w))) * np.sqrt(252)
+            p_ret = np.sum(mean_rets * w) * self.periods_per_year
+            p_vol = np.sqrt(np.dot(w.T, np.dot(cov_mat, w))) * np.sqrt(self.periods_per_year)
 
             if p_vol < 1e-6:
                 p_vol = 1e-6
@@ -284,7 +253,7 @@ class PortfolioOptimizer:
                 if 'sortino' in obj_weights and obj_weights['sortino'] > 0:
                     downside = p_daily[p_daily < 0]
                     if len(downside) > 0:
-                        downside_std = np.std(downside) * np.sqrt(252)
+                        downside_std = np.std(downside) * np.sqrt(self.periods_per_year)
                         sortino = (p_ret - rf) / downside_std if downside_std > 0 else 0
                     else:
                         sortino = 5.0  # Very good
@@ -300,28 +269,78 @@ class PortfolioOptimizer:
         )
 
     def _package_result(self, scipy_result, assets, label):
-        """Package results and run a fast simulation check (reduced sims for speed)"""
+        """Normalize weights and drop dust. Callers simulate/backtest the final weights."""
         allocations = scipy_result.x / np.sum(scipy_result.x)
-
-        # Clean tiny allocations
         allocations[allocations < 0.001] = 0
         allocations = allocations / np.sum(allocations)
+        alloc_str = " | ".join(f"{a['ticker']}: {w*100:.1f}%"
+                               for a, w in zip(assets, allocations) if w > 0.001)
+        if self.verbose:
+            print(f"  → {label}: {alloc_str}")
+        return {'label': label,
+                'score': -scipy_result.fun if scipy_result.success else 0,
+                'allocations': allocations}
 
-        # Use reduced simulations for optimization phase (full sim done in main.py)
-        original_sims = self.simulator.simulations
-        self.simulator.simulations = self._optimization_sims
-        sim_results = self.simulator.simulate_portfolio(assets, allocations)
-        self.simulator.simulations = original_sims
+    # ------------------------------------------------------------------
+    # Efficient frontier
+    # ------------------------------------------------------------------
 
-        # Print allocation
-        alloc_str = " | ".join([f"{a['ticker']}: {w*100:.1f}%"
-                                for a, w in zip(assets, allocations) if w > 0.001])
-        print(f"  → {label}: {alloc_str}")
+    def efficient_frontier(self, assets, start_date_override=None, n_points=40):
+        """Long-only mean-variance frontier.
 
+        Return = annualized arithmetic mean of daily returns, risk = annualized
+        stdev of daily returns (the space the optimizers work in, not CAGR).
+        """
+        returns, mean_rets, cov_mat = self._get_data(assets, start_date_override=start_date_override)
+        if returns is None:
+            return None
+        ppy = self.periods_per_year
+        mu = mean_rets.values * ppy
+        cov = np.atleast_2d(cov_mat.values) * ppy
+        n = len(assets)
+        bounds = tuple((0.0, 1.0) for _ in range(n))
+        budget = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
+
+        def vol(w):
+            return np.sqrt(max(w @ cov @ w, 0.0))
+
+        def solve(constraints, x0):
+            res = sco.minimize(vol, x0, method='SLSQP', bounds=bounds, constraints=constraints,
+                               options={'ftol': 1e-12, 'maxiter': 500})
+            return res.x if res.success else None
+
+        w_min = solve([budget], np.full(n, 1 / n))
+        if w_min is None:
+            return None
+        targets = np.linspace(w_min @ mu, mu.max(), n_points)
+        points, x0 = [], w_min
+        for target in targets:
+            w = solve([budget, {'type': 'eq', 'fun': lambda w, t=target: w @ mu - t}], x0)
+            if w is None:
+                continue
+            w = np.clip(w, 0, None)
+            w /= w.sum()
+            points.append((vol(w), float(w @ mu), w))
+            x0 = w
         return {
-            'label': label,
-            'score': -scipy_result.fun if scipy_result.success else 0,
-            'allocations': allocations,
-            'stats': sim_results['stats'],
-            'results': sim_results
+            'tickers': [a['ticker'] for a in assets],
+            'vol': [p[0] for p in points],
+            'ret': [p[1] for p in points],
+            'weights': [p[2] for p in points],
+            'asset_vol': np.sqrt(np.diag(cov)).tolist(),
+            'asset_ret': mu.tolist(),
+            'mu': mu,
+            'cov': cov,
+            'start': returns.index[0].date(),
+            'end': returns.index[-1].date(),
         }
+
+    @staticmethod
+    def frontier_point(frontier, allocations: dict):
+        """(risk, return) of fixed weights in the frontier's space, or None if they
+        use assets outside it."""
+        tickers = frontier['tickers']
+        if any(t not in tickers for t, w in allocations.items() if w > 1e-9):
+            return None
+        w = np.array([allocations.get(t, 0.0) for t in tickers], dtype=float)
+        return float(np.sqrt(max(w @ frontier['cov'] @ w, 0.0))), float(w @ frontier['mu'])

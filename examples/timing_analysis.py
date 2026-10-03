@@ -7,13 +7,32 @@ This script helps analyze:
 3. Entry point sensitivity
 """
 
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
+from pathlib import Path
 from data_manager import DataManager
-from portfolio_simulator import PortfolioSimulator
+from engine import calendar_schedule
+import quant_analytics as qa
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+OUTPUT_DIR = Path('output')
+
+
+def month_starts(dates: pd.DatetimeIndex) -> np.ndarray:
+    """Row positions of the first trading day of each month."""
+    return np.concatenate([[0], np.flatnonzero(calendar_schedule(dates, 'monthly')) + 1])
+
+
+def row_after(dates: pd.DatetimeIndex, start_row: int, years: int) -> int:
+    """First row on or after `years` calendar years past start_row (len(dates) if none)."""
+    return int(dates.searchsorted(dates[start_row] + pd.DateOffset(years=years)))
 
 class TimingAnalyzer:
     """Analyzes investment timing strategies"""
@@ -38,35 +57,30 @@ class TimingAnalyzer:
         start_date = end_date - timedelta(days=365 * (years_back + 5))
 
         df = self.data_manager.get_data(self.ticker, start_date, end_date)
-        prices = df['Adj Close'].values
+        series = df['Adj Close']
+        prices = series.values
         dates = df.index
 
-        # Test different entry points
+        # Enter on the first trading day of each month, exit N calendar years later
         results = []
         holding_periods = [1, 3, 5, 10]  # years
 
         for holding_years in holding_periods:
-            holding_days = holding_years * 252
-
-            if holding_days >= len(prices):
-                continue
-
-            for entry_idx in range(0, len(prices) - holding_days, 21):  # Monthly intervals
+            for entry_idx in month_starts(dates):
+                exit_idx = row_after(dates, entry_idx, holding_years)
+                if exit_idx >= len(dates):
+                    break
                 entry_price = prices[entry_idx]
-                exit_price = prices[entry_idx + holding_days]
+                exit_price = prices[exit_idx]
+                period = series.iloc[entry_idx:exit_idx + 1]
 
                 total_return = (exit_price / entry_price - 1) * 100
-                cagr = ((exit_price / entry_price) ** (1 / holding_years) - 1) * 100
-
-                # Calculate max drawdown during period
-                period_prices = prices[entry_idx:entry_idx + holding_days + 1]
-                running_max = np.maximum.accumulate(period_prices)
-                drawdowns = (period_prices - running_max) / running_max
-                max_dd = np.min(drawdowns) * 100
+                cagr = qa.cagr_from_index(period) * 100
+                max_dd = qa.max_drawdown(period) * 100
 
                 results.append({
                     'entry_date': dates[entry_idx],
-                    'exit_date': dates[entry_idx + holding_days],
+                    'exit_date': dates[exit_idx],
                     'holding_years': holding_years,
                     'entry_price': entry_price,
                     'exit_price': exit_price,
@@ -133,31 +147,26 @@ class TimingAnalyzer:
 
         results = []
         holding_years = 5
-        holding_days = holding_years * 252
-        dca_days = dca_months * 21  # Approximate trading days per month
+        starts = month_starts(dates)
 
-        # Test different start dates
-        for start_idx in range(0, len(prices) - holding_days - dca_days, 21):
+        # Start on each month's first trading day; DCA buys on the next dca_months month starts
+        for k, start_idx in enumerate(starts):
+            end_idx = row_after(dates, start_idx, holding_years)
+            buys = starts[k:k + dca_months]
+            if end_idx >= len(dates) or len(buys) < dca_months:
+                break
             # Lump sum: invest everything at start
-            ls_shares = investment_amount / prices[start_idx]
-            ls_final_value = ls_shares * prices[start_idx + holding_days]
+            ls_final_value = investment_amount / prices[start_idx] * prices[end_idx]
             ls_return = (ls_final_value / investment_amount - 1) * 100
 
-            # DCA: invest equal amounts over dca_months
-            dca_shares = 0
-            monthly_investment = investment_amount / dca_months
-
-            for month in range(dca_months):
-                invest_idx = start_idx + (month * 21)  # Approximate monthly
-                if invest_idx < len(prices):
-                    dca_shares += monthly_investment / prices[invest_idx]
-
-            dca_final_value = dca_shares * prices[start_idx + holding_days]
+            # DCA: equal amounts on each buy date
+            dca_shares = np.sum(investment_amount / dca_months / prices[buys])
+            dca_final_value = dca_shares * prices[end_idx]
             dca_return = (dca_final_value / investment_amount - 1) * 100
 
             results.append({
                 'start_date': dates[start_idx],
-                'end_date': dates[start_idx + holding_days],
+                'end_date': dates[end_idx],
                 'lump_sum_return': ls_return,
                 'dca_return': dca_return,
                 'difference': ls_return - dca_return
@@ -276,8 +285,9 @@ class TimingAnalyzer:
             barmode='overlay'
         )
 
-        fig.write_html('timing_analysis.html')
-        print(f"\n✓ Saved timing analysis to: timing_analysis.html")
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        fig.write_html(OUTPUT_DIR / 'timing_analysis.html')
+        print(f"\n✓ Saved timing analysis to: {OUTPUT_DIR / 'timing_analysis.html'}")
 
     def _visualize_ls_vs_dca(self, results_df):
         """Create visualization for lump sum vs DCA comparison"""
@@ -383,8 +393,9 @@ class TimingAnalyzer:
             barmode='overlay'
         )
 
-        fig.write_html('lump_sum_vs_dca.html')
-        print(f"✓ Saved LS vs DCA analysis to: lump_sum_vs_dca.html")
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        fig.write_html(OUTPUT_DIR / 'lump_sum_vs_dca.html')
+        print(f"✓ Saved LS vs DCA analysis to: {OUTPUT_DIR / 'lump_sum_vs_dca.html'}")
 
 
 def main():
@@ -395,10 +406,15 @@ def main():
     parser.add_argument('--ticker', default='VOO', help='Ticker symbol to analyze')
     parser.add_argument('--capital', type=float, default=100000, help='Investment amount')
     parser.add_argument('--dca-months', type=int, default=12, help='DCA period in months')
+    parser.add_argument('--synthetic', action='store_true', help='Use generated prices (offline)')
     args = parser.parse_args()
 
     # Initialize
-    data_manager = DataManager()
+    if args.synthetic:
+        from synthetic_data import SyntheticDataManager
+        data_manager = SyntheticDataManager()
+    else:
+        data_manager = DataManager()
     analyzer = TimingAnalyzer(data_manager, ticker=args.ticker, initial_capital=args.capital)
 
     # Run analyses
@@ -418,8 +434,8 @@ def main():
     data_manager.close()
 
     print("\n✓ Analysis complete!")
-    print(f"  • timing_analysis.html")
-    print(f"  • lump_sum_vs_dca.html")
+    print(f"  • {OUTPUT_DIR / 'timing_analysis.html'}")
+    print(f"  • {OUTPUT_DIR / 'lump_sum_vs_dca.html'}")
 
 
 if __name__ == "__main__":

@@ -25,13 +25,6 @@ import portion as P
 from typing import Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass
 
-# Try to import requests_cache
-try:
-    import requests_cache
-    HAS_REQUESTS_CACHE = True
-except ImportError:
-    HAS_REQUESTS_CACHE = False
-
 Base = declarative_base()
 
 
@@ -259,7 +252,16 @@ class DataManager:
         Base.metadata.create_all(self.engine)
         Session = sessionmaker(bind=self.engine)
         self.session = Session()
+        # Plain HTTP session for FMP. yfinance is deliberately NOT given a session:
+        # yfinance >= 0.2.58 rejects requests.Session (Yahoo requires curl_cffi
+        # browser impersonation, which yfinance sets up itself).
         self.yf_session = self._setup_session()
+
+        # Large requests are what trigger Yahoo rate limits, so downloads are
+        # split into ticker batches and date chunks with a pause between each.
+        self.bulk_batch_size = 5
+        self.max_chunk_years = 5
+        self.chunk_pause_seconds = 2.0
 
         # FMP API key (loaded from environment when using FMP data source)
         self.fmp_api_key = None
@@ -300,14 +302,18 @@ class DataManager:
         }
 
     def _setup_session(self) -> requests.Session:
-        if HAS_REQUESTS_CACHE:
-            session = requests_cache.CachedSession('yfinance_cache', expire_after=timedelta(hours=6))
-        else:
-            session = requests.Session()
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        return session
+        return requests.Session()
+
+    def _date_chunks(self, start: date, end: date) -> List[Tuple[date, date]]:
+        """Split [start, end] into consecutive chunks of at most max_chunk_years."""
+        chunk_days = int(365.25 * self.max_chunk_years)
+        chunks = []
+        cur = start
+        while cur <= end:
+            chunk_end = min(cur + timedelta(days=chunk_days - 1), end)
+            chunks.append((cur, chunk_end))
+            cur = chunk_end + timedelta(days=1)
+        return chunks
 
     def _normalize_date(self, date_input) -> date:
         """Convert various date formats to date object"""
@@ -476,9 +482,26 @@ class DataManager:
 
     def _smart_download(self, ticker: str, start: date, end: date,
                         max_retries: int = 5) -> pd.DataFrame:
-        """Download with exponential backoff and rate limit handling"""
-        if self.data_source == 'fmp':
-            return self._fmp_download(ticker, start, end, max_retries)
+        """Download in date chunks, each with exponential backoff."""
+        chunks = self._date_chunks(start, end)
+        frames = []
+        for i, (c_start, c_end) in enumerate(chunks):
+            if i > 0:
+                time.sleep(self.chunk_pause_seconds + random.random())
+            if self.data_source == 'fmp':
+                df = self._fmp_download(ticker, c_start, c_end, max_retries)
+            else:
+                df = self._yf_download_one(ticker, c_start, c_end, max_retries)
+            if df is not None and not df.empty:
+                frames.append(df)
+        if not frames:
+            return pd.DataFrame()
+        out = pd.concat(frames)
+        return out[~out.index.duplicated(keep='last')].sort_index()
+
+    def _yf_download_one(self, ticker: str, start: date, end: date,
+                         max_retries: int = 5) -> pd.DataFrame:
+        """Single-ticker, single-chunk yfinance download with backoff."""
 
         delay = 2.0  # Start with longer delay
 
@@ -490,7 +513,7 @@ class DataManager:
                 # Small delay before each request to avoid rate limits
                 time.sleep(0.5 + random.random())
 
-                data = yf.Ticker(ticker, session=self.yf_session)
+                data = yf.Ticker(ticker)
                 df = data.history(start=start, end=end_buffered, auto_adjust=False, timeout=30)
 
                 if not df.empty:
@@ -685,15 +708,8 @@ class DataManager:
             else:
                 # Sequential with per-ticker intervals (most efficient for catch-up)
                 print(f"↓ Downloading {len(all_tickers_needing_data)} tickers (interval-targeted)...")
-                for ticker in all_tickers_needing_data:
-                    tracker = self._get_interval_tracker(ticker)
-                    for interval_start, interval_end in tickers_to_download[ticker]:
-                        if self._is_on_cooldown(ticker, interval_start, interval_end):
-                            print(f"  ⏸ Skipping {ticker} [{interval_start} to {interval_end}] (cooldown)")
-                            continue
-                        time.sleep(1 + random.random())
-                        self._download_and_save(ticker, interval_start, interval_end, tracker)
-                    self._save_interval_tracker(ticker, tracker)
+                self._sequential_download(all_tickers_needing_data, start_date, end_date,
+                                          tickers_to_download)
 
         # Retrieve all data from database
         for ticker in tickers:
@@ -710,102 +726,92 @@ class DataManager:
 
     def _bulk_download_and_save(self, tickers: List[str], start: date, end: date,
                                 ticker_intervals: Dict[str, List[Tuple[date, date]]] = None):
-        """Use yf.download() for efficient bulk downloading with rate limit handling.
+        """Bulk download via yf.download(), split into small ticker batches and
+        date chunks so no single request is large enough to get rate limited.
 
         Args:
             ticker_intervals: Per-ticker missing intervals dict, used for fallback
-                to sequential downloads if bulk fails.
+                to sequential downloads if a batch fails.
         """
-        # Bulk download only supported for yfinance; fall through to sequential
         if self.data_source != 'yfinance':
-            for ticker in tickers:
-                tracker = self._get_interval_tracker(ticker)
-                intervals = (ticker_intervals.get(ticker, [(start, end)])
-                             if ticker_intervals else [(start, end)])
-                for interval_start, interval_end in intervals:
-                    if self._is_on_cooldown(ticker, interval_start, interval_end):
-                        continue
-                    time.sleep(1 + random.random())
-                    self._download_and_save(ticker, interval_start, interval_end, tracker)
-                self._save_interval_tracker(ticker, tracker)
+            self._sequential_download(tickers, start, end, ticker_intervals)
             return
 
-        try:
-            end_buffered = end + timedelta(days=1)
+        batches = [tickers[i:i + self.bulk_batch_size]
+                   for i in range(0, len(tickers), self.bulk_batch_size)]
+        chunks = self._date_chunks(start, end)
+        print(f"  {len(batches)} ticker batch(es) x {len(chunks)} date chunk(s)")
 
-            # Add delay to avoid rate limiting (especially on WSL/Linux)
-            time.sleep(1.0)
-
-            df = yf.download(
-                tickers=tickers,
-                start=start,
-                end=end_buffered,
-                auto_adjust=False,
-                group_by='ticker',
-                threads=False,  # Single-threaded to reduce rate limit hits
-                progress=True,
-                session=self.yf_session,
-                timeout=30
-            )
-
-            if df.empty:
-                print("  ⚠ No data returned from bulk download")
-                return
-
-            # Process each ticker
-            for ticker in tickers:
+        for b_idx, batch in enumerate(batches):
+            failed = False
+            for c_start, c_end in chunks:
+                time.sleep(self.chunk_pause_seconds + random.random())
                 try:
-                    if len(tickers) == 1:
-                        ticker_df = df
-                    else:
-                        ticker_df = df[ticker].dropna(how='all')
-
-                    if ticker_df.empty:
-                        self._record_failure(ticker, start, end)
-                        continue
-
-                    # Normalize columns
-                    ticker_df = ticker_df.copy()
-                    ticker_df.index = pd.DatetimeIndex([
-                        d.date() if hasattr(d, 'date') else d for d in ticker_df.index
-                    ])
-
-                    # Save to database
-                    self._save_to_db(ticker, ticker_df)
-
-                    # Update tracker
-                    tracker = self._get_interval_tracker(ticker)
-                    dates_received = [d.date() if hasattr(d, 'date') else d for d in ticker_df.index]
-                    tracker.add_dates(dates_received)
-                    self._save_interval_tracker(ticker, tracker)
-
-                    print(f"  ✓ {ticker}: {len(ticker_df)} rows")
-
+                    df = yf.download(
+                        tickers=batch,
+                        start=c_start,
+                        end=c_end + timedelta(days=1),
+                        auto_adjust=False,
+                        group_by='ticker',
+                        threads=False,
+                        progress=False,
+                        timeout=30
+                    )
                 except Exception as e:
-                    print(f"  ⚠ Error processing {ticker}: {e}")
+                    print(f"  ⚠ Batch {batch} [{c_start} to {c_end}] failed: {e}")
+                    failed = True
+                    break
 
-        except Exception as e:
-            error_str = str(e).lower()
-            if 'rate' in error_str or 'limit' in error_str or '429' in error_str:
-                print(f"  ⏳ Rate limited on bulk download, switching to sequential...")
-                time.sleep(5)  # Wait before retrying
-
-            # Fallback: use per-ticker intervals if available, otherwise global range
-            for ticker in tickers:
-                try:
-                    intervals = (ticker_intervals.get(ticker, [(start, end)])
-                                 if ticker_intervals else [(start, end)])
-                    print(f"  → Downloading {ticker} individually...")
+                if df is None or df.empty:
+                    continue
+                for ticker in batch:
+                    ticker_df = self._extract_ticker_frame(df, ticker)
+                    if ticker_df is None or ticker_df.empty:
+                        continue
+                    self._save_to_db(ticker, ticker_df)
                     tracker = self._get_interval_tracker(ticker)
-                    for interval_start, interval_end in intervals:
-                        if self._is_on_cooldown(ticker, interval_start, interval_end):
-                            print(f"    ⏸ Skipping [{interval_start} to {interval_end}] (cooldown)")
-                            continue
-                        time.sleep(2 + random.random() * 2)
-                        self._download_and_save(ticker, interval_start, interval_end, tracker)
+                    tracker.add_dates([d.date() for d in ticker_df.index])
                     self._save_interval_tracker(ticker, tracker)
-                except Exception as e2:
-                    print(f"  ✗ {ticker} fallback failed: {e2}")
+                    print(f"  ✓ {ticker}: {len(ticker_df)} rows [{c_start} to {c_end}]")
+
+            if failed:
+                print("  ⏳ Falling back to per-ticker downloads for this batch...")
+                time.sleep(5)
+                self._sequential_download(batch, start, end, ticker_intervals)
+
+    def _sequential_download(self, tickers: List[str], start: date, end: date,
+                             ticker_intervals: Dict[str, List[Tuple[date, date]]] = None):
+        for ticker in tickers:
+            intervals = (ticker_intervals.get(ticker, [(start, end)])
+                         if ticker_intervals else [(start, end)])
+            tracker = self._get_interval_tracker(ticker)
+            for interval_start, interval_end in intervals:
+                if self._is_on_cooldown(ticker, interval_start, interval_end):
+                    print(f"    ⏸ Skipping {ticker} [{interval_start} to {interval_end}] (cooldown)")
+                    continue
+                time.sleep(1 + random.random())
+                self._download_and_save(ticker, interval_start, interval_end, tracker)
+            self._save_interval_tracker(ticker, tracker)
+
+    @staticmethod
+    def _extract_ticker_frame(df: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
+        """Pull one ticker's OHLCV frame out of a yf.download() result.
+
+        Handles both flat columns (old yfinance, single ticker) and
+        (ticker, field) MultiIndex columns (group_by='ticker').
+        """
+        if isinstance(df.columns, pd.MultiIndex):
+            if ticker not in df.columns.get_level_values(0):
+                return None
+            out = df[ticker]
+        else:
+            out = df
+        out = out.dropna(how='all').copy()
+        if 'Adj Close' not in out.columns or out['Adj Close'].isna().all():
+            return None
+        out.index = pd.DatetimeIndex([d.date() if hasattr(d, 'date') else d for d in out.index])
+        out.index.name = 'Date'
+        return out
 
     def _get_from_db(self, ticker: str, start_date: date, end_date: date) -> Optional[pd.DataFrame]:
         """Retrieve data from database"""

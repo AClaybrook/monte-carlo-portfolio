@@ -87,10 +87,11 @@ class TestBacktestReturns:
         """
         Verify CAGR calculation matches expected.
 
-        100% return over 1 year → CAGR = 100%
+        100% return over 1 calendar year → CAGR = 100%
+        (CAGR is annualized by calendar span, not row count.)
         """
-        n_days = 252
-        dates = pd.date_range(start='2020-01-01', periods=n_days, freq='D')
+        dates = pd.bdate_range(start='2021-01-01', end='2022-01-01')
+        n_days = len(dates)
 
         # 100% return over the year
         prices = np.linspace(100, 200, n_days)
@@ -108,7 +109,7 @@ class TestBacktestReturns:
 
         # CAGR for 100% return in 1 year = 100%
         cagr = results['metrics']['CAGR']
-        assert abs(cagr - 1.0) < 0.15, \
+        assert abs(cagr - 1.0) < 0.01, \
             f"CAGR {cagr:.2%} should be ~100%"
 
     def test_negative_return(self):

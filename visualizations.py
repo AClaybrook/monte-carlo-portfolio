@@ -1,372 +1,914 @@
 """
-Visualization engine - With Volatility, DCA Indicator, and MC/Historical Alignment
+HTML report in the spirit of Portfolio Visualizer's backtest + Monte Carlo pages.
+
+Rule: this module only presents. Every number comes from the backtester
+(quant_analytics.compute_performance) or the simulator; nothing financial is
+recomputed here, so the tables and charts cannot disagree with the engine.
+
+Charts are Plotly figures serialized to JSON and rendered by a small script that
+swaps light/dark colors and drives the per-portfolio selectors.
 """
-
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import numpy as np
-import plotly.io as pio
-import pandas as pd
-from scipy import stats
 import base64
+import html
+import json
+from typing import Dict, List, Optional
 
-from pv_compat import export_portfolio_csv, save_portfolio_csv, generate_pv_url, generate_mc_url
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.offline import get_plotlyjs, get_plotlyjs_version
+
+import quant_analytics as qa
+from pv_compat import export_portfolio_csv, generate_mc_url, generate_pv_url
+
+# Validated categorical palette (light, dark): fixed order, never cycled.
+SERIES = [('#2a78d6', '#3987e5'), ('#eb6834', '#d95926'), ('#1baf7a', '#199e70'),
+          ('#eda100', '#c98500'), ('#e87ba4', '#d55181'), ('#008300', '#008300'),
+          ('#4a3aa7', '#9085e9'), ('#e34948', '#e66767')]
+BENCHMARK = ('#52514e', '#c3c2b7')
+OVERFLOW = ('#898781', '#898781')
+OVERFLOW_DASHES = ['dot', 'dash', 'dashdot', 'longdash']
+
+CHROME = {  # role: (light, dark)
+    'surface': ('#fcfcfb', '#1a1a19'),
+    'page': ('#f9f9f7', '#0d0d0d'),
+    'text': ('#0b0b0b', '#ffffff'),
+    'text2': ('#52514e', '#c3c2b7'),
+    'muted': ('#898781', '#8a8a84'),
+    'grid': ('#e1e0d9', '#2c2c2a'),
+    'axis': ('#c3c2b7', '#383835'),
+    'mid': ('#f0efec', '#383835'),
+    'neg': ('#e34948', '#e66767'),
+    'pos': ('#2a78d6', '#3987e5'),
+}
+FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif'
+PCTS = (10, 25, 50, 75, 90)
+
+
+# ---------------------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------------------
+
+def _nan(x) -> bool:
+    return x is None or (isinstance(x, float) and np.isnan(x))
+
+
+def pct(x, d=2):
+    if _nan(x):
+        return '—'
+    v = round(x * 100, d)
+    return f"{v + 0.0:,.{d}f}%"  # + 0.0 turns -0.0 into 0.0
+
+
+def money(x):
+    return '—' if _nan(x) else f"${x:,.0f}"
+
+
+def num(x, d=2):
+    return '—' if _nan(x) else f"{x:,.{d}f}"
+
+
+def esc(s) -> str:
+    return html.escape(str(s))
+
 
 class PortfolioVisualizer:
-    def __init__(self, simulator):
+    def __init__(self, simulator=None):
         self.simulator = simulator
-        self.colors = [
-            '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
-            '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'
-        ]
+        self._cmap: Dict[str, str] = {}
 
-    def _hex_to_rgba(self, hex_color, alpha):
-        hex_color = hex_color.lstrip('#')
-        r, g, b = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-        return f'rgba({r}, {g}, {b}, {alpha})'
+    # ------------------------------------------------------------------ colors
 
-    def _get_kde_curve(self, data, clip_percentile=1.0):
-        try:
-            min_val = np.percentile(data, clip_percentile)
-            max_val = np.percentile(data, 100 - clip_percentile)
-            kde = stats.gaussian_kde(data)
-            x_range = np.linspace(min_val, max_val, 200)
-            y_range = kde(x_range)
-            return x_range, y_range
-        except:
-            return [], []
+    def _c(self, pair) -> str:
+        """Register a (light, dark) pair; return the light value for the figure."""
+        light, dark = pair
+        self._cmap[light] = dark
+        return light
 
-    def _get_type_info(self, item) -> str:
-        """Get combined contribution + strategy info (single line)"""
-        results = item.get('results', {})
-        backtest = item.get('backtest', {})
+    def _wash(self, pair, alpha) -> str:
+        def rgba(h):
+            h = h.lstrip('#')
+            return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{alpha})"
+        return self._c((rgba(pair[0]), rgba(pair[1])))
 
-        # Check for DCA
-        total_invested = backtest.get('metrics', {}).get('Total Invested', None)
-        if total_invested is None:
-            total_invested = results.get('total_invested', None)
+    def _chrome(self, role) -> str:
+        return self._c(CHROME[role])
 
-        start_balance = backtest.get('metrics', {}).get('Start Balance',
-                                                         results.get('stats', {}).get('initial_capital', 10000))
-
-        if total_invested and total_invested > start_balance * 1.01:
-            contrib_str = f"DCA: ${total_invested - start_balance:,.0f}"
-        else:
-            contrib_str = "Lump Sum"
-
-        # Get strategy (but avoid redundancy)
-        strategy = backtest.get('strategy', results.get('strategy', ''))
-
-        # Skip generic/redundant strategy names
-        if strategy and strategy not in ['Buy and Hold', 'Static DCA', '', None]:
-            return f"{contrib_str}<br><small>{strategy}</small>"
-
-        return contrib_str
-
-    def create_allocation_table_html(self, portfolio_results):
-        """Creates a compact allocation table with PV export buttons"""
-        all_tickers = set()
-        portfolio_rows = []
-
-        for item in portfolio_results:
-            p_name = item['label']
-            res = item['results']
-            allocations = res['allocations']
-            assets = res['assets']
-
-            row_data = {'Portfolio': p_name}
-
-            for asset, weight in zip(assets, allocations):
-                ticker = asset['ticker'].upper()
-                if weight > 0.001:  # Only include non-zero allocations
-                    all_tickers.add(ticker)
-                    row_data[ticker] = weight
-
-            portfolio_rows.append(row_data)
-
-        sorted_tickers = sorted(list(all_tickers))
-
-        # Button styles
-        btn_style = '''
-            display: inline-block;
-            padding: 4px 8px;
-            margin: 2px;
-            border-radius: 4px;
-            font-size: 0.75em;
-            font-weight: 500;
-            text-decoration: none;
-            border: 1px solid;
-            cursor: pointer;
-            transition: all 0.2s;
-        '''
-        csv_btn_style = f'{btn_style} background: #f8f9fa; color: #495057; border-color: #dee2e6;'
-        backtest_btn_style = f'{btn_style} background: #e3f2fd; color: #1565c0; border-color: #90caf9;'
-        mc_btn_style = f'{btn_style} background: #f3e5f5; color: #7b1fa2; border-color: #ce93d8;'
-
-        # Compact table with smaller cells and export column
-        html = f'''<div style="overflow-x: auto; font-size: 0.85em;">
-        <table style="border-collapse: collapse; width: auto;">
-        <thead><tr><th style="text-align:left; padding: 6px 10px;">Portfolio</th>'''
-
-        for ticker in sorted_tickers:
-            html += f'<th style="padding: 6px 8px; min-width: 50px;">{ticker}</th>'
-        html += '<th style="padding: 6px 12px;">Export</th></tr></thead>'
-
-        html += '<tbody>'
-        for row_dict in portfolio_rows:
-            p_name = row_dict['Portfolio']
-            html += f'<tr><td style="font-weight:600; text-align:left; padding: 5px 10px; white-space: nowrap;">{p_name}</td>'
-
-            for ticker in sorted_tickers:
-                val = row_dict.get(ticker, 0.0)
-                if val > 0.001:
-                    html += f'<td style="padding: 5px 8px; text-align: center;">{val*100:.1f}%</td>'
-                else:
-                    html += '<td style="padding: 5px 8px; text-align: center; color: #ddd;">-</td>'
-
-            # Build allocations dict for export (only non-zero weights)
-            row_allocations = {t: row_dict.get(t, 0) for t in sorted_tickers if row_dict.get(t, 0) > 0.001}
-
-            # Save CSV to output/portfolios/
-            try:
-                save_portfolio_csv(row_allocations, p_name)
-            except Exception:
-                pass  # Don't fail if save doesn't work
-
-            # Generate CSV data URI for browser download
-            csv_content = export_portfolio_csv(row_allocations, p_name)
-            csv_b64 = base64.b64encode(csv_content.encode()).decode()
-            data_uri = f"data:text/csv;base64,{csv_b64}"
-
-            # Generate PV URLs
-            pv_url = generate_pv_url(row_allocations)
-            mc_url = generate_mc_url(row_allocations)
-
-            # Safe filename
-            safe_name = "".join(c if c.isalnum() or c in '_-' else '_' for c in p_name)
-
-            html += f'''<td style="padding: 5px 8px; text-align: center; white-space: nowrap;">
-                <a href="{data_uri}" download="{safe_name}.csv"
-                   style="{csv_btn_style}" title="Download CSV for Portfolio Visualizer import">CSV</a>
-                <a href="{pv_url}" target="_blank"
-                   style="{backtest_btn_style}" title="Open Backtest in Portfolio Visualizer">Backtest</a>
-                <a href="{mc_url}" target="_blank"
-                   style="{mc_btn_style}" title="Open Monte Carlo in Portfolio Visualizer">MC Sim</a>
-            </td>'''
-            html += '</tr>'
-        html += '</tbody></table></div>'
-
-        return html
-
-    def create_monte_carlo_plot(self, portfolio_results):
-        """Monte Carlo visualization with probability plots"""
-        fig = make_subplots(
-            rows=2, cols=3,
-            subplot_titles=('95% Confidence Trajectories', 'Final Value Density', 'CAGR Density',
-                            'Risk-Return Profile', 'Risk of Loss over Time', 'Prob. of >10% Annual Return'),
-            specs=[[{'type': 'scatter'}, {'type': 'scatter'}, {'type': 'scatter'}],
-                   [{'type': 'scatter'}, {'type': 'scatter'}, {'type': 'scatter'}]],
-            vertical_spacing=0.15, horizontal_spacing=0.08
-        )
-
-        for idx, item in enumerate(portfolio_results):
-            label = item['label']
-            res = item['results']
-            stats_data = res['stats']
-            probs = res.get('probabilities', {})
-
-            color = self.colors[idx % len(self.colors)]
-            fill_color = self._hex_to_rgba(color, 0.15)
-            grp = f"mc_{idx}"
-
-            # 1. Trajectory (downsample for faster percentile computation)
-            pv = res['portfolio_values']
-            n_days = pv.shape[1]
-            # Sample every 5 days for charts (still 500+ points for smooth lines)
-            step = max(1, n_days // 500)
-            sample_idx = np.arange(0, n_days, step)
-            if sample_idx[-1] != n_days - 1:
-                sample_idx = np.append(sample_idx, n_days - 1)  # Always include last day
-            pv_sampled = pv[:, sample_idx]
-            p5 = np.percentile(pv_sampled, 5, axis=0)
-            p50 = np.median(pv_sampled, axis=0)
-            p95 = np.percentile(pv_sampled, 95, axis=0)
-            days = sample_idx
-
-            fig.add_trace(go.Scatter(x=days, y=p95, mode='lines', line=dict(width=0), showlegend=False, legendgroup=grp, hoverinfo='skip'), row=1, col=1)
-            fig.add_trace(go.Scatter(x=days, y=p5, mode='lines', line=dict(width=0), fill='tonexty', fillcolor=fill_color, showlegend=False, legendgroup=grp, hoverinfo='skip'), row=1, col=1)
-            fig.add_trace(go.Scatter(x=days, y=p50, mode='lines', line=dict(color=color, width=2), name=label, legendgroup=grp, hovertemplate=f"<b>{label}</b><br>Median: $%{{y:,.0f}}"), row=1, col=1)
-
-            # 2. Final Value KDE
-            x_kde, y_kde = self._get_kde_curve(res['final_values'])
-            fig.add_trace(go.Scatter(x=x_kde, y=y_kde, mode='lines', line=dict(color=color, width=1), fill='tozeroy', fillcolor=fill_color, showlegend=False, legendgroup=grp, name=label, hovertemplate=f"<b>{label}</b><br>Value: $%{{x:,.0f}}<br>Density: %{{y:.2e}}"), row=1, col=2)
-
-            # 3. CAGR KDE
-            x_cagr, y_cagr = self._get_kde_curve(res['cagr'] * 100)
-            fig.add_trace(go.Scatter(x=x_cagr, y=y_cagr, mode='lines', line=dict(color=color, width=1), fill='tozeroy', fillcolor=fill_color, showlegend=False, legendgroup=grp, name=label, hovertemplate=f"<b>{label}</b><br>CAGR: %{{x:.1f}}%"), row=1, col=3)
-
-            # 4. Risk Return
-            fig.add_trace(go.Scatter(x=[stats_data['std_cagr']*100], y=[stats_data['mean_cagr']*100], mode='markers', marker=dict(color=color, size=14, line=dict(width=1, color='black')), showlegend=False, legendgroup=grp, name=label, hovertemplate=f"<b>{label}</b><br>Vol: %{{x:.1f}}%<br>Ret: %{{y:.1f}}%"), row=2, col=1)
-
-            # 5. Risk of Loss Over Time
-            if 'years' in probs:
-                fig.add_trace(go.Scatter(
-                    x=probs['years'], y=probs['prob_loss']*100,
-                    mode='lines', line=dict(color=color, width=2),
-                    showlegend=False, legendgroup=grp, name=label,
-                    hovertemplate=f"<b>{label}</b><br>Year: %{{x}}<br>Prob Loss: %{{y:.1f}}%"
-                ), row=2, col=2)
-
-            # 6. Prob of High Return
-            if 'years' in probs:
-                fig.add_trace(go.Scatter(
-                    x=probs['years'], y=probs['prob_high_return']*100,
-                    mode='lines', line=dict(color=color, width=2),
-                    showlegend=False, legendgroup=grp, name=label,
-                    hovertemplate=f"<b>{label}</b><br>Year: %{{x}}<br>Prob >10%: %{{y:.1f}}%"
-                ), row=2, col=3)
-
-        fig.update_yaxes(tickformat="$,.0f", title="Portfolio Value", row=1, col=1)
-        fig.update_xaxes(tickformat="$,.0s", title="Final Value", row=1, col=2)
-        fig.update_xaxes(tickformat=".1f", title="CAGR (%)", row=1, col=3)
-
-        fig.update_xaxes(tickformat=".1f", title="Volatility (%)", row=2, col=1)
-        fig.update_yaxes(tickformat=".1f", title="Return (%)", row=2, col=1)
-
-        fig.update_yaxes(tickformat=".0f", title="Probability (%)", range=[0, 100], row=2, col=2)
-        fig.update_xaxes(title="Years Invested", row=2, col=2)
-
-        fig.update_yaxes(tickformat=".0f", title="Probability (%)", range=[0, 100], row=2, col=3)
-        fig.update_xaxes(title="Years Invested", row=2, col=3)
-
-        fig.update_layout(height=900, title_text="", template='plotly_white')
-        return fig
-
-    def create_backtest_plot(self, portfolio_results):
-        fig = make_subplots(
-            rows=4, cols=1,
-            subplot_titles=('Growth of $10k (Log Scale)', 'Historical Drawdowns',
-                            'Rolling 3-Year Annualized Return', 'Rolling 5-Year Annualized Return'),
-            vertical_spacing=0.08, shared_xaxes=True
-        )
-
-        for idx, item in enumerate(portfolio_results):
-            if 'backtest' not in item: continue
-            bt = item['backtest']
-            label = item['label']
-            color = self.colors[idx % len(self.colors)]
-            grp = f"bt_{idx}"
-
-            fig.add_trace(go.Scatter(x=bt['dates'], y=bt['values'], name=label, line=dict(color=color), legendgroup=grp, showlegend=True), row=1, col=1)
-            fig.add_trace(go.Scatter(x=bt['dates'], y=bt['drawdowns']*100, name=label, line=dict(width=1, color=color), fill='tozeroy', legendgroup=grp, showlegend=False), row=2, col=1)
-            fig.add_trace(go.Scatter(x=bt['dates'], y=bt['rolling_3y']*100, name=label, line=dict(width=1.5, color=color), legendgroup=grp, showlegend=False), row=3, col=1)
-            fig.add_trace(go.Scatter(x=bt['dates'], y=bt['rolling_5y']*100, name=label, line=dict(width=1.5, color=color, dash='dot'), legendgroup=grp, showlegend=False), row=4, col=1)
-
-        fig.update_yaxes(type="log", tickformat="$,.0f", title="Value ($)", row=1, col=1)
-        fig.update_yaxes(tickformat=".1f", title="Drawdown (%)", row=2, col=1)
-        fig.update_yaxes(tickformat=".1f", title="CAGR (%)", row=3, col=1)
-        fig.update_yaxes(tickformat=".1f", title="CAGR (%)", row=4, col=1)
-
-        fig.update_layout(height=1200, template='plotly_white', hovermode='x unified')
-        return fig
-
-    def generate_html_report(self, portfolio_results, filename, start_date=None, end_date=None):
-        mc_fig = self.create_monte_carlo_plot(portfolio_results)
-        bt_fig = self.create_backtest_plot(portfolio_results)
-
-        allocation_table_html = self.create_allocation_table_html(portfolio_results)
-
-        # Build performance metrics table with VOLATILITY column
-        table_html = f"""
-        <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 16px 20px; background: #f9f9f9; color: #333; }}
-            details {{ background: white; padding: 12px 16px; margin-bottom: 10px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 1px solid #eaeaea; }}
-            summary {{ cursor: pointer; font-weight: 600; font-size: 1em; outline: none; list-style: none; }}
-            summary::-webkit-details-marker {{ display: none; }}
-            summary:after {{ content: " ▶"; font-size: 0.75em; color: #888; }}
-            details[open] summary:after {{ content: " ▼"; }}
-
-            table {{ width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.82em; }}
-            th, td {{ border-bottom: 1px solid #eee; padding: 6px 8px; text-align: right; }}
-            th {{ background-color: #f8f9fa; color: #555; font-weight: 600; text-align: center; font-size: 0.85em; }}
-            td:first-child {{ text-align: left; font-weight: 600; color: #2c3e50; }}
-            small {{ color: #888; font-weight: normal; }}
-
-            .pos-val {{ color: #27ae60; }}
-            .neg-val {{ color: #c0392b; }}
-            .warn-val {{ color: #f39c12; }}
-
-            .header-row {{ display: flex; align-items: baseline; gap: 16px; margin-bottom: 8px; flex-wrap: wrap; }}
-            .header-row h1 {{ margin: 0; font-size: 1.5em; }}
-            .header-row p {{ margin: 0; color: #666; font-size: 0.9em; }}
-        </style>
-        <div class="header-row">
-            <h1>Portfolio Analysis Report</h1>
-            {f"<p>Analysis Period: <b>{start_date}</b> to <b>{end_date}</b></p>" if start_date and end_date else ""}
-        </div>
-        <details open><summary>Performance Metrics Summary</summary>
-        <table>
-        <tr>
-            <th style="text-align:left;">Portfolio</th>
-            <th>Type</th>
-            <th>Sim CAGR</th>
-            <th>Hist CAGR</th>
-            <th>Vol</th>
-            <th>Sharpe</th>
-            <th>Sortino</th>
-            <th>Max DD</th>
-            <th>Best Yr</th>
-            <th>Worst Yr</th>
-        </tr>
-        """
-
-        for item in portfolio_results:
-            m = item['backtest']['metrics']
-            sim_stats = item['results']['stats']
-
-            sim_cagr = sim_stats.get('median_cagr', sim_stats.get('mean_cagr', 0))
-            hist_cagr = m['CAGR']
-            volatility = m['Stdev']
-
-            # Single combined type column
-            type_str = self._get_type_info(item)
-
-            # Calculate delta and flag large discrepancies
-            delta = sim_cagr - hist_cagr
-            if abs(delta) > 0.05:
-                delta_class = "warn-val"
-            elif delta > 0:
-                delta_class = "pos-val"
+    def _assign_styles(self, items):
+        styles, slot = [], 0
+        for item in items:
+            if item.get('is_benchmark'):
+                styles.append({'pair': BENCHMARK, 'dash': 'solid', 'width': 1.5})
+            elif slot < len(SERIES):
+                styles.append({'pair': SERIES[slot], 'dash': 'solid', 'width': 2})
+                slot += 1
             else:
-                delta_class = ""
+                styles.append({'pair': OVERFLOW, 'width': 2,
+                               'dash': OVERFLOW_DASHES[(slot - len(SERIES)) % len(OVERFLOW_DASHES)]})
+                slot += 1
+        return styles
 
-            table_html += f"""<tr>
-                <td>{item['label']}</td>
-                <td style="text-align:center;">{type_str}</td>
-                <td>{sim_cagr*100:.2f}%</td>
-                <td>{hist_cagr*100:.2f}%</td>
-                <td>{volatility*100:.2f}%</td>
-                <td>{m['Sharpe']:.2f}</td>
-                <td>{m['Sortino']:.2f}</td>
-                <td class='neg-val'>{m['Max Drawdown']*100:.2f}%</td>
-                <td class='pos-val'>{m['Best Year']*100:.2f}%</td>
-                <td class='neg-val'>{m['Worst Year']*100:.2f}%</td>
-            </tr>"""
+    def _line(self, style):
+        return dict(color=self._c(style['pair']), width=style['width'], dash=style['dash'])
 
-        table_html += "</table>"
+    # ------------------------------------------------------------------ layout
 
-        # Add MC vs Historical explanation
-        table_html += """
-        <p style="font-size: 0.75em; color: #999; margin: 8px 0 0 0;">
-            <b>Note:</b> Sim CAGR = Monte Carlo median. Hist CAGR = actual backtest. Vol = annualized stdev.
-        </p>
-        </details>
-        """
+    def _layout(self, height=380, yfmt=None, ytitle=None, ylog=False, xtitle=None,
+                hover='x unified', legend=True, **extra):
+        axis = dict(gridcolor=self._chrome('grid'), linecolor=self._chrome('axis'),
+                    zerolinecolor=self._chrome('axis'), showline=True, zeroline=False,
+                    tickfont=dict(color=self._chrome('muted')), automargin=True,
+                    title=dict(font=dict(color=self._chrome('text2'))))
+        layout = dict(
+            height=height,
+            margin=dict(l=8, r=16, t=8, b=8),
+            paper_bgcolor=self._chrome('surface'),
+            plot_bgcolor=self._chrome('surface'),
+            font=dict(family=FONT, size=12, color=self._chrome('text2')),
+            hovermode=hover,
+            hoverlabel=dict(bgcolor=self._chrome('surface'), bordercolor=self._chrome('axis'),
+                            font=dict(color=self._chrome('text'), family=FONT)),
+            showlegend=legend,
+            legend=dict(orientation='h', yanchor='bottom', y=1.0, x=0, xanchor='left',
+                        font=dict(color=self._chrome('text2')), bgcolor='rgba(0,0,0,0)'),
+            xaxis=dict(axis, title=dict(axis['title'], text=xtitle)),
+            yaxis=dict(axis, title=dict(axis['title'], text=ytitle), tickformat=yfmt),
+        )
+        if ylog:
+            layout['yaxis'].update(type='log', dtick='D2')
+            if yfmt == '$,.0f':
+                layout['yaxis']['tickformat'] = '$~s'
+        layout.update(extra)
+        return layout
 
-        html_content = f"{table_html}" \
-                       f"<details><summary>Asset Allocation Details</summary>{allocation_table_html}</details>" \
-                       f"<details open><summary>Historical Backtest</summary>{pio.to_html(bt_fig, full_html=False, include_plotlyjs='cdn')}</details>" \
-                       f"<details open><summary>Monte Carlo Simulation</summary>{pio.to_html(mc_fig, full_html=False, include_plotlyjs=False)}</details>"
+    @staticmethod
+    def _fig_json(fig: go.Figure) -> dict:
+        return json.loads(fig.to_json())
 
+    # ------------------------------------------------------------------ charts
+
+    def _growth(self, items, styles):
+        fig = go.Figure()
+        for i, (it, st) in enumerate(zip(items, styles)):
+            bal = it['backtest']['balance']
+            fig.add_trace(go.Scatter(x=bal.index, y=bal.values, name=it['label'], line=self._line(st),
+                                     hovertemplate='%{y:$,.0f}'))
+        ref = next((it['backtest'] for it in items if not it.get('is_benchmark')), items[0]['backtest'])
+        if ref['metrics']['Total Contributions'] > 0:
+            invested = ref['metrics']['Start Balance'] + ref['contributions'].reindex(
+                ref['balance'].index).fillna(0).cumsum()
+            fig.add_trace(go.Scatter(x=invested.index, y=invested.values, name='Invested capital',
+                                     line=dict(color=self._chrome('muted'), width=1.5, shape='hv'),
+                                     hovertemplate='%{y:$,.0f}'))
+        fig.update_layout(**self._layout(height=440, yfmt='$,.0f', ytitle='Balance (log scale)', ylog=True))
+        return fig
+
+    def _annual_bars(self, items, styles):
+        fig = go.Figure()
+        for it, st in zip(items, styles):
+            a = it['backtest']['annual_returns']
+            labels = [f"{y}{'†' if p else ''}" for y, p in zip(a.index, a['partial'])]
+            fig.add_trace(go.Bar(x=labels, y=a['return'].values, name=it['label'],
+                                 marker=dict(color=self._c(st['pair']), line=dict(width=0)),
+                                 hovertemplate='%{y:.2%}'))
+        fig.update_layout(**self._layout(yfmt='.0%', ytitle='Calendar-year return',
+                                         barmode='group', bargap=0.25, bargroupgap=0.08,
+                                         barcornerradius=4))
+        return fig
+
+    def _drawdowns(self, items, styles):
+        fig = go.Figure()
+        for it, st in zip(items, styles):
+            dd = it['backtest']['drawdowns']
+            fig.add_trace(go.Scatter(x=dd.index, y=dd.values, name=it['label'],
+                                     line=dict(self._line(st), width=1.5), hovertemplate='%{y:.2%}'))
+        fig.update_layout(**self._layout(yfmt='.0%', ytitle='Drawdown from peak'))
+        return fig
+
+    def _rolling(self, items, styles):
+        fig = go.Figure()
+        for window in ('1y', '3y', '5y'):
+            for it, st in zip(items, styles):
+                r = it['backtest'][f'rolling_{window}'].dropna()
+                fig.add_trace(go.Scatter(x=r.index, y=r.values, name=it['label'], meta=window,
+                                         legendgroup=it['label'], showlegend=window == '1y',
+                                         visible=window == '1y', line=self._line(st),
+                                         hovertemplate='%{y:.2%}'))
+        fig.update_layout(**self._layout(yfmt='.0%', ytitle='Annualized trailing return'))
+        return fig
+
+    def _risk_return(self, items, styles):
+        fig = go.Figure()
+        for it, st in zip(items, styles):
+            m = it['backtest']['metrics']
+            fig.add_trace(go.Scatter(
+                x=[m['Stdev']], y=[m['CAGR']], name=it['label'], mode='markers+text',
+                text=[it['label']], textposition='top center',
+                textfont=dict(color=self._chrome('text2'), size=11),
+                marker=dict(size=11, color=self._c(st['pair']),
+                            line=dict(width=2, color=self._chrome('surface'))),
+                hovertemplate='Stdev %{x:.2%}<br>CAGR %{y:.2%}<extra>%{text}</extra>'))
+        fig.update_layout(**self._layout(height=420, yfmt='.0%', ytitle='CAGR', xtitle='Annualized stdev',
+                                         hover='closest', legend=False,
+                                         xaxis=dict(self._layout()['xaxis'], tickformat='.0%')))
+        return fig
+
+    def _diverging_scale(self):
+        return [[0, self._chrome('neg')], [0.5, self._chrome('mid')], [1, self._chrome('pos')]]
+
+    def _monthly_heatmap(self, items):
+        fig = go.Figure()
+        for i, it in enumerate(items):
+            t = it['backtest']['monthly_table']
+            z = t.drop(columns='Year')
+            text = [[pct(v, 1) if not _nan(v) else '' for v in row] for row in z.values]
+            fig.add_trace(go.Heatmap(
+                z=z.values, x=list(z.columns), y=[str(y) for y in z.index], meta=str(i),
+                visible=i == 0, zmid=0, zmin=-0.15, zmax=0.15, colorscale=self._diverging_scale(),
+                text=text, texttemplate='%{text}', textfont=dict(size=10), xgap=2, ygap=2,
+                colorbar=dict(tickformat='.0%', outlinewidth=0, thickness=10,
+                              tickfont=dict(color=self._chrome('muted'))),
+                hovertemplate='%{y} %{x}: %{z:.2%}<extra></extra>'))
+        n_years = max(len(it['backtest']['monthly_table']) for it in items)
+        fig.update_layout(**self._layout(height=max(260, 26 * n_years + 60), hover='closest', legend=False,
+                                         yaxis=dict(self._layout()['yaxis'], autorange='reversed',
+                                                    type='category', showgrid=False),
+                                         xaxis=dict(self._layout()['xaxis'], showgrid=False, side='top')))
+        return fig
+
+    def _correlation(self, items):
+        prices = {}
+        for it in items:
+            for col, s in it['backtest']['asset_prices'].items():
+                if col not in prices or len(s) > len(prices[col]):
+                    prices[col] = s
+        if len(prices) < 2:
+            return None
+        rets = pd.DataFrame({k: qa.monthly_returns(v) for k, v in prices.items()})
+        corr = rets.corr(min_periods=12)
+        fig = go.Figure(go.Heatmap(
+            z=corr.values, x=list(corr.columns), y=list(corr.index), zmin=-1, zmax=1, zmid=0,
+            colorscale=self._diverging_scale(), xgap=2, ygap=2,
+            text=[[num(v) for v in row] for row in corr.values], texttemplate='%{text}',
+            colorbar=dict(outlinewidth=0, thickness=10, tickfont=dict(color=self._chrome('muted'))),
+            hovertemplate='%{y} / %{x}: %{z:.2f}<extra></extra>'))
+        size = max(300, 48 * len(corr) + 80)
+        fig.update_layout(**self._layout(height=size, hover='closest', legend=False,
+                                         yaxis=dict(self._layout()['yaxis'], autorange='reversed', showgrid=False),
+                                         xaxis=dict(self._layout()['xaxis'], showgrid=False, side='top')))
+        return fig, corr
+
+    def _allocation(self, items):
+        tickers = []
+        for it in items:
+            for t in it['backtest']['weights'].columns:
+                if t not in tickers:
+                    tickers.append(t)
+        colors = {t: (SERIES[i] if i < len(SERIES) else OVERFLOW) for i, t in enumerate(tickers)}
+        fig = go.Figure()
+        shapes = []
+        for i, it in enumerate(items):
+            w = it['backtest']['weights'].resample('W').last().dropna(how='all')
+            for t in w.columns:
+                fig.add_trace(go.Scatter(
+                    x=w.index, y=w[t].values, name=t, meta=str(i), visible=i == 0, stackgroup=f's{i}',
+                    legendgroup=t, line=dict(width=1, color=self._chrome('surface')),
+                    fillcolor=self._c(colors[t]), hovertemplate='%{y:.1%}'))
+            for e in it['backtest']['events']:
+                if e['type'] == 'rebalance' and e['trigger'] in ('signal', 'threshold'):
+                    shapes.append(dict(type='line', xref='x', yref='paper', x0=e['date'], x1=e['date'],
+                                       y0=0, y1=1, name=str(i), visible=i == 0,
+                                       line=dict(color=self._chrome('text2'), width=1)))
+        fig.update_layout(**self._layout(yfmt='.0%', ytitle='Weight', shapes=shapes,
+                                         yaxis=dict(self._layout()['yaxis'], range=[0, 1], tickformat='.0%')))
+        return fig
+
+    def _mc_fan(self, items, styles):
+        fig = go.Figure()
+        for i, (it, st) in enumerate(zip(items, styles)):
+            res = it['results']
+            yrs = res['record_years']
+            p = {q: np.percentile(res['portfolio_values'], q, axis=0) for q in PCTS}
+            vis = i == 0
+            band = lambda lo, hi, alpha, name: [
+                go.Scatter(x=yrs, y=p[hi], meta=str(i), visible=vis, line=dict(width=0), showlegend=False,
+                           hoverinfo='skip'),
+                go.Scatter(x=yrs, y=p[lo], meta=str(i), visible=vis, line=dict(width=0), fill='tonexty',
+                           fillcolor=self._wash(st['pair'], alpha), name=name, hoverinfo='skip')]
+            for tr in band(10, 90, 0.12, '10th–90th percentile') + band(25, 75, 0.22, '25th–75th percentile'):
+                fig.add_trace(tr)
+            for q, dash in ((10, 'dot'), (90, 'dot')):
+                fig.add_trace(go.Scatter(x=yrs, y=p[q], meta=str(i), visible=vis, showlegend=False,
+                                         name=f'{q}th', line=dict(width=0.5, color=self._c(st['pair'])),
+                                         hovertemplate=f'{q}th: %{{y:$,.0f}}'))
+            fig.add_trace(go.Scatter(x=yrs, y=p[50], meta=str(i), visible=vis, name='Median',
+                                     line=self._line(st), hovertemplate='Median: %{y:$,.0f}'))
+        invested = self._invested_curve(items)
+        if invested is not None:
+            fig.add_trace(go.Scatter(x=invested[0], y=invested[1], meta='all', name='Invested capital',
+                                     line=dict(color=self._chrome('muted'), width=1.5, shape='hv'),
+                                     hovertemplate='Invested: %{y:$,.0f}'))
+        fig.update_layout(**self._layout(height=440, yfmt='$,.0f', ytitle='Balance (log scale)', ylog=True,
+                                         xtitle='Years'))
+        return fig
+
+    def _invested_curve(self, items):
+        sim = self.simulator
+        if sim is None or not sim.contrib_amount:
+            return None
+        res = items[0]['results']
+        dpy = res['days_per_year']
+        steps = np.round(np.asarray(res['record_years']) * dpy).astype(int)
+        from engine import contribution_schedule
+        sched = contribution_schedule(sim.contrib_freq, int(steps[-1]), days_per_year=dpy)
+        cum = np.concatenate([[0], np.cumsum(sched)])[steps]
+        return res['record_years'], sim.initial_capital + sim.contrib_amount * cum
+
+    def _mc_medians(self, items, styles):
+        fig = go.Figure()
+        for it, st in zip(items, styles):
+            res = it['results']
+            fig.add_trace(go.Scatter(x=res['record_years'], y=np.median(res['portfolio_values'], axis=0),
+                                     name=it['label'], line=self._line(st), hovertemplate='%{y:$,.0f}'))
+        fig.update_layout(**self._layout(yfmt='$,.0f', ytitle='Median balance (log scale)', ylog=True,
+                                         xtitle='Years'))
+        return fig
+
+    def _mc_cagr_boxes(self, items, styles):
+        fig = go.Figure()
+        for it, st in zip(items, styles):
+            pc = it['results']['stats']['percentiles']['cagr']
+            fig.add_trace(go.Box(
+                y=[it['label']], q1=[pc[25]], median=[pc[50]], q3=[pc[75]],
+                lowerfence=[pc[10]], upperfence=[pc[90]], name=it['label'], orientation='h',
+                fillcolor=self._wash(st['pair'], 0.18), line=dict(color=self._c(st['pair']), width=2),
+                hoverinfo='x'))
+        fig.update_layout(**self._layout(height=max(220, 44 * len(items) + 80), hover='closest', legend=False,
+                                         xtitle='Annualized time-weighted return (10th–90th percentile)',
+                                         xaxis=dict(self._layout()['xaxis'], tickformat='.0%'),
+                                         yaxis=dict(self._layout()['yaxis'], autorange='reversed',
+                                                    showgrid=False)))
+        return fig
+
+    def _prob_loss(self, items, styles):
+        fig = go.Figure()
+        for it, st in zip(items, styles):
+            pr = it['results']['probabilities']
+            fig.add_trace(go.Scatter(x=pr['years'], y=pr['prob_loss'], name=it['label'],
+                                     line=self._line(st), mode='lines+markers',
+                                     marker=dict(size=7, line=dict(width=2, color=self._chrome('surface'))),
+                                     hovertemplate='%{y:.1%}'))
+        fig.update_layout(**self._layout(yfmt='.0%', ytitle='P(balance < invested)', xtitle='Years',
+                                         yaxis=dict(self._layout()['yaxis'], tickformat='.0%', rangemode='tozero')))
+        return fig
+
+    # ------------------------------------------------------------------ tables
+
+    @staticmethod
+    def _table(headers: List[str], rows: List[List[str]], first_col_html=False, cls='',
+               html_cols=()) -> str:
+        """Cells are escaped unless their column holds HTML built by this module."""
+        raw = set(html_cols) | ({0} if first_col_html else set())
+        head = ''.join(f'<th>{esc(h)}</th>' for h in headers)
+        body = ''
+        for row in rows:
+            cells = ''.join(f'<td>{c if j in raw else esc(c)}</td>' for j, c in enumerate(row))
+            body += f'<tr>{cells}</tr>'
+        return f'<div class="table-wrap"><table class="{cls}"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+
+    @staticmethod
+    def _name_cell(i, label, sub=None):
+        sub_html = f'<span class="sub">{esc(sub)}</span>' if sub else ''
+        return f'<span class="key k{i}"></span><span class="name">{esc(label)}</span>{sub_html}'
+
+    def _summary_table(self, items):
+        has_dca = any(it['backtest']['metrics']['Total Contributions'] for it in items)
+        headers = ['Portfolio', 'Initial', 'Contributions', 'Final balance', 'CAGR'] + \
+                  (['IRR'] if has_dca else []) + \
+                  ['Stdev', 'Best year', 'Worst year', 'Max drawdown', 'Sharpe', 'Sortino', 'Calmar']
+        rows = []
+        for i, it in enumerate(items):
+            m = it['backtest']['metrics']
+            rows.append([self._name_cell(i, it['label'], it['backtest']['strategy']),
+                         money(m['Start Balance']), money(m['Total Contributions']), money(m['End Balance']),
+                         pct(m['CAGR'])] + ([pct(m['IRR'])] if has_dca else []) +
+                        [pct(m['Stdev']), pct(m['Best Year']), pct(m['Worst Year']), pct(m['Max Drawdown']),
+                         num(m['Sharpe']), num(m['Sortino']), num(m['Calmar'])])
+        return self._table(headers, rows, first_col_html=True)
+
+    def _risk_table(self, items):
+        headers = ['Portfolio', 'Beta', 'Alpha', 'R²', 'Correlation', 'Upside capture', 'Downside capture',
+                   'Tracking error', 'Info ratio', 'VaR 5%', 'CVaR 5%', 'Skew', 'Excess kurtosis',
+                   'Positive periods', 'Rebalances', 'Costs']
+        rows = []
+        for i, it in enumerate(items):
+            m = it['backtest']['metrics']
+            rows.append([self._name_cell(i, it['label']), num(m.get('Beta')), pct(m.get('Alpha')),
+                         pct(m.get('R2'), 1), num(m.get('Correlation')), pct(m.get('Upside Capture'), 1),
+                         pct(m.get('Downside Capture'), 1), pct(m.get('Tracking Error')),
+                         num(m.get('Info Ratio')), pct(m['VaR 5%']), pct(m['CVaR 5%']), num(m['Skewness']),
+                         num(m['Excess Kurtosis']), pct(m['Positive Periods'], 1), str(m['Rebalances']),
+                         money(m['Transaction Costs'])])
+        return self._table(headers, rows, first_col_html=True)
+
+    def _annual_table(self, items):
+        years = sorted({y for it in items for y in it['backtest']['annual_returns'].index})
+        headers = ['Year'] + [it['label'] for it in items]
+        rows = []
+        for y in years:
+            partial = any(it['backtest']['annual_returns']['partial'].get(y, False) for it in items)
+            row = [f"{y}{'†' if partial else ''}"]
+            for it in items:
+                a = it['backtest']['annual_returns']
+                row.append(pct(a.loc[y, 'return']) if y in a.index else '—')
+            rows.append(row)
+        return self._table(headers, rows)
+
+    def _drawdown_table(self, items, top=3):
+        headers = ['Portfolio', 'Rank', 'Peak', 'Trough', 'Recovered', 'Depth', 'Decline (days)',
+                   'Recovery (days)', 'Underwater (days)']
+        rows = []
+        for i, it in enumerate(items):
+            for rank, d in enumerate(it['backtest']['drawdown_periods'][:top], 1):
+                rows.append([self._name_cell(i, it['label']) if rank == 1 else '', str(rank), str(d['start']),
+                             str(d['trough']), str(d['end']) if d['end'] else 'Not yet',
+                             pct(d['depth']), f"{d['decline_days']:,}",
+                             f"{d['recovery_days']:,}" if d['recovery_days'] is not None else '—',
+                             f"{d['underwater_days']:,}"])
+        return self._table(headers, rows, first_col_html=True)
+
+    def _mc_table(self, items):
+        has_dca = any(it['results']['stats']['total_invested'] > it['results']['portfolio_values'][0, 0]
+                      for it in items)
+        headers = ['Portfolio'] + [f'Balance p{q}' for q in PCTS] + ['Median CAGR', 'CAGR p10–p90'] + \
+                  (['Median IRR'] if has_dca else []) + \
+                  ['Median max DD', 'Max DD p5', 'Median stdev', 'P(loss)', 'P(2× invested)']
+        rows = []
+        for i, it in enumerate(items):
+            s = it['results']['stats']
+            pc = s['percentiles']
+            rows.append([self._name_cell(i, it['label'])] + [money(pc['final_value'][q]) for q in PCTS] +
+                        [pct(s['median_cagr']), f"{pct(pc['cagr'][10], 1)} to {pct(pc['cagr'][90], 1)}"] +
+                        ([pct(s['median_irr'])] if has_dca else []) +
+                        [pct(s['median_max_drawdown']), pct(s['max_drawdown_95']),
+                         pct(s.get('median_volatility')), pct(s['probability_loss'], 1),
+                         pct(s['probability_double'], 1)])
+        return self._table(headers, rows, first_col_html=True)
+
+    def _allocation_table(self, items, start_year, end_year):
+        tickers = []
+        for it in items:
+            for a, w in zip(it['results']['assets'], it['results']['allocations']):
+                if w > 0.001 and a['ticker'] not in tickers:
+                    tickers.append(a['ticker'])
+        sim = self.simulator
+        initial = sim.initial_capital if sim else 10000
+        years = sim.years if sim else 30
+        headers = ['Portfolio'] + tickers + ['Portfolio Visualizer']
+        rows = []
+        for i, it in enumerate(items):
+            alloc = {a['ticker']: w for a, w in zip(it['results']['assets'], it['results']['allocations'])
+                     if w > 0.001}
+            csv_b64 = base64.b64encode(export_portfolio_csv(alloc, it['label']).encode()).decode()
+            safe = ''.join(c if c.isalnum() or c in '_-' else '_' for c in it['label'])
+            links = (f'<a href="data:text/csv;base64,{csv_b64}" download="{esc(safe)}.csv">CSV</a> · '
+                     f'<a href="{esc(generate_pv_url(alloc, start_year, end_year, initial))}" target="_blank" rel="noopener">Backtest</a> · '
+                     f'<a href="{esc(generate_mc_url(alloc, initial, years))}" target="_blank" rel="noopener">Monte Carlo</a>')
+            rows.append([self._name_cell(i, it['label'])] +
+                        [pct(alloc[t], 1) if t in alloc else '—' for t in tickers] + [links])
+        return self._table(headers, rows, first_col_html=True, html_cols=(len(headers) - 1,))
+
+    def _sweep_figure(self, result):
+        from sweeps import SWEEP_METRICS, metric_grid
+        keys, values = result['keys'], result['values']
+        x = [str(v) for v in values[0]]
+        y = [str(v) for v in values[1]] if len(keys) == 2 else [result['strategy_type']]
+        fig = go.Figure()
+        for j, metric in enumerate(result['metrics']):
+            label, higher_better = SWEEP_METRICS[metric]
+            z = metric_grid(result, metric)
+            fmt = (lambda v: num(v)) if metric in ('Sharpe', 'Sortino') else (lambda v: pct(v, 1))
+            base = result['baseline'][metric]
+            span = np.nanmax(np.abs(z - base)) if np.isfinite(z).any() else 0
+            span = span if span > 0 else 1e-9
+            fig.add_trace(go.Heatmap(
+                z=z, x=x, y=y, meta=metric, visible=j == 0, zmid=base, zmin=base - span, zmax=base + span,
+                colorscale=self._diverging_scale(), reversescale=not higher_better, xgap=2, ygap=2,
+                text=[[fmt(v) for v in row] for row in z], texttemplate='%{text}',
+                customdata=[[fmt(base)] * len(x)] * len(y),
+                colorbar=dict(outlinewidth=0, thickness=10, tickfont=dict(color=self._chrome('muted')),
+                              tickformat='.2f' if metric in ('Sharpe', 'Sortino') else '.0%'),
+                hovertemplate=(f'{esc(keys[0])}=%{{x}}' + (f', {esc(keys[1])}=%{{y}}' if len(keys) == 2 else '')
+                               + f'<br>{esc(label)}: %{{text}} (baseline %{{customdata}})<extra></extra>')))
+        fig.update_layout(**self._layout(
+            height=max(220, 52 * len(y) + 110), hover='closest', legend=False,
+            xaxis=dict(self._layout()['xaxis'], title=dict(text=keys[0]), type='category', showgrid=False),
+            yaxis=dict(self._layout()['yaxis'], title=dict(text=keys[1] if len(keys) == 2 else ''),
+                       type='category', showgrid=False)))
+        return fig
+
+    def _sweep_table(self, result):
+        from sweeps import SWEEP_METRICS
+        metrics = result['metrics']
+        headers = result['keys'] + [SWEEP_METRICS[m][0] for m in metrics]
+
+        def fmt(m, v):
+            return num(v) if m in ('Sharpe', 'Sortino') else pct(v)
+
+        rows = [['No strategy (baseline)'] + [''] * (len(result['keys']) - 1) +
+                [fmt(m, result['baseline'][m]) for m in metrics]]
+        for c in sorted(result['cells'], key=lambda c: -c['metrics']['Sharpe']):
+            rows.append([str(c['params'][k]) for k in result['keys']] + [fmt(m, c['metrics'][m]) for m in metrics])
+        return self._table(headers, rows)
+
+    def _sweeps_section(self, sweeps, figs):
+        from sweeps import SWEEP_METRICS
+        parts = ['<h2>Strategy parameter sweeps</h2><p class="lede">Each cell is a full backtest with the '
+                 'run\'s contributions and rebalancing. Blue beats the same allocation without the strategy, '
+                 'red trails it. Cells are fit to this history: trust broad regions that work, not the single '
+                 'best cell.</p>']
+        for i, res in enumerate(sweeps):
+            fig_id = f'sweep{i}'
+            figs[fig_id] = self._sweep_figure(res)
+            opts = ''.join(f'<option value="{m}">{esc(SWEEP_METRICS[m][0])}</option>' for m in res['metrics'])
+            alloc = ' / '.join(f"{t} {w:.0%}" for t, w in res['allocations'].items())
+            b = res['baseline']
+            base_txt = (f"Without the strategy: CAGR {pct(b['CAGR'])}, Sharpe {num(b['Sharpe'])}, "
+                        f"max drawdown {pct(b['Max Drawdown'])}")
+            parts.append(
+                f'<h3>{esc(res["name"])}</h3><p class="caption">{esc(alloc)} · {esc(res["strategy_type"])} '
+                f'[{esc(res["apply_to"])}] · {esc(res["policy"])} · {esc(res["start"])} to {esc(res["end"])}<br>'
+                f'{esc(base_txt)}</p>'
+                f'<label class="select">Metric <select data-chart="{fig_id}">{opts}</select></label>'
+                f'<div class="chart" id="c-{fig_id}"></div>'
+                f'<details><summary>All cells, best Sharpe first</summary>{self._sweep_table(res)}</details>')
+        return ''.join(parts)
+
+    def _walk_forward_section(self, wfs, figs):
+        headers = ['Optimizer', 'Out-of-sample window', 'Refits', 'CAGR in-sample', 'CAGR walk-forward',
+                   'Sharpe in-sample', 'Sharpe walk-forward', 'Max DD in-sample', 'Max DD walk-forward',
+                   'Avg refit turnover']
+        rows = []
+        for wf in wfs:
+            mi, mo = wf['in_sample']['metrics'], wf['oos']['metrics']
+            d = wf['oos']['dates']
+            rows.append([wf['label'], f"{d[0].date()} to {d[-1].date()}", str(len(wf['schedule'])),
+                         pct(mi['CAGR']), pct(mo['CAGR']), num(mi['Sharpe']), num(mo['Sharpe']),
+                         pct(mi['Max Drawdown']), pct(mo['Max Drawdown']), pct(wf['mean_refit_turnover'], 0)])
+
+        growth = go.Figure()
+        weights = go.Figure()
+        tickers = []
+        for wf in wfs:
+            for t in wf['tickers']:
+                if t not in tickers:
+                    tickers.append(t)
+        colors = {t: (SERIES[i] if i < len(SERIES) else OVERFLOW) for i, t in enumerate(tickers)}
+        shapes = []
+        for i, wf in enumerate(wfs):
+            vis = i == 0
+            for key, name, pair, width in (('in_sample', 'In-sample weights (hindsight)', BENCHMARK, 1.5),
+                                           ('oos', 'Walk-forward', SERIES[0], 2)):
+                bal = wf[key]['balance']
+                growth.add_trace(go.Scatter(x=bal.index, y=bal.values, name=name, meta=str(i), visible=vis,
+                                            line=dict(color=self._c(pair), width=width),
+                                            hovertemplate='%{y:$,.0f}'))
+            w = wf['oos']['weights'].resample('W').last().dropna(how='all')
+            for t in w.columns:
+                weights.add_trace(go.Scatter(
+                    x=w.index, y=w[t].values, name=t, meta=str(i), visible=vis, stackgroup=f's{i}',
+                    legendgroup=t, line=dict(width=1, color=self._chrome('surface')),
+                    fillcolor=self._c(colors[t]), hovertemplate='%{y:.1%}'))
+            for d, _ in wf['schedule']:
+                shapes.append(dict(type='line', xref='x', yref='paper', x0=d, x1=d, y0=0, y1=1, name=str(i),
+                                   visible=vis, line=dict(color=self._chrome('text2'), width=1)))
+        growth.update_layout(**self._layout(height=400, yfmt='$,.0f', ytitle='Balance (log scale)', ylog=True))
+        weights.update_layout(**self._layout(height=320, ytitle='Weight', shapes=shapes,
+                                             yaxis=dict(self._layout()['yaxis'], range=[0, 1], tickformat='.0%')))
+        figs['wfgrowth'], figs['wfweights'] = growth, weights
+        opts = ''.join(f'<option value="{i}">{esc(wf["label"])}</option>' for i, wf in enumerate(wfs))
+        wf0 = wfs[0]
+        return (f'<h2>Optimizer walk-forward check</h2><p class="lede">At each refit the optimizer sees only '
+                f'the previous {wf0["train_years"]} years, and its weights are held for the next '
+                f'{wf0["test_years"]} year(s). The in-sample line holds the full-history optimum over the same '
+                f'window; the gap between them is how much the optimized rows owe to hindsight.</p>'
+                f'{self._table(headers, rows)}'
+                f'<label class="select">Optimizer <select data-chart="wfgrowth wfweights">{opts}</select></label>'
+                f'<div class="chart" id="c-wfgrowth"></div>'
+                f'<h3>Walk-forward weights</h3><div class="chart" id="c-wfweights"></div>'
+                f'<p class="caption">Vertical lines mark refits.</p>')
+
+    def _frontier(self, frontier, items, styles):
+        fig = go.Figure()
+        hover_w = ['<br>'.join(f"{t} {w:.0%}" for t, w in zip(frontier['tickers'], ws) if w > 0.005)
+                   for ws in frontier['weights']]
+        fig.add_trace(go.Scatter(
+            x=frontier['vol'], y=frontier['ret'], mode='lines', name='Efficient frontier',
+            line=dict(color=self._chrome('text2'), width=2), customdata=hover_w,
+            hovertemplate='Risk %{x:.1%}<br>Return %{y:.1%}<br>%{customdata}<extra>Frontier</extra>'))
+        fig.add_trace(go.Scatter(
+            x=frontier['asset_vol'], y=frontier['asset_ret'], mode='markers+text', name='Assets',
+            text=frontier['tickers'], textposition='middle right',
+            textfont=dict(color=self._chrome('muted'), size=11),
+            marker=dict(size=8, color=self._chrome('muted'), line=dict(width=2, color=self._chrome('surface'))),
+            hovertemplate='%{text}<br>Risk %{x:.1%}<br>Return %{y:.1%}<extra></extra>'))
+        by_label = {it['label']: st for it, st in zip(items, styles)}
+        for p in frontier.get('portfolios', []):
+            st = by_label.get(p['label'])
+            if st is None:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[p['vol']], y=[p['ret']], mode='markers', name=p['label'],
+                marker=dict(size=11, color=self._c(st['pair']), line=dict(width=2, color=self._chrome('surface'))),
+                hovertemplate='Risk %{x:.1%}<br>Return %{y:.1%}<extra>' + esc(p['label']) + '</extra>'))
+        fig.update_layout(**self._layout(height=440, yfmt='.0%', hover='closest',
+                                         ytitle='Expected annual return (arithmetic mean)',
+                                         xtitle='Annualized volatility (daily returns)',
+                                         xaxis=dict(self._layout()['xaxis'], tickformat='.0%', rangemode='tozero')))
+        return fig
+
+    def _events_section(self, items):
+        blocks = []
+        for i, it in enumerate(items):
+            events = it['backtest']['events']
+            if not events:
+                continue
+            tickers = list(it['backtest']['weights'].columns)
+            labels = {'calendar': 'calendar rebalances', 'signal': 'signal rebalances',
+                      'threshold': 'band rebalances', 'strategy': 'strategy-weighted contributions'}
+            counts = pd.Series([e['trigger'] for e in events]).value_counts()
+            summary = ', '.join(f"{n} {labels.get(k, k)}" for k, n in counts.items())
+            shown = [e for e in events if e['trigger'] != 'calendar'][:40] or events[:12]
+            rows = [[str(e['date'].date()), e['type'], e['trigger'] or '',
+                     ' / '.join(f"{t} {w:.0%}" for t, w in zip(tickers, e['weights']))] for e in shown]
+            blocks.append(f'<details><summary>{self._name_cell(i, it["label"])} '
+                          f'<span class="sub">{esc(summary)}</span></summary>'
+                          f'{self._table(["Date", "Action", "Trigger", "Target weights"], rows)}</details>')
+        return ''.join(blocks)
+
+    # ------------------------------------------------------------------ page
+
+    def generate_html_report(self, portfolio_results, filename, start_date=None, end_date=None,
+                             title: str = 'Portfolio Analysis', assumptions: Optional[Dict[str, str]] = None,
+                             synthetic: bool = False, embed_plotlyjs: bool = False,
+                             sweeps: Optional[List[Dict]] = None,
+                             walk_forward: Optional[List[Dict]] = None,
+                             frontier: Optional[Dict] = None):
+        items = [it for it in portfolio_results if it.get('backtest') and it.get('results')]
+        if not items:
+            raise ValueError("No results to report")
+        self._cmap = {}
+        styles = self._assign_styles(items)
+
+        figs = {
+            'growth': self._growth(items, styles),
+            'annual': self._annual_bars(items, styles),
+            'drawdowns': self._drawdowns(items, styles),
+            'rolling': self._rolling(items, styles),
+            'riskret': self._risk_return(items, styles),
+            'monthly': self._monthly_heatmap(items),
+            'allocation': self._allocation(items),
+            'mcfan': self._mc_fan(items, styles),
+            'mcmedian': self._mc_medians(items, styles),
+            'mcbox': self._mc_cagr_boxes(items, styles),
+            'mcloss': self._prob_loss(items, styles),
+        }
+        corr = self._correlation(items)
+        if corr is not None:
+            figs['corr'] = corr[0]
+        if frontier:
+            figs['frontier'] = self._frontier(frontier, items, styles)
+
+        # Open the allocation chart on the most interesting portfolio
+        alloc_default = next((i for i, it in enumerate(items)
+                              if any(e['trigger'] != 'calendar' for e in it['backtest']['events'])),
+                             next((i for i, it in enumerate(items)
+                                   if it['backtest']['weights'].shape[1] > 1), 0))
+        start_year = start_date.year if start_date else items[0]['backtest']['dates'][0].year
+        end_year = end_date.year if end_date else items[0]['backtest']['dates'][-1].year
+        sim = self.simulator
+        mc_units = "today's dollars" if items[0]['results'].get('real_dollars') else 'nominal dollars'
+
+        def portfolio_options(selected=0):
+            return ''.join(f'<option value="{i}"{" selected" if i == selected else ""}>{esc(it["label"])}</option>'
+                           for i, it in enumerate(items))
+
+        def selector(chart_id, opts=None, label='Portfolio'):
+            opts = opts or portfolio_options()
+            return (f'<label class="select">{esc(label)} <select data-chart="{chart_id}">{opts}</select></label>')
+
+        window_opts = ''.join(f'<option value="{w}">{w}</option>' for w in ('1y', '3y', '5y'))
+
+        def chart(chart_id, caption=''):
+            cap = f'<p class="caption">{caption}</p>' if caption else ''
+            return f'<div class="chart" id="c-{chart_id}"></div>{cap}'
+
+        assumptions = assumptions or {}
+        assumption_html = ''.join(f'<div><dt>{esc(k)}</dt><dd>{esc(v)}</dd></div>' for k, v in assumptions.items())
+        banner = ('<div class="banner"><strong>Synthetic data.</strong> Prices were generated by '
+                  'synthetic_data.py for offline testing. These numbers say nothing about real markets.</div>'
+                  if synthetic else '')
+
+        key_css = '\n'.join(f'.k{i}{{background:{st["pair"][0]}}}' for i, st in enumerate(styles))
+        key_css_dark = '\n'.join(f'.k{i}{{background:{st["pair"][1]}}}' for i, st in enumerate(styles))
+
+        sections = [
+            ('summary', 'Summary', f'''
+                <h2>Performance summary</h2>
+                <p class="lede">Historical backtest over {esc(start_date)} to {esc(end_date)}. Return metrics are
+                time-weighted, so contributions never count as returns. IRR is the money-weighted return
+                including contributions.</p>
+                {self._summary_table(items)}
+                <h3>Risk and benchmark statistics</h3>
+                {self._risk_table(items)}
+                <details><summary>Allocations and Portfolio Visualizer export</summary>
+                {self._allocation_table(items, start_year, end_year)}</details>'''),
+            ('growth', 'Growth', f'''
+                <h2>Portfolio growth</h2>{chart('growth')}'''),
+            ('returns', 'Returns', f'''
+                <h2>Annual returns</h2>{chart('annual', '† partial calendar year (measured from the first or to the last available date).')}
+                <details><summary>Annual returns table</summary>{self._annual_table(items)}</details>
+                <h2>Monthly returns</h2>{selector('monthly')}{chart('monthly')}
+                <h2>Rolling returns</h2>{selector('rolling', window_opts, 'Window')}{chart('rolling')}'''),
+            ('drawdowns', 'Drawdowns', f'''
+                <h2>Drawdowns</h2>{chart('drawdowns')}
+                <h3>Largest drawdowns</h3>{self._drawdown_table(items)}'''),
+            ('risk', 'Risk', f'''
+                <h2>Risk vs return</h2>{chart('riskret', 'Annualized stdev of monthly returns vs CAGR, historical.')}
+                {('<h2>Asset correlations</h2>' + chart('corr', 'Correlation of monthly returns over each pair’s overlapping history.')) if corr is not None else ''}
+                {('<h2>Efficient frontier</h2>' + chart('frontier', f"Long-only mean-variance frontier of the optimization assets, {frontier['start']} to {frontier['end']}. Fixed-weight portfolios built only from these assets are placed by their target weights; strategy portfolios have no single point. In-sample, like the optimizers.")) if frontier else ''}'''),
+            ('allocation', 'Allocation', f'''
+                <h2>Allocation over time</h2>{selector('allocation', portfolio_options(alloc_default))}
+                {chart('allocation', 'Weekly snapshot of holdings weights. Vertical lines mark signal- or band-triggered rebalances.')}
+                {('<h3>Strategy and rebalance events</h3>' + self._events_section(items)) if any(it['backtest']['events'] for it in items) else ''}'''),
+            ('montecarlo', 'Monte Carlo', f'''
+                <h2>Monte Carlo simulation</h2>
+                <p class="lede">{esc(sim.simulations if sim else '')} paths over {esc(sim.years if sim else '')} years,
+                method <code>{esc(items[0]['results'].get('method'))}</code>, history
+                {esc(items[0]['results'].get('history_start'))} to {esc(items[0]['results'].get('history_end'))}.
+                Balances in {mc_units}.</p>
+                {self._mc_table(items)}
+                <h3>Range of outcomes</h3>{selector('mcfan')}{chart('mcfan')}
+                <h3>Median balance</h3>{chart('mcmedian')}
+                <h3>Annualized return distribution</h3>{chart('mcbox', 'Box = 25th–75th percentile, whiskers = 10th–90th, line = median.')}
+                <h3>Probability of loss</h3>{chart('mcloss', 'Share of paths whose balance is below the money invested so far.')}'''),
+            *([('walkforward', 'Walk-forward', self._walk_forward_section(walk_forward, figs))]
+              if walk_forward else []),
+            *([('sweeps', 'Sweeps', self._sweeps_section(sweeps, figs))] if sweeps else []),
+            ('notes', 'Notes', f'''
+                <h2>Assumptions and methodology</h2>
+                <dl class="assumptions">{assumption_html}</dl>
+                <ul class="notes">
+                  <li><b>CAGR</b> is time-weighted and annualized by calendar span, so 24/7 crypto and 5-day equity calendars compare correctly.</li>
+                  <li><b>Stdev, Sharpe, Sortino, beta, capture ratios, VaR</b> use monthly returns (Portfolio Visualizer's convention); histories under a year fall back to daily. Sharpe and Sortino subtract the configured risk-free rate.</li>
+                  <li><b>Max drawdown</b> uses daily values, so it can be deeper than Portfolio Visualizer's month-end figure.</li>
+                  <li><b>Best/Worst year</b> are calendar-year returns over full years.</li>
+                  <li><b>Upside/Downside capture</b> are ratios (1.00 = matches the benchmark).</li>
+                  <li><b>Optimized portfolios</b> are fit to the same history they are tested on (in-sample); expect worse results going forward.</li>
+                  <li><b>Monte Carlo</b> resamples or fits the common history of each portfolio's assets; it cannot produce regimes that history doesn't contain.</li>
+                </ul>'''),
+        ]
+        nav = ''.join(f'<a href="#{sid}">{esc(name)}</a>' for sid, name, _ in sections)
+        body = ''.join(f'<section id="{sid}">{content}</section>' for sid, _, content in sections)
+
+        fig_payload = json.dumps({f'c-{k}': self._fig_json(v) for k, v in figs.items()})
+        cmap = json.dumps(self._cmap)
+        page = _PAGE.format(
+            title=esc(title), period=f"{esc(start_date)} to {esc(end_date)}", banner=banner, nav=nav, body=body,
+            figs=fig_payload, cmap=cmap,
+            plotly_script=(f'<script>{get_plotlyjs()}</script>' if embed_plotlyjs else
+                           f'<script src="https://cdn.plot.ly/plotly-{get_plotlyjs_version()}.min.js"></script>'),
+            key_css=key_css, key_css_dark=key_css_dark,
+            **{f'{k}_l': v[0] for k, v in CHROME.items()}, **{f'{k}_d': v[1] for k, v in CHROME.items()},
+        )
         with open(filename, 'w', encoding='utf-8') as f:
-            f.write(html_content)
+            f.write(page)
+
+
+_PAGE = '''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+{plotly_script}
+<style>
+:root {{
+  color-scheme: light;
+  --page: {page_l}; --surface: {surface_l}; --text: {text_l}; --text2: {text2_l};
+  --muted: {muted_l}; --grid: {grid_l}; --axis: {axis_l};
+  --border: rgba(11,11,11,0.10);
+}}
+{key_css}
+@media (prefers-color-scheme: dark) {{
+  :root:where(:not([data-theme="light"])) {{
+    color-scheme: dark;
+    --page: {page_d}; --surface: {surface_d}; --text: {text_d}; --text2: {text2_d};
+    --muted: {muted_d}; --grid: {grid_d}; --axis: {axis_d}; --border: rgba(255,255,255,0.10);
+  }}
+}}
+:root[data-theme="dark"] {{
+  color-scheme: dark;
+  --page: {page_d}; --surface: {surface_d}; --text: {text_d}; --text2: {text2_d};
+  --muted: {muted_d}; --grid: {grid_d}; --axis: {axis_d}; --border: rgba(255,255,255,0.10);
+}}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; background: var(--page); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }}
+header {{ max-width: 1240px; margin: 0 auto; padding: 24px 16px 8px; display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; }}
+header h1 {{ font-size: 22px; margin: 0; font-weight: 600; }}
+header .period {{ color: var(--text2); }}
+header button {{ margin-left: auto; background: var(--surface); color: var(--text2); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; font: inherit; cursor: pointer; }}
+nav {{ position: sticky; top: 0; z-index: 5; background: var(--page); border-bottom: 1px solid var(--border); }}
+nav div {{ max-width: 1240px; margin: 0 auto; padding: 0 16px; display: flex; gap: 4px; overflow-x: auto; }}
+nav a {{ color: var(--text2); text-decoration: none; padding: 10px 10px; white-space: nowrap; border-bottom: 2px solid transparent; }}
+nav a:hover {{ color: var(--text); border-bottom-color: var(--axis); }}
+main {{ max-width: 1240px; margin: 0 auto; padding: 8px 16px 48px; }}
+section {{ background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 20px 20px; margin: 16px 0; scroll-margin-top: 52px; }}
+h2 {{ font-size: 17px; font-weight: 600; margin: 8px 0 8px; }}
+h3 {{ font-size: 14px; font-weight: 600; margin: 20px 0 6px; color: var(--text2); }}
+.lede {{ color: var(--text2); margin: 0 0 12px; max-width: 80ch; }}
+.caption {{ color: var(--muted); font-size: 12px; margin: 4px 0 0; }}
+.banner {{ max-width: 1208px; margin: 8px auto 0; padding: 10px 14px; border-radius: 8px; border: 1px solid #fab219; background: rgba(250,178,25,0.12); }}
+.table-wrap {{ overflow-x: auto; margin: 4px 0 8px; }}
+table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
+th, td {{ padding: 6px 10px; text-align: right; border-bottom: 1px solid var(--grid); white-space: nowrap; font-variant-numeric: tabular-nums; }}
+th {{ color: var(--text2); font-weight: 600; font-size: 12px; position: sticky; top: 0; background: var(--surface); }}
+th:first-child, td:first-child {{ text-align: left; }}
+td:first-child {{ white-space: normal; min-width: 180px; }}
+.key {{ display: inline-block; width: 12px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 8px; }}
+.name {{ font-weight: 600; }}
+.sub {{ display: block; color: var(--muted); font-size: 12px; font-weight: 400; margin-left: 20px; }}
+details {{ margin: 12px 0; }}
+summary {{ cursor: pointer; color: var(--text2); font-weight: 600; }}
+details summary .sub {{ display: inline; }}
+a {{ color: var(--text); }}
+code {{ font-size: 12px; }}
+.chart {{ width: 100%; min-height: 220px; }}
+.select {{ display: inline-flex; gap: 8px; align-items: center; color: var(--text2); margin: 4px 0 8px; }}
+.select select {{ font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; max-width: 70vw; }}
+dl.assumptions {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px 24px; margin: 8px 0 16px; }}
+dl.assumptions dt {{ color: var(--muted); font-size: 12px; }}
+dl.assumptions dd {{ margin: 0; }}
+ul.notes {{ color: var(--text2); padding-left: 18px; max-width: 90ch; }}
+</style>
+<style id="dark-keys" media="not all">{key_css_dark}</style>
+</head>
+<body>
+<header><h1>{title}</h1><span class="period">{period}</span><button id="theme" type="button">Theme: auto</button></header>
+{banner}
+<nav><div>{nav}</div></nav>
+<main>{body}</main>
+<script>
+const FIGS = {figs};
+const CMAP = {cmap};
+const selection = {{}};
+const root = document.documentElement;
+const mq = window.matchMedia('(prefers-color-scheme: dark)');
+
+function isDark() {{
+  const t = root.dataset.theme;
+  return t === 'dark' || (t !== 'light' && mq.matches);
+}}
+function swap(o) {{
+  if (typeof o === 'string') return CMAP[o] ?? o;
+  if (Array.isArray(o)) return o.map(swap);
+  if (o && typeof o === 'object') {{ const r = {{}}; for (const k in o) r[k] = swap(o[k]); return r; }}
+  return o;
+}}
+function selectionFor(id) {{
+  const el = document.querySelector('select[data-chart~="' + id.slice(2) + '"]');
+  return el ? el.value : null;
+}}
+function applySelection(fig, sel) {{
+  if (sel === null) return fig;
+  fig.data.forEach(t => {{ if (t.meta !== undefined && t.meta !== null) t.visible = (t.meta === 'all' || String(t.meta) === sel); }});
+  (fig.layout.shapes || []).forEach(s => {{ if (s.name !== undefined) s.visible = String(s.name) === sel; }});
+  return fig;
+}}
+function render() {{
+  const dark = isDark();
+  document.getElementById('dark-keys').media = dark ? 'all' : 'not all';
+  for (const id in FIGS) {{
+    const el = document.getElementById(id);
+    if (!el) continue;
+    let fig = JSON.parse(JSON.stringify(FIGS[id]));
+    if (dark) fig = swap(fig);
+    fig = applySelection(fig, selectionFor(id));
+    Plotly.react(el, fig.data, fig.layout, {{responsive: true, displaylogo: false,
+      modeBarButtonsToRemove: ['select2d', 'lasso2d', 'autoScale2d']}});
+  }}
+}}
+document.querySelectorAll('select[data-chart]').forEach(s => s.addEventListener('change', render));
+const modes = ['auto', 'light', 'dark'];
+document.getElementById('theme').addEventListener('click', e => {{
+  const next = modes[(modes.indexOf(root.dataset.theme || 'auto') + 1) % 3];
+  if (next === 'auto') delete root.dataset.theme; else root.dataset.theme = next;
+  e.target.textContent = 'Theme: ' + next;
+  render();
+}});
+mq.addEventListener('change', render);
+render();
+</script>
+</body>
+</html>
+'''

@@ -8,6 +8,22 @@ import os
 PORTFOLIO_OUTPUT_DIR = "output/portfolios"
 
 
+def whole_percentages(allocations: dict) -> dict:
+    """Integer percentages that sum to exactly 100 (largest-remainder rounding).
+
+    Plain rounding turns 1/3 each into 33/33/33, which PV rejects.
+    """
+    items = [(t, w) for t, w in sorted(allocations.items()) if w > 0]
+    total = sum(w for _, w in items)
+    raw = [(t, w / total * 100) for t, w in items]
+    floors = {t: int(v) for t, v in raw}
+    short = 100 - sum(floors.values())
+    by_remainder = sorted(raw, key=lambda tv: tv[1] - int(tv[1]), reverse=True)
+    for t, _ in by_remainder[:short]:
+        floors[t] += 1
+    return floors
+
+
 def export_portfolio_csv(allocations: dict, name: str = "Portfolio") -> str:
     """
     Generate PV-compatible CSV content.
@@ -21,9 +37,8 @@ def export_portfolio_csv(allocations: dict, name: str = "Portfolio") -> str:
     """
     lines = [f"{name}", "", "Symbol,Weight"]
 
-    for ticker, weight in sorted(allocations.items()):
-        pv_ticker = to_pv_ticker(ticker)
-        lines.append(f"{pv_ticker},{weight*100:.0f}%")
+    for ticker, pct in whole_percentages(allocations).items():
+        lines.append(f"{to_pv_ticker(ticker)},{pct}%")
 
     lines.append("")
     return "\n".join(lines)
@@ -121,7 +136,8 @@ def from_pv_ticker(ticker: str) -> str:
     return ticker.upper()
 
 
-def generate_pv_url(allocations: dict, start_year: int = 2017, end_year: int = 2025) -> str:
+def generate_pv_url(allocations: dict, start_year: int = 2017, end_year: int = 2025,
+                    initial_amount: int = 10000) -> str:
     """
     Generate Portfolio Visualizer backtest URL.
 
@@ -140,17 +156,16 @@ def generate_pv_url(allocations: dict, start_year: int = 2017, end_year: int = 2
         'timePeriod=4',
         f'startYear={start_year}',
         f'endYear={end_year}',
-        'initialAmount=10000',
+        f'initialAmount={int(initial_amount)}',
         'annualOperation=0',
         'inflationAdjusted=true',
         'frequency=4',
         'rebalanceType=1',  # Annual rebalancing
     ]
 
-    for i, (ticker, weight) in enumerate(sorted(allocations.items()), 1):
-        pv_ticker = to_pv_ticker(ticker)
-        params.append(f'symbol{i}={pv_ticker}')
-        params.append(f'allocation{i}_1={weight*100:.0f}')
+    for i, (ticker, pct) in enumerate(whole_percentages(allocations).items(), 1):
+        params.append(f'symbol{i}={to_pv_ticker(ticker)}')
+        params.append(f'allocation{i}_1={pct}')
 
     return f"{base}?{'&'.join(params)}"
 
@@ -173,7 +188,7 @@ def generate_mc_url(allocations: dict, initial_amount: int = 1000000,
 
     params = [
         's=y',
-        f'initialAmount={initial_amount}',
+        f'initialAmount={int(initial_amount)}',
         f'years={years}',
         'inflationAdjusted=true',
         'simulationModel=1',  # Historical returns
@@ -184,9 +199,8 @@ def generate_mc_url(allocations: dict, initial_amount: int = 1000000,
         params.append(f'periodicAmount={periodic_amount}')
         params.append('adjustmentType=2')  # Inflation-adjusted contributions
 
-    for i, (ticker, weight) in enumerate(sorted(allocations.items()), 1):
-        pv_ticker = to_pv_ticker(ticker)
-        params.append(f'symbol{i}={pv_ticker}')
-        params.append(f'allocation{i}={weight*100:.0f}')
+    for i, (ticker, pct) in enumerate(whole_percentages(allocations).items(), 1):
+        params.append(f'symbol{i}={to_pv_ticker(ticker)}')
+        params.append(f'allocation{i}={pct}')
 
     return f"{base}?{'&'.join(params)}"

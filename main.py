@@ -13,8 +13,10 @@ from data_manager import DataManager
 from portfolio_simulator import PortfolioSimulator
 from portfolio_optimizer import PortfolioOptimizer
 from visualizations import PortfolioVisualizer
+from pv_compat import save_portfolio_csv
+from sweeps import run_sweep
+from walk_forward import run_walk_forward
 from backtester import Backtester
-from strategies import StaticAllocationStrategy
 
 
 def find_config_file(specified_path: str = None) -> Path:
@@ -30,16 +32,75 @@ def find_config_file(specified_path: str = None) -> Path:
     raise FileNotFoundError("No config file found.")
 
 
+def evaluate_portfolio(sim, backtester, sim_cfg, label, assets, weights, start=None, end=None,
+                       strategy_conf=None, rebalance=None, benchmark=None, description=None) -> dict:
+    """Monte Carlo + backtest with identical cash flows, rebalancing and benchmark."""
+    strategy = create_strategy_from_config(strategy_conf) if strategy_conf else None
+    apply_to = strategy_conf.apply_to if strategy_conf else 'contributions'
+    if strategy is None:
+        # Zero-weight assets never trade without a strategy; skipping them saves simulation work
+        kept = [(a, w) for a, w in zip(assets, weights) if w > 1e-9]
+        assets, weights = [a for a, _ in kept], [w for _, w in kept]
+    check = strategy_conf.check_frequency if strategy_conf else 'monthly'
+    rebalance = rebalance or sim_cfg.rebalance
+    sim_res = sim.simulate_portfolio(
+        assets, weights, start_date_override=start, strategy=strategy,
+        rebalance=rebalance, apply_to=apply_to, check_frequency=check)
+    bt_res = backtester.run_backtest(
+        assets, weights, sim_cfg.initial_capital,
+        start_date_override=start, end_date=end,
+        strategy=strategy, contribution_amount=sim_cfg.contribution_amount,
+        contribution_frequency=sim_cfg.contribution_frequency,
+        rebalance=rebalance, apply_to=apply_to, check_frequency=check,
+        risk_free_rate=sim_cfg.risk_free_rate, benchmark=benchmark)
+    m = bt_res['metrics']
+    irr = f" | IRR: {m['IRR']*100:.2f}%" if m['Total Contributions'] else ""
+    print(f"  {bt_res['strategy']}")
+    print(f"  CAGR: {m['CAGR']*100:.2f}%{irr} | Max DD: {m['Max Drawdown']*100:.2f}% | "
+          f"Sharpe: {m['Sharpe']:.2f}")
+    return {'label': label, 'description': description, 'results': sim_res, 'backtest': bt_res}
+
+
+def describe_assumptions(config, args) -> dict:
+    sim = config.simulation
+    reb = sim.rebalance
+    rebalance = reb.frequency.capitalize() if reb.frequency != 'none' else 'None (buy and hold)'
+    if reb.threshold:
+        rebalance += f", {reb.threshold:.0%} band"
+    if reb.transaction_cost_bps:
+        rebalance += f", {reb.transaction_cost_bps:g} bps cost"
+    freq = sim.contribution_frequency
+    period = {'daily': 'day', 'weekly': 'week', 'monthly': 'month', 'quarterly': 'quarter', 'annual': 'year'}
+    contrib = (f"${sim.contribution_amount:,.0f} every "
+               + (f"{freq} trading days" if isinstance(freq, int) else period[freq])
+               if sim.contribution_amount else 'None')
+    return {
+        'Initial capital': f"${sim.initial_capital:,.0f}",
+        'Contributions': contrib,
+        'Default rebalancing': rebalance,
+        'Risk-free rate': f"{sim.risk_free_rate:.2%}",
+        'Benchmark': config.benchmark_ticker or 'First asset of each portfolio',
+        'Simulation': f"{sim.simulations:,} paths x {sim.years} years, {sim.method}"
+                      + (f" (block {sim.block_size}d)" if sim.method == 'block_bootstrap' else ''),
+        'Inflation': f"{sim.inflation_rate:.2%} (results in today's dollars)" if sim.inflation_rate else 'Not adjusted',
+        'Seed': str(sim.seed) if sim.seed is not None else 'Random',
+        'Data': 'SYNTHETIC' if args.synthetic else ('cached only' if args.offline else args.data_source),
+    }
+
+
 def collect_all_tickers(config) -> set:
     """Collect all tickers needed from config"""
     all_tickers = set()
 
     for p in config.portfolios:
         all_tickers.update([t.upper() for t in p.allocations.keys()])
+    for sw in config.sweeps:
+        all_tickers.update([t.upper() for t in sw.allocations.keys()])
 
     if config.optimization:
         all_tickers.update([t.upper() for t in config.optimization.assets])
-        all_tickers.add(config.optimization.benchmark_ticker.upper())
+    if config.benchmark_ticker:
+        all_tickers.add(config.benchmark_ticker.upper())
 
     return all_tickers
 
@@ -53,6 +114,10 @@ def main():
     parser.add_argument('--offline', action='store_true', help='Use cached data only (no yfinance calls)')
     parser.add_argument('--data-source', choices=['yfinance', 'fmp'], default='yfinance',
                         help='Data source for market data (default: yfinance)')
+    parser.add_argument('--embed-plotlyjs', action='store_true',
+                        help='Embed plotly.js in the report so it opens offline')
+    parser.add_argument('--synthetic', action='store_true',
+                        help='Use deterministic synthetic prices (no network, not real data)')
     args = parser.parse_args()
 
     config_path = find_config_file(args.config)
@@ -65,10 +130,15 @@ def main():
         return 1
 
     # Initialize data manager
-    data_source = getattr(args, 'data_source', 'yfinance')
-    data_manager = DataManager(db_path=config.database.path, data_source=data_source)
-    if data_source != 'yfinance':
-        print(f"  Data source: {data_source.upper()}")
+    if args.synthetic:
+        from synthetic_data import SyntheticDataManager
+        data_manager = SyntheticDataManager()
+        print("  Data source: SYNTHETIC (generated prices, not real market data)")
+    else:
+        data_source = args.data_source
+        data_manager = DataManager(db_path=config.database.path, data_source=data_source)
+        if data_source != 'yfinance':
+            print(f"  Data source: {data_source.upper()}")
 
     # Coverage report mode
     if args.coverage_report:
@@ -162,139 +232,120 @@ def main():
         return 1
 
     global_start_date = max(start_dates)
-    global_end_date = sim.end_date
-    print(f"\n✓ GLOBAL ALIGNMENT: {global_start_date.date()} to {global_end_date}")
+    global_end_date = min(a['full_data'].index.max() for a in asset_map.values())
+    print(f"\n✓ GLOBAL ALIGNMENT: {global_start_date.date()} to {global_end_date.date()}")
+
+    sim_cfg = config.simulation
+    bench_ticker = config.benchmark_ticker.upper() if config.benchmark_ticker else None
+    bench_asset = asset_map.get(bench_ticker) if bench_ticker else None
+
+    def evaluate(label, assets, weights, strategy_conf=None, rebalance=None, description=None):
+        return evaluate_portfolio(sim, backtester, sim_cfg, label, assets, weights,
+                                  start=global_start_date, end=global_end_date,
+                                  strategy_conf=strategy_conf, rebalance=rebalance,
+                                  benchmark=bench_asset, description=description)
 
     portfolio_results = []
 
-    # Add Benchmark Portfolio
-    if config.optimization:
-        bench_ticker = config.optimization.benchmark_ticker.upper()
-        if bench_ticker in asset_map:
-            print(f"\n→ Adding Benchmark: {bench_ticker}")
-            assets = [asset_map[bench_ticker]]
-            weights = [1.0]
+    if bench_asset is not None:
+        print(f"\n→ Benchmark: {bench_ticker}")
+        bench_item = evaluate(f"Benchmark ({bench_ticker})", [bench_asset], [1.0])
+        bench_item['is_benchmark'] = True
+        portfolio_results.append(bench_item)
 
-            sim_res = sim.simulate_portfolio(assets, weights, start_date_override=global_start_date)
-            bt_res = backtester.run_backtest(
-                assets, weights, config.simulation.initial_capital,
-                start_date_override=global_start_date
-            )
-
-            portfolio_results.append({
-                'label': f"Benchmark ({bench_ticker})",
-                'results': sim_res,
-                'backtest': bt_res
-            })
-
-    # Process Defined Portfolios
     print("\n" + "="*60)
     print("PROCESSING PORTFOLIOS")
     print("="*60)
 
     for p_conf in config.portfolios:
         print(f"\n→ {p_conf.name}")
-
-        # Check all assets exist
         missing = [t for t in p_conf.allocations.keys() if t.upper() not in asset_map]
         if missing:
             print(f"  ⚠ Skipping - missing assets: {missing}")
             continue
-
         assets = [asset_map[t.upper()] for t in p_conf.allocations.keys()]
         weights = list(p_conf.allocations.values())
+        portfolio_results.append(evaluate(p_conf.name, assets, weights, p_conf.strategy,
+                                          p_conf.rebalance, p_conf.description))
 
-        # Create strategy if defined
-        strategy = None
-        if p_conf.strategy:
-            strategy = create_strategy_from_config(p_conf.strategy)
-            print(f"  Strategy: {strategy.name}")
-
-        # Run simulation
-        sim_res = sim.simulate_portfolio(
-            assets, weights,
-            start_date_override=global_start_date,
-            strategy=strategy
-        )
-
-        # Run backtest
-        bt_res = backtester.run_backtest(
-            assets, weights, config.simulation.initial_capital,
-            start_date_override=global_start_date,
-            strategy=strategy,
-            contribution_amount=config.simulation.contribution_amount,
-            contribution_frequency=config.simulation.contribution_frequency
-        )
-
-        portfolio_results.append({
-            'label': p_conf.name,
-            'results': sim_res,
-            'backtest': bt_res
-        })
-
-        # Quick summary
-        m = bt_res['metrics']
-        print(f"  CAGR: {m['CAGR']*100:.2f}% | Max DD: {m['Max Drawdown']*100:.2f}% | Sharpe: {m['Sharpe']:.2f}")
-
-    # Run Optimizations
+    walk_forward_results = []
     if config.optimization and not args.no_optimize:
         print("\n" + "="*60)
-        print("RUNNING OPTIMIZATIONS")
+        print("RUNNING OPTIMIZATIONS (in-sample: weights are fit to the same history they are tested on)")
         print("="*60)
 
-        # Filter to available assets
-        opt_assets = [
-            asset_map[name.upper()]
-            for name in config.optimization.assets
-            if name.upper() in asset_map
-        ]
-
+        opt_assets = [asset_map[name.upper()] for name in config.optimization.assets
+                      if name.upper() in asset_map]
         if len(opt_assets) < 2:
             print("⚠ Need at least 2 assets for optimization")
         else:
-            active_strats = config.optimization.active_strategies
-
-            strategy_map = {
-                'max_sharpe': optimizer.optimize_sharpe_ratio,
-                'min_volatility': optimizer.optimize_min_volatility,
-                'risk_parity': optimizer.optimize_risk_parity,
-                'max_sortino': optimizer.optimize_sortino_ratio,
-                'custom_weighted': optimizer.optimize_custom_weighted
+            rf = sim_cfg.risk_free_rate
+            fitters = {
+                'max_sharpe': lambda A, start=None: optimizer.optimize_sharpe_ratio(
+                    A, risk_free_rate=rf, start_date_override=start),
+                'min_volatility': lambda A, start=None: optimizer.optimize_min_volatility(
+                    A, start_date_override=start),
+                'risk_parity': lambda A, start=None: optimizer.optimize_risk_parity(
+                    A, start_date_override=start),
+                'max_sortino': lambda A, start=None: optimizer.optimize_sortino_ratio(
+                    A, risk_free_rate=rf, start_date_override=start),
+                'custom_weighted': lambda A, start=None: optimizer.optimize_custom_weighted(
+                    A, weights_config=config.optimization.objective_weights, risk_free_rate=rf,
+                    start_date_override=start),
             }
-
-            for strat_name in active_strats:
-                if strat_name not in strategy_map:
+            opt_cfg = config.optimization
+            for strat_name in opt_cfg.active_strategies:
+                if strat_name not in fitters:
                     print(f"⚠ Unknown strategy: {strat_name}")
                     continue
-
                 print(f"\n→ {strat_name}...")
+                opt = fitters[strat_name](opt_assets, global_start_date)
+                portfolio_results.append(evaluate(opt['label'], opt_assets, opt['allocations'],
+                                                  description='Optimized (in-sample)'))
+                if opt_cfg.walk_forward:
+                    optimizer.verbose = False
+                    wf = run_walk_forward(opt['label'], lambda A, f=fitters[strat_name]: f(A),
+                                          opt_assets, opt['allocations'], sim_cfg,
+                                          start=global_start_date, end=global_end_date,
+                                          train_years=opt_cfg.train_years, test_years=opt_cfg.test_years,
+                                          benchmark=bench_asset)
+                    optimizer.verbose = True
+                    if wf is None:
+                        print(f"  ⚠ Walk-forward skipped: need more than {opt_cfg.train_years} years of history")
+                    else:
+                        walk_forward_results.append(wf)
+                        mi, mo = wf['in_sample']['metrics'], wf['oos']['metrics']
+                        print(f"  Walk-forward ({len(wf['schedule'])} refits): CAGR {mo['CAGR']*100:.2f}% "
+                              f"vs in-sample {mi['CAGR']*100:.2f}% over the same window")
 
-                if strat_name == 'custom_weighted':
-                    strat_result = strategy_map[strat_name](
-                        opt_assets,
-                        weights_config=config.optimization.objective_weights,
-                        start_date_override=global_start_date
-                    )
-                else:
-                    strat_result = strategy_map[strat_name](opt_assets, start_date_override=global_start_date)
+    frontier = None
+    if config.optimization and config.optimization.efficient_frontier and not args.no_optimize:
+        opt_assets = [asset_map[t.upper()] for t in config.optimization.assets if t.upper() in asset_map]
+        if len(opt_assets) >= 2:
+            frontier = optimizer.efficient_frontier(opt_assets, start_date_override=global_start_date)
+        if frontier is not None:
+            frontier['portfolios'] = []
+            for item in portfolio_results:
+                if item['backtest'].get('strategy_config'):
+                    continue   # dynamic weights have no single point
+                alloc = {a['ticker'].upper(): w for a, w in
+                         zip(item['results']['assets'], item['results']['allocations'])}
+                point = optimizer.frontier_point(frontier, alloc)
+                if point is not None:
+                    frontier['portfolios'].append({'label': item['label'], 'vol': point[0], 'ret': point[1]})
 
-                alloc_str = " / ".join([
-                    f"{int(w*100)}% {a['ticker']}"
-                    for w, a in zip(strat_result['allocations'], opt_assets)
-                ])
-                print(f"  Result: {alloc_str}")
-
-                bt_res = backtester.run_backtest(
-                    opt_assets, strat_result['allocations'],
-                    config.simulation.initial_capital,
-                    start_date_override=global_start_date
-                )
-
-                portfolio_results.append({
-                    'label': strat_result['label'],
-                    'results': strat_result['results'],
-                    'backtest': bt_res
-                })
+    sweep_results = []
+    if config.sweeps:
+        print("\n" + "="*60)
+        print("PARAMETER SWEEPS")
+        print("="*60)
+        for sweep in config.sweeps:
+            missing = [t for t in sweep.allocations if t.upper() not in asset_map]
+            if missing:
+                print(f"  ⚠ Skipping sweep '{sweep.name}' - missing assets: {missing}")
+                continue
+            sweep_results.append(run_sweep(sweep, asset_map, sim_cfg, start=global_start_date,
+                                           end=global_end_date, benchmark=bench_asset))
 
     # Generate Report
     print("\n" + "="*60)
@@ -306,11 +357,26 @@ def main():
 
     output_path = Path(out_dir) / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{config.visualization.output_filename}"
 
+    for item in portfolio_results:
+        alloc = {a['ticker']: w for a, w in zip(item['results']['assets'], item['results']['allocations'])
+                 if w > 0.001}
+        try:
+            save_portfolio_csv(alloc, item['label'])
+        except OSError as e:
+            print(f"  ⚠ Could not save PV CSV for {item['label']}: {e}")
+
     visualizer.generate_html_report(
         portfolio_results,
         str(output_path),
         start_date=global_start_date.date(),
-        end_date=global_end_date
+        end_date=global_end_date.date(),
+        title=config.name,
+        assumptions=describe_assumptions(config, args),
+        synthetic=args.synthetic,
+        embed_plotlyjs=config.visualization.embed_plotlyjs or args.embed_plotlyjs,
+        sweeps=sweep_results,
+        walk_forward=walk_forward_results,
+        frontier=frontier,
     )
     print(f"✓ Report saved to: {output_path}")
 
