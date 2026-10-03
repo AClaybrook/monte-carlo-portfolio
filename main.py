@@ -14,6 +14,7 @@ from portfolio_simulator import PortfolioSimulator
 from portfolio_optimizer import PortfolioOptimizer
 from visualizations import PortfolioVisualizer
 from pv_compat import save_portfolio_csv
+from sweeps import run_sweep
 from backtester import Backtester
 
 
@@ -92,6 +93,8 @@ def collect_all_tickers(config) -> set:
 
     for p in config.portfolios:
         all_tickers.update([t.upper() for t in p.allocations.keys()])
+    for sw in config.sweeps:
+        all_tickers.update([t.upper() for t in sw.allocations.keys()])
 
     if config.optimization:
         all_tickers.update([t.upper() for t in config.optimization.assets])
@@ -299,6 +302,19 @@ def main():
                 portfolio_results.append(evaluate(opt['label'], opt_assets, opt['allocations'],
                                                   description='Optimized (in-sample)'))
 
+    sweep_results = []
+    if config.sweeps:
+        print("\n" + "="*60)
+        print("PARAMETER SWEEPS")
+        print("="*60)
+        for sweep in config.sweeps:
+            missing = [t for t in sweep.allocations if t.upper() not in asset_map]
+            if missing:
+                print(f"  ⚠ Skipping sweep '{sweep.name}' - missing assets: {missing}")
+                continue
+            sweep_results.append(run_sweep(sweep, asset_map, sim_cfg, start=global_start_date,
+                                           end=global_end_date, benchmark=bench_asset))
+
     # Generate Report
     print("\n" + "="*60)
     print("GENERATING REPORT")
@@ -326,6 +342,7 @@ def main():
         assumptions=describe_assumptions(config, args),
         synthetic=args.synthetic,
         embed_plotlyjs=config.visualization.embed_plotlyjs or args.embed_plotlyjs,
+        sweeps=sweep_results,
     )
     print(f"✓ Report saved to: {output_path}")
 

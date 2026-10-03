@@ -478,6 +478,72 @@ class PortfolioVisualizer:
                         [pct(alloc[t], 1) if t in alloc else '—' for t in tickers] + [links])
         return self._table(headers, rows, first_col_html=True, html_cols=(len(headers) - 1,))
 
+    def _sweep_figure(self, result):
+        from sweeps import SWEEP_METRICS, metric_grid
+        keys, values = result['keys'], result['values']
+        x = [str(v) for v in values[0]]
+        y = [str(v) for v in values[1]] if len(keys) == 2 else [result['strategy_type']]
+        fig = go.Figure()
+        for j, metric in enumerate(result['metrics']):
+            label, higher_better = SWEEP_METRICS[metric]
+            z = metric_grid(result, metric)
+            fmt = (lambda v: num(v)) if metric in ('Sharpe', 'Sortino') else (lambda v: pct(v, 1))
+            base = result['baseline'][metric]
+            span = np.nanmax(np.abs(z - base)) if np.isfinite(z).any() else 0
+            span = span if span > 0 else 1e-9
+            fig.add_trace(go.Heatmap(
+                z=z, x=x, y=y, meta=metric, visible=j == 0, zmid=base, zmin=base - span, zmax=base + span,
+                colorscale=self._diverging_scale(), reversescale=not higher_better, xgap=2, ygap=2,
+                text=[[fmt(v) for v in row] for row in z], texttemplate='%{text}',
+                customdata=[[fmt(base)] * len(x)] * len(y),
+                colorbar=dict(outlinewidth=0, thickness=10, tickfont=dict(color=self._chrome('muted')),
+                              tickformat='.2f' if metric in ('Sharpe', 'Sortino') else '.0%'),
+                hovertemplate=(f'{esc(keys[0])}=%{{x}}' + (f', {esc(keys[1])}=%{{y}}' if len(keys) == 2 else '')
+                               + f'<br>{esc(label)}: %{{text}} (baseline %{{customdata}})<extra></extra>')))
+        fig.update_layout(**self._layout(
+            height=max(220, 52 * len(y) + 110), hover='closest', legend=False,
+            xaxis=dict(self._layout()['xaxis'], title=dict(text=keys[0]), type='category', showgrid=False),
+            yaxis=dict(self._layout()['yaxis'], title=dict(text=keys[1] if len(keys) == 2 else ''),
+                       type='category', showgrid=False)))
+        return fig
+
+    def _sweep_table(self, result):
+        from sweeps import SWEEP_METRICS
+        metrics = result['metrics']
+        headers = result['keys'] + [SWEEP_METRICS[m][0] for m in metrics]
+
+        def fmt(m, v):
+            return num(v) if m in ('Sharpe', 'Sortino') else pct(v)
+
+        rows = [['No strategy (baseline)'] + [''] * (len(result['keys']) - 1) +
+                [fmt(m, result['baseline'][m]) for m in metrics]]
+        for c in sorted(result['cells'], key=lambda c: -c['metrics']['Sharpe']):
+            rows.append([str(c['params'][k]) for k in result['keys']] + [fmt(m, c['metrics'][m]) for m in metrics])
+        return self._table(headers, rows)
+
+    def _sweeps_section(self, sweeps, figs):
+        from sweeps import SWEEP_METRICS
+        parts = ['<h2>Strategy parameter sweeps</h2><p class="lede">Each cell is a full backtest with the '
+                 'run\'s contributions and rebalancing. Blue beats the same allocation without the strategy, '
+                 'red trails it. Cells are fit to this history: trust broad regions that work, not the single '
+                 'best cell.</p>']
+        for i, res in enumerate(sweeps):
+            fig_id = f'sweep{i}'
+            figs[fig_id] = self._sweep_figure(res)
+            opts = ''.join(f'<option value="{m}">{esc(SWEEP_METRICS[m][0])}</option>' for m in res['metrics'])
+            alloc = ' / '.join(f"{t} {w:.0%}" for t, w in res['allocations'].items())
+            b = res['baseline']
+            base_txt = (f"Without the strategy: CAGR {pct(b['CAGR'])}, Sharpe {num(b['Sharpe'])}, "
+                        f"max drawdown {pct(b['Max Drawdown'])}")
+            parts.append(
+                f'<h3>{esc(res["name"])}</h3><p class="caption">{esc(alloc)} · {esc(res["strategy_type"])} '
+                f'[{esc(res["apply_to"])}] · {esc(res["policy"])} · {esc(res["start"])} to {esc(res["end"])}<br>'
+                f'{esc(base_txt)}</p>'
+                f'<label class="select">Metric <select data-chart="{fig_id}">{opts}</select></label>'
+                f'<div class="chart" id="c-{fig_id}"></div>'
+                f'<details><summary>All cells, best Sharpe first</summary>{self._sweep_table(res)}</details>')
+        return ''.join(parts)
+
     def _events_section(self, items):
         blocks = []
         for i, it in enumerate(items):
@@ -501,7 +567,8 @@ class PortfolioVisualizer:
 
     def generate_html_report(self, portfolio_results, filename, start_date=None, end_date=None,
                              title: str = 'Portfolio Analysis', assumptions: Optional[Dict[str, str]] = None,
-                             synthetic: bool = False, embed_plotlyjs: bool = False):
+                             synthetic: bool = False, embed_plotlyjs: bool = False,
+                             sweeps: Optional[List[Dict]] = None):
         items = [it for it in portfolio_results if it.get('backtest') and it.get('results')]
         if not items:
             raise ValueError("No results to report")
@@ -597,6 +664,7 @@ class PortfolioVisualizer:
                 <h3>Median balance</h3>{chart('mcmedian')}
                 <h3>Annualized return distribution</h3>{chart('mcbox', 'Box = 25th–75th percentile, whiskers = 10th–90th, line = median.')}
                 <h3>Probability of loss</h3>{chart('mcloss', 'Share of paths whose balance is below the money invested so far.')}'''),
+            *([('sweeps', 'Sweeps', self._sweeps_section(sweeps, figs))] if sweeps else []),
             ('notes', 'Notes', f'''
                 <h2>Assumptions and methodology</h2>
                 <dl class="assumptions">{assumption_html}</dl>

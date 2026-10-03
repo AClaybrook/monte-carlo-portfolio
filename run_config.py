@@ -124,10 +124,20 @@ class OptimizationConfig:
     benchmark_ticker: str = 'VFINX'
     method: str = 'scipy'
     objective_weights: Dict[str, float] = field(default_factory=dict)
+    # Walk-forward check: refit every `test_years` on the previous `train_years`
+    # and trade those weights out of sample, to show how much of the in-sample
+    # result was hindsight.
+    walk_forward: bool = True
+    train_years: int = 3
+    test_years: int = 1
+    # Plot the mean-variance efficient frontier of these assets
+    efficient_frontier: bool = True
 
     def __post_init__(self):
         if len(self.assets) < 2:
             raise ValueError("Need at least 2 assets for optimization")
+        if self.train_years < 1 or self.test_years < 1:
+            raise ValueError("train_years and test_years must be at least 1")
 
 @dataclass
 class SimulationConfig:
@@ -239,6 +249,42 @@ class DatabaseConfig:
     save_results: bool = True
 
 @dataclass
+class SweepConfig:
+    """
+    Grid search over one or two strategy parameters on a fixed allocation.
+
+    Every cell is backtested with the run's cash flows and rebalancing and compared
+    with the same allocation without a strategy. The best cell is fit to this
+    history (in-sample), so prefer broad plateaus over a single bright cell.
+
+    Example:
+        SweepConfig(
+            name='TQQQ dip buyer',
+            allocations={'VOO': 0.8, 'TQQQ': 0.2},
+            strategy=StrategyConfig('buy_the_dip', {'target_ticker': 'TQQQ'}),
+            grid={'threshold': [0.1, 0.2, 0.3, 0.4], 'aggressive_weight': [0.4, 0.6, 0.8]},
+            simulations=500,   # optional Monte Carlo per cell
+        )
+    """
+    name: str
+    allocations: Dict[str, float]
+    strategy: StrategyConfig
+    grid: Dict[str, List[Any]]
+    rebalance: Optional[Union[RebalanceConfig, str]] = None   # None -> SimulationConfig.rebalance
+    simulations: int = 0       # >0 adds a Monte Carlo per cell (same seed for every cell)
+
+    def __post_init__(self):
+        self.rebalance = RebalanceConfig.coerce(self.rebalance)
+        if not 1 <= len(self.grid) <= 2:
+            raise ValueError(f"Sweep '{self.name}': grid must have 1 or 2 parameters")
+        if any(len(v) == 0 for v in self.grid.values()):
+            raise ValueError(f"Sweep '{self.name}': every grid parameter needs at least one value")
+        total = sum(self.allocations.values())
+        if abs(total - 1.0) > 0.01:
+            raise ValueError(f"Sweep '{self.name}': allocations must sum to 1.0, got {total}")
+
+
+@dataclass
 class RunConfig:
     name: str
     portfolios: List[PortfolioConfig]
@@ -250,6 +296,7 @@ class RunConfig:
     # Benchmark for relative metrics and the benchmark row; defaults to
     # optimization.benchmark_ticker when optimization is configured.
     benchmark_ticker: Optional[str] = None
+    sweeps: List[SweepConfig] = field(default_factory=list)
 
     def __post_init__(self):
         if self.benchmark_ticker is None and self.optimization:
@@ -259,6 +306,8 @@ class RunConfig:
             discovered_tickers.add(self.benchmark_ticker)
         for p in self.portfolios:
             discovered_tickers.update(p.allocations.keys())
+        for sw in self.sweeps:
+            discovered_tickers.update(sw.allocations.keys())
         if self.optimization:
             discovered_tickers.update(self.optimization.assets)
             discovered_tickers.add(self.optimization.benchmark_ticker)

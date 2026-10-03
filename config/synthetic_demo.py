@@ -6,7 +6,7 @@ well under a minute. With --synthetic the prices are generated, not real.
 """
 from run_config import (
     RunConfig, PortfolioConfig, SimulationConfig, OptimizationConfig,
-    VisualizationConfig, StrategyConfig
+    VisualizationConfig, StrategyConfig, SweepConfig
 )
 
 config = RunConfig(
@@ -37,5 +37,16 @@ config = RunConfig(
         active_strategies=['max_sharpe', 'min_volatility'],
         benchmark_ticker='VOO',
     ),
+    sweeps=[
+        SweepConfig(
+            name='Drawdown protection thresholds',
+            allocations={'VOO': 0.8, 'BND': 0.2},
+            strategy=StrategyConfig('drawdown_protection', apply_to='rebalance', check_frequency='daily',
+                                    params={'risk_off_allocation': {'BND': 1.0}}),
+            grid={'threshold': [0.08, 0.12, 0.16, 0.20, 0.25],
+                  'recovery_threshold': [0.0, 0.03, 0.06]},
+            simulations=300,
+        ),
+    ],
     visualization=VisualizationConfig(output_filename='synthetic_demo.html'),
 )

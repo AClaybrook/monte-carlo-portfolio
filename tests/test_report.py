@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 CONFIG = '''
-from run_config import RunConfig, PortfolioConfig, SimulationConfig, OptimizationConfig, StrategyConfig
+from run_config import RunConfig, PortfolioConfig, SimulationConfig, OptimizationConfig, StrategyConfig, SweepConfig
 config = RunConfig(
     name="Smoke <Test>",
     portfolios=[
@@ -29,6 +29,9 @@ config = RunConfig(
                                 contribution_amount=250, contribution_frequency='monthly'),
     optimization=OptimizationConfig(assets=['VOO', 'BND'], active_strategies=['min_volatility'],
                                     benchmark_ticker='VOO'),
+    sweeps=[SweepConfig('Dip grid', {'VOO': 0.7, 'QQQ': 0.3},
+                        StrategyConfig('buy_the_dip', {'target_ticker': 'QQQ'}),
+                        grid={'threshold': [0.1, 0.2], 'aggressive_weight': [0.5, 0.8]})],
 )
 '''
 
@@ -46,13 +49,13 @@ def test_main_synthetic_report(tmp_path):
         assert '<title>Smoke &lt;Test&gt;</title>' in page          # names are escaped
         assert 'Synthetic data.' in page
         for section in ('summary', 'growth', 'returns', 'drawdowns', 'risk', 'allocation',
-                        'montecarlo', 'notes'):
+                        'montecarlo', 'sweeps', 'notes'):
             assert f'<section id="{section}">' in page
         for label in ('Benchmark (VOO)', '60/40', 'Thirds', 'Protected', 'Min Volatility'):
             assert label in page
         assert 'signal rebalances' in page
         figs = json.loads(re.search(r'const FIGS = (\{.*?\});\nconst CMAP', page, re.S).group(1))
-        assert {'c-growth', 'c-mcfan', 'c-corr', 'c-allocation'} <= set(figs)
+        assert {'c-growth', 'c-mcfan', 'c-corr', 'c-allocation', 'c-sweep0'} <= set(figs)
         # Every PV backtest link has whole-percent weights summing to exactly 100
         urls = re.findall(r'href="(https://www.portfoliovisualizer.com/backtest-portfolio[^"]+)"', page)
         assert len(urls) == 5
