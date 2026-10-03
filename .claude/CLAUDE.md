@@ -75,6 +75,7 @@ python -m pytest tests -q
 
 - Yahoo rate-limits large requests (worse on WSL). `bulk_download` splits work into `bulk_batch_size` tickers × `max_chunk_years` date chunks with `chunk_pause_seconds` pauses; per-ticker downloads are chunked too.
 - yfinance must NOT be given a `requests.Session` (yfinance >= 0.2.58 requires its own curl_cffi session).
+- Gaps with no weekdays are never requested for exchange-traded tickers (crypto `-USD` trades weekends). Empty answers are not retried; short empty windows in the settled past (holidays) are remembered as checked. Tickers missing the same ranges share one batched request.
 - Failed intervals have a 1-hour in-memory cooldown. `db_scripts/repair_metadata.py` fixes interval metadata drift.
 - For reproducible comparisons, set an explicit `end_date` that your cache covers (`python data_utils.py coverage`).
 
