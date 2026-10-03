@@ -3,6 +3,8 @@ Portfolio optimization using SciPy (SLSQP with multi-start).
 """
 import numpy as np
 import scipy.optimize as sco
+
+import quant_analytics as qa
 from portfolio_simulator import PortfolioSimulator
 
 class PortfolioOptimizer:
@@ -10,8 +12,7 @@ class PortfolioOptimizer:
         self.simulator = simulator
         self.data_manager = data_manager
         self._data_cache = {}  # Cache for aligned returns/covariance
-        # Use fewer simulations during optimization for speed (full sim done later for final results)
-        self._optimization_sims = min(1000, simulator.simulations)
+        self.periods_per_year = 252.0
 
     def _get_data(self, assets, start_date_override=None):
         """
@@ -21,7 +22,9 @@ class PortfolioOptimizer:
         # Check cache first
         cache_key = (tuple(a['ticker'] for a in assets), start_date_override)
         if cache_key in self._data_cache:
-            return self._data_cache[cache_key]
+            cached = self._data_cache[cache_key]
+            self.periods_per_year = qa.infer_periods_per_year(cached[0].index)
+            return cached
 
         try:
             # Note: _prepare_multivariate_data already returns daily returns, NOT prices
@@ -41,6 +44,8 @@ class PortfolioOptimizer:
              print(f"Optimization Skipped: Data still contains NaNs or Infinite values after cleaning.")
              return None, None, None
 
+        # Objectives annualize with the observed calendar (365 for crypto-only sets)
+        self.periods_per_year = qa.infer_periods_per_year(returns.index)
         result = (returns, returns.mean(), returns.cov())
         self._data_cache[cache_key] = result
         return result
@@ -92,21 +97,10 @@ class PortfolioOptimizer:
             return self._package_fail(assets, label, str(e))
 
     def _package_fail(self, assets, label, reason):
-        """Return a safe 'failed' result so the script continues"""
+        """Equal weights, labelled as failed, so the run continues."""
         num = len(assets)
-        alloc = np.array([1/num]*num)
-        # Use reduced simulations for speed
-        original_sims = self.simulator.simulations
-        self.simulator.simulations = self._optimization_sims
-        sim_results = self.simulator.simulate_portfolio(assets, alloc)
-        self.simulator.simulations = original_sims
-        return {
-            'label': f"{label} (FAILED: {reason})",
-            'score': 0,
-            'allocations': alloc,
-            'stats': sim_results['stats'],
-            'results': sim_results
-        }
+        return {'label': f"{label} (FAILED: {reason})", 'score': 0,
+                'allocations': np.full(num, 1 / num)}
 
     def optimize_sharpe_ratio(self, assets, risk_free_rate=0.04, start_date_override=None):
         """Maximize Sharpe Ratio"""
@@ -115,8 +109,8 @@ class PortfolioOptimizer:
         if returns is None: return self._package_fail(assets, "Max Sharpe", "No Data")
 
         def neg_sharpe(weights, mean_rets, cov_mat, rf):
-            p_ret = np.sum(mean_rets * weights) * 252
-            p_vol = np.sqrt(np.dot(weights.T, np.dot(cov_mat, weights))) * np.sqrt(252)
+            p_ret = np.sum(mean_rets * weights) * self.periods_per_year
+            p_vol = np.sqrt(np.dot(weights.T, np.dot(cov_mat, weights))) * np.sqrt(self.periods_per_year)
             if p_vol == 0: return 0
             return - (p_ret - rf) / p_vol
 
@@ -130,7 +124,7 @@ class PortfolioOptimizer:
         if returns is None: return self._package_fail(assets, "Min Volatility", "No Data")
 
         def port_vol(weights, cov_mat):
-            return np.sqrt(np.dot(weights.T, np.dot(cov_mat, weights))) * np.sqrt(252)
+            return np.sqrt(np.dot(weights.T, np.dot(cov_mat, weights))) * np.sqrt(self.periods_per_year)
 
         return self._minimize(port_vol, assets, args=(cov_mat,), label="Min Volatility")
 
@@ -142,7 +136,7 @@ class PortfolioOptimizer:
 
         def neg_sortino(weights, returns, rf):
             p_daily_rets = returns.dot(weights)
-            ann_ret = np.mean(p_daily_rets) * 252
+            ann_ret = np.mean(p_daily_rets) * self.periods_per_year
             downside = p_daily_rets[p_daily_rets < 0]
 
             # Need enough downside days for meaningful calculation
@@ -151,7 +145,7 @@ class PortfolioOptimizer:
                 # Can't calculate meaningful Sortino
                 return 100  # Return LARGE positive = bad score for minimizer
 
-            downside_std = np.std(downside) * np.sqrt(252)
+            downside_std = np.std(downside) * np.sqrt(self.periods_per_year)
             if downside_std < 0.001:
                 # Near-zero downside vol means we can't trust Sortino
                 return 100
@@ -196,13 +190,13 @@ class PortfolioOptimizer:
 
         # Pre-compute baseline metrics for normalization
         equal_w = np.ones(len(assets)) / len(assets)
-        baseline_ret = np.sum(mean_rets * equal_w) * 252
-        baseline_vol = np.sqrt(np.dot(equal_w.T, np.dot(cov_mat, equal_w))) * np.sqrt(252)
+        baseline_ret = np.sum(mean_rets * equal_w) * self.periods_per_year
+        baseline_vol = np.sqrt(np.dot(equal_w.T, np.dot(cov_mat, equal_w))) * np.sqrt(self.periods_per_year)
 
         def custom_objective(w, returns, mean_rets, cov_mat, rf, obj_weights, baseline_ret, baseline_vol):
             # Calculate metrics
-            p_ret = np.sum(mean_rets * w) * 252
-            p_vol = np.sqrt(np.dot(w.T, np.dot(cov_mat, w))) * np.sqrt(252)
+            p_ret = np.sum(mean_rets * w) * self.periods_per_year
+            p_vol = np.sqrt(np.dot(w.T, np.dot(cov_mat, w))) * np.sqrt(self.periods_per_year)
 
             if p_vol < 1e-6:
                 p_vol = 1e-6
@@ -250,7 +244,7 @@ class PortfolioOptimizer:
                 if 'sortino' in obj_weights and obj_weights['sortino'] > 0:
                     downside = p_daily[p_daily < 0]
                     if len(downside) > 0:
-                        downside_std = np.std(downside) * np.sqrt(252)
+                        downside_std = np.std(downside) * np.sqrt(self.periods_per_year)
                         sortino = (p_ret - rf) / downside_std if downside_std > 0 else 0
                     else:
                         sortino = 5.0  # Very good
@@ -266,28 +260,13 @@ class PortfolioOptimizer:
         )
 
     def _package_result(self, scipy_result, assets, label):
-        """Package results and run a fast simulation check (reduced sims for speed)"""
+        """Normalize weights and drop dust. Callers simulate/backtest the final weights."""
         allocations = scipy_result.x / np.sum(scipy_result.x)
-
-        # Clean tiny allocations
         allocations[allocations < 0.001] = 0
         allocations = allocations / np.sum(allocations)
-
-        # Use reduced simulations for optimization phase (full sim done in main.py)
-        original_sims = self.simulator.simulations
-        self.simulator.simulations = self._optimization_sims
-        sim_results = self.simulator.simulate_portfolio(assets, allocations)
-        self.simulator.simulations = original_sims
-
-        # Print allocation
-        alloc_str = " | ".join([f"{a['ticker']}: {w*100:.1f}%"
-                                for a, w in zip(assets, allocations) if w > 0.001])
+        alloc_str = " | ".join(f"{a['ticker']}: {w*100:.1f}%"
+                               for a, w in zip(assets, allocations) if w > 0.001)
         print(f"  → {label}: {alloc_str}")
-
-        return {
-            'label': label,
-            'score': -scipy_result.fun if scipy_result.success else 0,
-            'allocations': allocations,
-            'stats': sim_results['stats'],
-            'results': sim_results
-        }
+        return {'label': label,
+                'score': -scipy_result.fun if scipy_result.success else 0,
+                'allocations': allocations}

@@ -3,7 +3,38 @@ Configuration system - Updated with Strategy Support.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Literal, Any
+from typing import List, Dict, Optional, Literal, Any, Union
+
+CALENDAR_FREQUENCIES = ('daily', 'weekly', 'monthly', 'quarterly', 'annual')
+
+
+@dataclass
+class RebalanceConfig:
+    """
+    When holdings are traded back to target weights.
+
+    frequency: 'none' (buy and hold), 'daily', 'weekly', 'monthly', 'quarterly', 'annual'.
+        Historical runs rebalance on the first trading day of each new period.
+    threshold: Optional absolute drift band, e.g. 0.05 trades whenever any
+        asset's weight is more than 5 percentage points from its target.
+        Works alone (frequency='none') or alongside a calendar.
+    transaction_cost_bps: Cost charged on traded dollars (one-way), in basis points.
+    """
+    frequency: Literal['none', 'daily', 'weekly', 'monthly', 'quarterly', 'annual'] = 'annual'
+    threshold: Optional[float] = None
+    transaction_cost_bps: float = 0.0
+
+    def __post_init__(self):
+        if self.frequency not in ('none',) + CALENDAR_FREQUENCIES:
+            raise ValueError(f"Unknown rebalance frequency: {self.frequency}")
+        if self.threshold is not None and not 0 < self.threshold < 1:
+            raise ValueError("rebalance threshold must be between 0 and 1")
+
+    @staticmethod
+    def coerce(value: Union['RebalanceConfig', str, None]) -> Optional['RebalanceConfig']:
+        if value is None or isinstance(value, RebalanceConfig):
+            return value
+        return RebalanceConfig(frequency=value)
 
 @dataclass
 class AssetConfig:
@@ -39,28 +70,48 @@ class StrategyConfig:
         type='momentum',
         params={'tilt_strength': 0.5, 'min_weight': 0.05}
     )
+
+    # Conditional rebalancing: move holdings to bonds in a 15% drawdown
+    StrategyConfig(
+        type='drawdown_protection', apply_to='rebalance', check_frequency='daily',
+        params={'threshold': 0.15, 'recovery_threshold': 0.05,
+                'risk_off_allocation': {'VOO': 0.3, 'BND': 0.7}}
+    )
+
+    apply_to: what the strategy's weights steer.
+        'contributions' - only new cash is split by the strategy (default)
+        'rebalance'     - holdings are traded to the strategy's target whenever it
+                          changes (checked every check_frequency) and on calendar
+                          rebalance dates; contributions use base weights
+        'both'          - both of the above
+    check_frequency: how often the strategy is evaluated for 'rebalance'/'both'.
     """
     type: str  # Strategy type from registry
     params: Dict[str, Any] = field(default_factory=dict)
     name: Optional[str] = None  # Override auto-generated name
+    apply_to: Literal['contributions', 'rebalance', 'both'] = 'contributions'
+    check_frequency: Literal['daily', 'weekly', 'monthly', 'quarterly', 'annual'] = 'monthly'
 
     def __post_init__(self):
-        valid_types = [
-            'static', 'buy_the_dip', 'momentum', 'volatility_target',
-            'drawdown_protection', 'relative_value', 'crypto_opportunistic',
-            'dual_momentum'
-        ]
-        if self.type not in valid_types:
-            raise ValueError(f"Unknown strategy type: {self.type}. Valid: {valid_types}")
+        from strategies import STRATEGY_BUILDERS
+        if self.type not in STRATEGY_BUILDERS:
+            raise ValueError(f"Unknown strategy type: {self.type}. Valid: {sorted(STRATEGY_BUILDERS)}")
+        if self.apply_to not in ('contributions', 'rebalance', 'both'):
+            raise ValueError(f"Unknown apply_to: {self.apply_to}")
+        if self.check_frequency not in CALENDAR_FREQUENCIES:
+            raise ValueError(f"Unknown check_frequency: {self.check_frequency}")
 
 @dataclass
 class PortfolioConfig:
     name: str
     allocations: Dict[str, float]
     description: Optional[str] = None
-    strategy: Optional[StrategyConfig] = None  # NEW: Optional strategy
+    strategy: Optional[StrategyConfig] = None
+    # None -> SimulationConfig.rebalance. Accepts a RebalanceConfig or a frequency string.
+    rebalance: Optional[Union[RebalanceConfig, str]] = None
 
     def __post_init__(self):
+        self.rebalance = RebalanceConfig.coerce(self.rebalance)
         total = sum(self.allocations.values())
         if abs(total - 1.0) > 0.01:
             raise ValueError(f"Allocations must sum to 1.0, got {total}")
@@ -101,7 +152,15 @@ class SimulationConfig:
     initial_capital: float = 100000
     years: int = 10
     simulations: int = 10000
-    method: Literal['bootstrap', 'geometric_brownian', 'parametric'] = 'bootstrap'
+    # bootstrap: i.i.d. resampled historical days
+    # block_bootstrap: resampled runs of `block_size` consecutive days (keeps
+    #   trends, volatility clustering and drawdown shapes that strategies react to)
+    # geometric_brownian: multivariate lognormal fitted to historical log returns
+    # parametric: multivariate normal fitted to historical simple returns
+    method: Literal['bootstrap', 'block_bootstrap', 'geometric_brownian', 'parametric'] = 'bootstrap'
+    block_size: int = 21
+    seed: Optional[int] = None
+    inflation_rate: float = 0.0       # >0 reports Monte Carlo results in today's dollars
 
     # Date range options
     start_date: Optional[str] = None  # Format: 'YYYY-MM-DD'
@@ -109,10 +168,22 @@ class SimulationConfig:
     lookback_years: int = 10          # Used if start_date not specified
 
     contribution_amount: float = 0.0
-    contribution_frequency: int = 21  # trading days (~monthly)
+    # int = every N trading days, or 'monthly' / 'quarterly' / 'annual'
+    contribution_frequency: Union[int, str] = 21
+
+    # Default rebalancing for portfolios that do not set their own (PV default: annual)
+    rebalance: Union[RebalanceConfig, str] = field(default_factory=RebalanceConfig)
+    risk_free_rate: float = 0.02      # Annual, used for Sharpe/Sortino/alpha
 
     def __post_init__(self):
         from datetime import date as dt_date
+
+        self.rebalance = RebalanceConfig.coerce(self.rebalance)
+        if isinstance(self.contribution_frequency, str) and \
+                self.contribution_frequency not in CALENDAR_FREQUENCIES:
+            raise ValueError(f"Unknown contribution_frequency: {self.contribution_frequency}")
+        if self.method not in ('bootstrap', 'block_bootstrap', 'geometric_brownian', 'parametric'):
+            raise ValueError(f"Unknown simulation method: {self.method}")
 
         # Validate dates if provided
         if self.start_date:
@@ -175,9 +246,16 @@ class RunConfig:
     optimization: Optional[OptimizationConfig] = None
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    # Benchmark for relative metrics and the benchmark row; defaults to
+    # optimization.benchmark_ticker when optimization is configured.
+    benchmark_ticker: Optional[str] = None
 
     def __post_init__(self):
+        if self.benchmark_ticker is None and self.optimization:
+            self.benchmark_ticker = self.optimization.benchmark_ticker
         discovered_tickers = set()
+        if self.benchmark_ticker:
+            discovered_tickers.add(self.benchmark_ticker)
         for p in self.portfolios:
             discovered_tickers.update(p.allocations.keys())
         if self.optimization:
@@ -218,70 +296,6 @@ def load_config_from_file(filepath: str) -> RunConfig:
 
 
 def create_strategy_from_config(strategy_config: StrategyConfig):
-    """
-    Factory function to create strategy instances from StrategyConfig.
-    """
-    from strategies import (
-        StaticAllocationStrategy, BuyTheDipStrategy, MomentumStrategy,
-        VolatilityTargetStrategy, DrawdownProtectionStrategy, RelativeValueStrategy,
-        create_crypto_opportunistic_strategy, create_dual_momentum_strategy
-    )
-
-    params = strategy_config.params
-
-    if strategy_config.type == 'static':
-        return StaticAllocationStrategy()
-
-    elif strategy_config.type == 'buy_the_dip':
-        return BuyTheDipStrategy(
-            target_ticker=params.get('target_ticker', 'VOO'),
-            threshold=params.get('threshold', 0.10),
-            aggressive_weight=params.get('aggressive_weight', 0.80)
-        )
-
-    elif strategy_config.type == 'momentum':
-        return MomentumStrategy(
-            momentum_lookback=params.get('lookback', 63),
-            tilt_strength=params.get('tilt_strength', 0.5),
-            min_weight=params.get('min_weight', 0.05)
-        )
-
-    elif strategy_config.type == 'volatility_target':
-        return VolatilityTargetStrategy(
-            target_vol=params.get('target_vol', 0.15),
-            vol_lookback=params.get('lookback', 21),
-            equity_tickers=params.get('equity_tickers', []),
-            safe_ticker=params.get('safe_ticker', 'BND')
-        )
-
-    elif strategy_config.type == 'drawdown_protection':
-        return DrawdownProtectionStrategy(
-            dd_threshold=params.get('threshold', 0.15),
-            risk_off_allocation=params.get('risk_off_allocation', {}),
-            recovery_threshold=params.get('recovery_threshold', 0.05)
-        )
-
-    elif strategy_config.type == 'relative_value':
-        return RelativeValueStrategy(
-            rebalance_threshold=params.get('threshold', 0.10),
-            max_tilt=params.get('max_tilt', 0.50)
-        )
-
-    elif strategy_config.type == 'crypto_opportunistic':
-        return create_crypto_opportunistic_strategy(
-            crypto_ticker=params.get('crypto_ticker', 'BTC-USD'),
-            equity_ticker=params.get('equity_ticker', 'VOO'),
-            crypto_dip_threshold=params.get('dip_threshold', 0.25),
-            normal_crypto_weight=params.get('normal_weight', 0.10),
-            dip_crypto_weight=params.get('dip_weight', 0.40)
-        )
-
-    elif strategy_config.type == 'dual_momentum':
-        return create_dual_momentum_strategy(
-            equity_ticker=params.get('equity_ticker', 'VOO'),
-            safe_ticker=params.get('safe_ticker', 'BND'),
-            lookback=params.get('lookback', 126)
-        )
-
-    else:
-        raise ValueError(f"Unknown strategy type: {strategy_config.type}")
+    """Build the AllocationStrategy described by a StrategyConfig."""
+    from strategies import create_strategy
+    return create_strategy(strategy_config.type, strategy_config.params, strategy_config.name)

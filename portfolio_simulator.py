@@ -1,12 +1,16 @@
 """
-Monte Carlo portfolio simulation engine.
-UPDATED: Enhanced strategy support with rich MarketContext.
-UPDATED: Added define_asset_from_dataframe for bulk data loading.
+Monte Carlo simulator: runs the shared engine over many simulated return paths.
 """
+from datetime import date, timedelta
+
 import numpy as np
-import pandas as pd
-from datetime import datetime, timedelta, date
-from strategies import StaticAllocationStrategy, MarketContext
+
+import quant_analytics as qa
+from engine import (SimulatedReturns, aligned_returns, contribution_schedule,
+                    run_engine, simulated_schedule, vectorized_irr)
+from run_config import RebalanceConfig
+
+PERCENTILES = (10, 25, 50, 75, 90)
 
 
 class PortfolioSimulator:
@@ -16,380 +20,159 @@ class PortfolioSimulator:
         self.initial_capital = sim_config.initial_capital
         self.simulations = sim_config.simulations
         self.years = sim_config.years
-        self.trading_days = 252 * sim_config.years
-
-        # DCA Config
         self.contrib_amount = getattr(sim_config, 'contribution_amount', 0.0)
         self.contrib_freq = getattr(sim_config, 'contribution_frequency', 21)
 
-        if hasattr(sim_config, 'end_date') and sim_config.end_date:
+        if getattr(sim_config, 'end_date', None):
             self.end_date = date.fromisoformat(sim_config.end_date)
         else:
             self.end_date = date.today()
 
+    def _rng(self) -> np.random.Generator:
+        seed = getattr(self.config, 'seed', None)
+        if seed is None:
+            # Draw from the legacy global RNG so np.random.seed() still makes runs reproducible
+            seed = np.random.randint(0, 2 ** 31 - 1)
+        return np.random.default_rng(seed)
+
     def define_asset_from_ticker(self, ticker, name=None, lookback_years=None):
-        """Original method - fetches data per ticker (can cause rate limiting)."""
-        if name is None: name = ticker
-        if lookback_years is None: lookback_years = self.config.lookback_years
-
-        end_date = self.end_date
-        start_date = end_date - timedelta(days=365*lookback_years)
-
-        df = self.data_manager.get_data(ticker, start_date, end_date)
-        returns = df['Adj Close'].pct_change().dropna()
-
-        return {
-            'ticker': ticker, 'name': name,
-            'historical_returns': returns, 'full_data': df,
-            'daily_mean': returns.mean(), 'daily_std': returns.std()
-        }
+        lookback_years = lookback_years or self.config.lookback_years
+        start = self.end_date - timedelta(days=365 * lookback_years)
+        df = self.data_manager.get_data(ticker, start, self.end_date)
+        return self.define_asset_from_dataframe(ticker, name or ticker, df)
 
     def define_asset_from_dataframe(self, ticker, name, df):
-        """
-        Build an asset dict from a pre-fetched DataFrame.
-        Use this with DataManager.get_data_bulk() to avoid per-ticker requests.
-
-        Args:
-            ticker: Stock ticker symbol
-            name: Display name for the asset
-            df: DataFrame with 'Adj Close' column and DatetimeIndex
-
-        Returns:
-            Asset dict compatible with simulate_portfolio()
-        """
         if df is None or df.empty:
             raise ValueError(f"No data provided for {ticker}")
-
-        # Use 'Adj Close' for returns calculation (matching define_asset_from_ticker)
-        if 'Adj Close' in df.columns:
-            prices = df['Adj Close']
-        elif 'Close' in df.columns:
-            prices = df['Close']
-        else:
-            raise ValueError(f"No price column found for {ticker}")
-
-        # Calculate daily returns
-        returns = prices.pct_change().dropna()
-
-        # Build asset dict matching define_asset_from_ticker structure
-        return {
-            'ticker': ticker,
-            'name': name,
-            'historical_returns': returns,
-            'full_data': df,
-            'daily_mean': returns.mean(),
-            'daily_std': returns.std()
-        }
+        col = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
+        returns = df[col].pct_change().dropna()
+        return {'ticker': ticker, 'name': name, 'historical_returns': returns, 'full_data': df,
+                'daily_mean': returns.mean(), 'daily_std': returns.std()}
 
     def _prepare_multivariate_data(self, assets, start_date_override=None):
-        dfs = []
-        for asset in assets:
-            s = asset['historical_returns']
-            if start_date_override:
-                s = s[s.index >= start_date_override]
-            s.name = asset['ticker']
-            dfs.append(s)
+        """Daily returns on common dates, computed from aligned prices."""
+        aligned = aligned_returns(assets, start_date_override).dropna()
+        if len(aligned) < 20:
+            raise ValueError(f"Insufficient common history ({len(aligned)} days).")
+        return aligned
 
-        aligned_df = pd.concat(dfs, axis=1, join='inner').dropna()
-        if len(aligned_df) < 20:
-             raise ValueError(f"Insufficient common history ({len(aligned_df)} days).")
-        return aligned_df
-
-    def simulate_portfolio(self, assets, allocations, method=None, start_date_override=None, strategy=None):
+    def simulate_portfolio(self, assets, allocations, method=None, start_date_override=None,
+                           strategy=None, rebalance=None, apply_to='contributions',
+                           check_frequency='monthly'):
         """
-        Main entry point. Switches between fast Vectorized (Lump Sum)
-        and Time-Stepped (DCA/Dynamic) automatically.
+        Simulate `years` forward from resampled/fitted history of the assets.
+
+        rebalance: RebalanceConfig or frequency string; None = buy and hold.
+        Simulated years have as many days as the history's observed rows/year
+        (252 for exchange-traded mixes, 365 for crypto-only portfolios).
         """
-        if method is None: method = self.config.method
+        method = method or self.config.method
+        rebalance = RebalanceConfig.coerce(rebalance) or RebalanceConfig(frequency='none')
+        hist = self._prepare_multivariate_data(assets, start_date_override)
+        tickers = [a['ticker'] for a in assets]
 
-        aligned_returns_df = self._prepare_multivariate_data(assets, start_date_override)
-        weights = np.array(allocations)
+        dpy = int(round(qa.infer_periods_per_year(hist.index)))
+        n_days = self.years * dpy
+        inflation = getattr(self.config, 'inflation_rate', 0.0) or 0.0
+        source = SimulatedReturns(
+            hist.values, method, self.simulations, self._rng(),
+            block_size=getattr(self.config, 'block_size', 21),
+            inflation_per_day=(1 + inflation) ** (1 / dpy) - 1,
+        )
+        contrib_days = (contribution_schedule(self.contrib_freq, n_days, days_per_year=dpy)
+                        if self.contrib_amount > 0 else np.zeros(n_days, dtype=bool))
+        record_steps = np.unique(np.round(np.linspace(0, n_days, self.years * 12 + 1)).astype(int))
 
-        # Use Time-Step if there is a contribution OR a custom strategy
-        use_time_step = (self.contrib_amount > 0) or (strategy is not None)
+        res = run_engine(
+            source, n_days, allocations, tickers, self.initial_capital,
+            contribution_amount=self.contrib_amount,
+            contribution_days=contrib_days,
+            rebalance_days=simulated_schedule(n_days, rebalance.frequency, dpy),
+            rebalance_threshold=rebalance.threshold,
+            transaction_cost_bps=rebalance.transaction_cost_bps,
+            strategy=strategy, apply_to=apply_to,
+            check_days=simulated_schedule(n_days, check_frequency, dpy) if strategy else None,
+            periods_per_year=dpy, record_steps=record_steps,
+        )
 
-        if not use_time_step:
-            return self._simulate_fast_vectorized(aligned_returns_df, weights, method, assets)
+        final_values = res.values[:, -1]
+        twr_final = np.maximum(res.twr[:, -1], 1e-12)
+        cagr = twr_final ** (1 / self.years) - 1
+        total_invested = self.initial_capital + self.contrib_amount * len(res.contribution_steps)
+        if self.contrib_amount > 0:
+            irr = vectorized_irr(self.initial_capital, self.contrib_amount,
+                                 res.contribution_steps / dpy, final_values, self.years)
         else:
-            if strategy is None:
-                strategy = StaticAllocationStrategy()
-            return self._simulate_time_stepped(aligned_returns_df, weights, method, assets, strategy)
+            irr = cagr
 
-    def _simulate_fast_vectorized(self, aligned_returns_df, weights, method, assets):
-        """
-        Optimized vectorized Monte Carlo simulation.
-        - Uses float32 for 2x memory efficiency
-        - Single-pass drawdown calculation
-        - Minimized intermediate allocations
-        """
-        # Use float32 for speed (less memory bandwidth)
-        historical_returns = aligned_returns_df.values.astype(np.float32)
-        weights_f32 = weights.astype(np.float32)
-        n_assets = len(assets)
-        n_days = self.trading_days
-        n_sims = self.simulations
-
-        # Pre-compute for GBM/parametric
-        if method in ['geometric_brownian', 'parametric']:
-            mean_returns = np.mean(historical_returns, axis=0).astype(np.float32)
-            cov_matrix = np.atleast_2d(np.cov(historical_returns, rowvar=False)).astype(np.float32)
-            try:
-                L = np.linalg.cholesky(cov_matrix).astype(np.float32)
-            except np.linalg.LinAlgError:
-                U, S, V = np.linalg.svd(cov_matrix)
-                L = (U @ np.sqrt(np.diag(S))).astype(np.float32)
-            variances = np.diag(cov_matrix)
-            mean_returns = np.atleast_1d(mean_returns)
-            drift = (mean_returns - 0.5 * variances).astype(np.float32)
-
-        # Allocate output arrays upfront
-        portfolio_values = np.empty((n_sims, n_days + 1), dtype=np.float32)
-        portfolio_values[:, 0] = self.initial_capital
-        max_drawdowns = np.empty(n_sims, dtype=np.float32)
-
-        # Process in batches to manage memory
-        BATCH_SIZE = min(2000, n_sims)  # Larger batches = less overhead
-
-        for batch_start in range(0, n_sims, BATCH_SIZE):
-            batch_end = min(batch_start + BATCH_SIZE, n_sims)
-            batch_size = batch_end - batch_start
-
-            # Generate returns
-            if method == 'bootstrap':
-                # Vectorized bootstrap - sample and weight in one go
-                indices = np.random.randint(0, len(historical_returns), (batch_size, n_days))
-                sampled = historical_returns[indices]  # (batch, days, assets)
-                portfolio_returns = sampled @ weights_f32  # (batch, days)
-            else:
-                # GBM: generate correlated returns
-                uncorrelated = np.random.standard_normal((batch_size, n_days, n_assets)).astype(np.float32)
-                correlated = uncorrelated @ L.T  # (batch, days, assets)
-                daily_returns = drift + correlated
-                if method == 'geometric_brownian':
-                    daily_returns = np.exp(daily_returns) - 1
-                portfolio_returns = daily_returns @ weights_f32
-
-            # Cumulative product - use float64 to prevent overflow with long simulations
-            # (30 years = 7560 days, high-growth assets can overflow float32)
-            portfolio_returns_f64 = (1 + portfolio_returns).astype(np.float64)
-            np.cumprod(portfolio_returns_f64, axis=1, out=portfolio_returns_f64)
-            portfolio_values[batch_start:batch_end, 1:] = (portfolio_returns_f64 * self.initial_capital).astype(np.float32)
-
-            # Single-pass max drawdown calculation
-            batch_values = portfolio_values[batch_start:batch_end]
-            running_max = np.maximum.accumulate(batch_values, axis=1)
-            # Avoid division - use multiplication by reciprocal
-            np.divide(batch_values - running_max, running_max, out=running_max,
-                     where=running_max > 0)
-            max_drawdowns[batch_start:batch_end] = np.min(running_max, axis=1)
-
-        # Final calculations
-        final_values = portfolio_values[:, -1].astype(np.float64)  # Back to float64 for precision
-        cagr = (final_values / self.initial_capital) ** (1.0 / self.years) - 1.0
-
-        return {
-            'portfolio_values': portfolio_values,
+        record_years = record_steps / dpy
+        out = {
+            'portfolio_values': res.values,
+            'twr_paths': res.twr,
+            'record_years': record_years,
             'final_values': final_values,
             'cagr': cagr,
-            'max_drawdowns': max_drawdowns.astype(np.float64),
+            'irr': irr,
+            'max_drawdowns': res.max_drawdown,
+            'volatility': res.volatility,
             'assets': assets,
-            'allocations': list(weights),
-            'probabilities': self._calculate_probabilities(portfolio_values),
-            'stats': self.calculate_statistics(final_values, cagr, max_drawdowns)
+            'allocations': list(np.asarray(allocations, dtype=float)),
+            'strategy': strategy.name if strategy else None,
+            'strategy_config': strategy.get_config_summary() if strategy else None,
+            'method': method,
+            'days_per_year': dpy,
+            'total_invested': total_invested,
+            'real_dollars': inflation > 0,
+            'history_start': hist.index[0].date(),
+            'history_end': hist.index[-1].date(),
         }
+        out['probabilities'] = self._calculate_probabilities(res, contrib_days, dpy)
+        out['stats'] = self.calculate_statistics(final_values, cagr, res.max_drawdown,
+                                                 irr=irr, volatility=res.volatility,
+                                                 total_invested=total_invested)
+        return out
 
-    def _simulate_time_stepped(self, aligned_returns_df, base_weights, method, assets, strategy):
-        """
-        Enhanced time-stepped engine with rich MarketContext for strategies.
-        """
-        mean_returns = aligned_returns_df.mean().values
-        cov_matrix = aligned_returns_df.cov().values
-        n_assets = len(assets)
-        asset_tickers = [a['ticker'] for a in assets]
-
-        if method in ['geometric_brownian', 'parametric']:
-            try:
-                L = np.linalg.cholesky(cov_matrix)
-            except np.linalg.LinAlgError:
-                U, S, V = np.linalg.svd(cov_matrix)
-                L = U @ np.sqrt(np.diag(S))
-            variances = np.diag(cov_matrix)
-            drift = (mean_returns - 0.5 * variances).reshape(n_assets, 1)
-
-        BATCH_SIZE = 1000
-        total_sims = self.simulations
-
-        all_final_values = []
-        all_max_drawdowns = []
-        portfolio_values_list = []
-        strategy_decisions_log = []  # Track strategy decisions for analysis
-
-        total_invested = self.initial_capital + (self.contrib_amount * (self.trading_days // self.contrib_freq))
-
-        print(f"  > Running Time-Stepped Simulation with Strategy: {strategy.name}")
-        print(f"  > Initial: ${self.initial_capital:,.0f} | DCA: ${self.contrib_amount:,.0f} every {self.contrib_freq} days")
-
-        # Rolling window size for indicators
-        indicator_window = max(21, getattr(strategy, 'lookback_days', 21))
-
-        for batch_start in range(0, total_sims, BATCH_SIZE):
-            current_batch = min(BATCH_SIZE, total_sims - batch_start)
-
-            # Pre-generate ALL random returns
-            if method == 'bootstrap':
-                random_indices = np.random.randint(0, len(aligned_returns_df), (current_batch, self.trading_days))
-                asset_returns_all = aligned_returns_df.values[random_indices].transpose(2, 0, 1)
-            elif method in ['geometric_brownian', 'parametric']:
-                uncorrelated = np.random.normal(0, 1, (n_assets, current_batch, self.trading_days))
-                correlated = np.einsum('ij,jkl->ikl', L, uncorrelated)
-                batch_rets = drift.reshape(n_assets, 1, 1) + correlated
-                asset_returns_all = np.exp(batch_rets) - 1 if method == 'geometric_brownian' else batch_rets
-
-            # Initialize Batch State
-            current_holdings = np.zeros((current_batch, n_assets))
-            start_w = np.tile(base_weights, (current_batch, 1))
-            current_holdings = start_w * self.initial_capital
-
-            batch_portfolio_values = np.zeros((current_batch, self.trading_days + 1))
-            batch_portfolio_values[:, 0] = np.sum(current_holdings, axis=1)
-
-            # Track peaks for drawdown
-            asset_peaks = np.copy(current_holdings)
-            portfolio_peaks = batch_portfolio_values[:, 0].copy()
-
-            # Rolling return buffer for momentum calculation
-            returns_buffer = np.zeros((current_batch, indicator_window, n_assets))
-
-            # Time-Step Loop
-            for day in range(self.trading_days):
-                # Get returns for this day
-                todays_returns = asset_returns_all[:, :, day].T  # (Batch, Assets)
-
-                # Apply returns
-                current_holdings = current_holdings * (1 + todays_returns)
-
-                # Update portfolio value
-                total_val = np.sum(current_holdings, axis=1)
-                batch_portfolio_values[:, day + 1] = total_val
-
-                # Update peaks
-                asset_peaks = np.maximum(asset_peaks, current_holdings)
-                portfolio_peaks = np.maximum(portfolio_peaks, total_val)
-
-                # Update returns buffer (circular)
-                buffer_idx = day % indicator_window
-                returns_buffer[:, buffer_idx, :] = todays_returns
-
-                # DCA Contribution Day
-                if self.contrib_amount > 0 and (day + 1) % self.contrib_freq == 0:
-                    # Calculate drawdowns
-                    asset_drawdowns = (current_holdings - asset_peaks) / np.where(asset_peaks != 0, asset_peaks, 1)
-                    portfolio_drawdown = (total_val - portfolio_peaks) / np.where(portfolio_peaks != 0, portfolio_peaks, 1)
-
-                    # Calculate rolling indicators
-                    if day >= indicator_window:
-                        rolling_returns = np.mean(returns_buffer, axis=1) * 252  # Annualized
-                        rolling_volatility = np.std(returns_buffer, axis=1) * np.sqrt(252)
-                        momentum_score = np.sum(returns_buffer, axis=1)  # Cumulative return over window
-                        rolling_sharpe = rolling_returns / (rolling_volatility + 1e-6)
-                    else:
-                        rolling_returns = None
-                        rolling_volatility = None
-                        momentum_score = None
-                        rolling_sharpe = None
-
-                    # Build MarketContext
-                    context = MarketContext(
-                        current_holdings=current_holdings,
-                        current_drawdowns=asset_drawdowns,
-                        base_allocations=base_weights,
-                        asset_tickers=asset_tickers,
-                        current_day=day,
-                        total_days=self.trading_days,
-                        rolling_returns=rolling_returns,
-                        rolling_volatility=rolling_volatility,
-                        rolling_sharpe=rolling_sharpe,
-                        momentum_score=momentum_score,
-                        portfolio_drawdown=portfolio_drawdown
-                    )
-
-                    # Get allocation from strategy
-                    new_money_weights = strategy.get_allocation(context)
-
-                    # Add contribution
-                    cash_injection = new_money_weights * self.contrib_amount
-                    current_holdings += cash_injection
-
-            # Store batch results
-            portfolio_values_list.append(batch_portfolio_values)
-            all_final_values.append(batch_portfolio_values[:, -1])
-
-            running_max = np.maximum.accumulate(batch_portfolio_values, axis=1)
-            drawdowns = (batch_portfolio_values - running_max) / running_max
-            all_max_drawdowns.append(np.min(drawdowns, axis=1))
-
-            del asset_returns_all
-
-        # Consolidate
-        portfolio_values = np.vstack(portfolio_values_list)
-        final_values = np.concatenate(all_final_values)
-        max_drawdowns = np.concatenate(all_max_drawdowns)
-        cagr = (final_values / total_invested) ** (1 / self.years) - 1
-
-        return {
-            'portfolio_values': portfolio_values,
-            'final_values': final_values,
-            'cagr': cagr,
-            'max_drawdowns': max_drawdowns,
-            'assets': assets,
-            'allocations': list(base_weights),
-            'strategy': strategy.name,
-            'strategy_config': strategy.get_config_summary(),
-            'probabilities': self._calculate_probabilities(portfolio_values),
-            'stats': self.calculate_statistics(final_values, cagr, max_drawdowns)
-        }
-
-    def _calculate_probabilities(self, portfolio_values):
+    def _calculate_probabilities(self, res, contrib_days, dpy):
         years = np.arange(1, self.years + 1)
-        indices = (years * 252).astype(int)
-        indices = np.minimum(indices, portfolio_values.shape[1] - 1)
-        prob_loss = []
-        prob_high_return = []
+        pos = np.searchsorted(res.record_steps, years * dpy)
+        prob_loss, prob_high = [], []
+        for y, p in zip(years, pos):
+            invested = self.initial_capital + self.contrib_amount * contrib_days[:y * dpy].sum()
+            prob_loss.append(np.mean(res.values[:, p] < invested))
+            prob_high.append(np.mean(res.twr[:, p] ** (1 / y) - 1 > 0.10))
+        return {'years': years, 'prob_loss': np.array(prob_loss),
+                'prob_high_return': np.array(prob_high)}
 
-        for year, idx in zip(years, indices):
-            values_at_year = portfolio_values[:, idx]
-            invested_at_year = self.initial_capital + (self.contrib_amount * (idx // self.contrib_freq))
+    def calculate_statistics(self, final_values, cagr, max_drawdowns, irr=None,
+                             volatility=None, total_invested=None):
+        if total_invested is None:
+            total_invested = self.initial_capital
+        irr = cagr if irr is None else irr
 
-            p_loss = np.mean(values_at_year < invested_at_year)
-            prob_loss.append(p_loss)
+        def pct(a):
+            return {p: float(np.percentile(a, p)) for p in PERCENTILES}
 
-            target_value = invested_at_year * (1.10 ** year)
-            p_high = np.mean(values_at_year > target_value)
-            prob_high_return.append(p_high)
-
-        return {
-            'years': years,
-            'prob_loss': np.array(prob_loss),
-            'prob_high_return': np.array(prob_high_return)
+        stats = {
+            'total_invested': total_invested,
+            'mean_final_value': float(np.mean(final_values)),
+            'median_final_value': float(np.median(final_values)),
+            'median_cagr': float(np.median(cagr)),
+            'mean_cagr': float(np.mean(cagr)),
+            'std_cagr': float(np.std(cagr)),
+            'median_irr': float(np.median(irr)),
+            'median_max_drawdown': float(np.median(max_drawdowns)),
+            'worst_max_drawdown': float(np.min(max_drawdowns)),
+            'max_drawdown_95': float(np.percentile(max_drawdowns, 5)),
+            'probability_loss': float(np.mean(final_values < total_invested)),
+            'probability_double': float(np.mean(final_values >= 2 * total_invested)),
+            'percentiles': {
+                'final_value': pct(final_values),
+                'cagr': pct(cagr),
+                'irr': pct(irr),
+                'max_drawdown': pct(max_drawdowns),
+            },
         }
-
-    def calculate_statistics(self, final_values, cagr, max_drawdowns):
-        downside_mask = cagr < 0
-        sortino = (np.mean(cagr) / np.std(cagr[downside_mask])) if np.sum(downside_mask) > 0 and np.std(cagr[downside_mask]) > 0 else 10.0
-
-        total_invested = self.initial_capital + (self.contrib_amount * (self.trading_days // self.contrib_freq))
-
-        return {
-            'mean_final_value': np.mean(final_values),
-            'median_final_value': np.median(final_values),
-            'median_cagr': np.median(cagr),
-            'mean_cagr': np.mean(cagr),
-            'std_cagr': np.std(cagr),
-            'median_max_drawdown': np.median(max_drawdowns),
-            'worst_max_drawdown': np.min(max_drawdowns),
-            'max_drawdown_95': np.percentile(max_drawdowns, 5),
-            'sharpe_ratio': np.mean(cagr) / np.std(cagr) if np.std(cagr) > 0 else 0,
-            'sortino_ratio': sortino,
-            'probability_loss': np.mean(final_values < total_invested),
-            'probability_double': np.mean(final_values >= 2 * total_invested),
-        }
+        if volatility is not None:
+            stats['median_volatility'] = float(np.median(volatility))
+            stats['percentiles']['volatility'] = pct(volatility)
+        return stats

@@ -1,121 +1,135 @@
 """
-strategies.py - Enhanced Dynamic Allocation Strategies
+Dynamic allocation strategies.
 
-Provides a rich framework for implementing and testing dynamic allocation strategies
-that respond to market conditions (drawdowns, momentum, volatility, etc.)
+A strategy maps a MarketContext to target weights, shape (paths, assets).
+The engine decides what those weights are applied to (see StrategyConfig.apply_to):
+- 'contributions': only new cash is split by the strategy's weights
+- 'rebalance': holdings are traded to the strategy's weights whenever the
+  target changes (checked at StrategyConfig.check_frequency) and on calendar
+  rebalance dates
+- 'both'
+
+All indicators are computed from PRICES, never from holdings, so contributions
+and trades cannot fake a drawdown or a recovery. Strategies are vectorized over
+paths: the same code runs on one historical path or 10,000 simulated ones.
 """
-import numpy as np
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Callable
-from enum import Enum
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional
 
-
-class MarketRegime(Enum):
-    """Market regime classification"""
-    BULL = "bull"
-    BEAR = "bear"
-    HIGH_VOL = "high_volatility"
-    LOW_VOL = "low_volatility"
-    NEUTRAL = "neutral"
+import numpy as np
 
 
 @dataclass
 class MarketContext:
-    """
-    Rich market context passed to strategies for decision making.
-
-    This provides strategies with everything they need to make informed decisions:
-    - Current portfolio state
-    - Historical price/return data
-    - Technical indicators
-    - Cross-asset relationships
-    """
-    # Current State (shape: Batch x Assets)
+    """Everything a strategy may look at on a decision day. Arrays are (paths, assets)."""
     current_holdings: np.ndarray          # Dollar value per asset
-    current_drawdowns: np.ndarray         # Drawdown from peak per asset
+    current_drawdowns: np.ndarray         # Price drawdown from each asset's running peak (<= 0)
+    base_allocations: np.ndarray          # Configured target weights (assets,)
+    asset_tickers: List[str]
+    current_day: int
+    total_days: int
 
-    # Base Configuration
-    base_allocations: np.ndarray          # Target weights
-    asset_tickers: List[str]              # Ticker names for reference
-
-    # Time Context
-    current_day: int                      # Day in simulation
-    total_days: int                       # Total simulation length
-
-    # Rolling Statistics (shape: Batch x Assets) - computed over lookback window
-    rolling_returns: Optional[np.ndarray] = None      # Annualized returns
+    # Rolling statistics over the engine's indicator window (None until warm)
+    rolling_returns: Optional[np.ndarray] = None      # Annualized mean return
     rolling_volatility: Optional[np.ndarray] = None   # Annualized vol
-    rolling_sharpe: Optional[np.ndarray] = None       # Sharpe ratio
-    momentum_score: Optional[np.ndarray] = None       # Momentum indicator
+    rolling_sharpe: Optional[np.ndarray] = None
+    momentum_score: Optional[np.ndarray] = None       # Compounded return over the window
 
-    # Cross-Asset (shape: Batch)
-    portfolio_drawdown: Optional[np.ndarray] = None   # Total portfolio DD
-    market_regime: Optional[np.ndarray] = None        # Regime classification
-
-    # Price History (for complex strategies) - shape: (lookback_days, assets)
-    # Only populated if strategy requests it
+    portfolio_drawdown: Optional[np.ndarray] = None   # (paths,) drawdown of the time-weighted index
+    # (paths,) drawdown of the base-weight portfolio (daily rebalanced). Unlike
+    # portfolio_drawdown it keeps moving while a strategy is out of the market.
+    reference_drawdown: Optional[np.ndarray] = None
+    portfolio_volatility: Optional[np.ndarray] = None # (paths,) annualized, over the window
+    current_weights: Optional[np.ndarray] = None
+    current_date: Optional[object] = None             # Historical runs only
+    periods_per_year: float = 252.0
+    market_regime: Optional[np.ndarray] = None
     price_history: Optional[np.ndarray] = None
+
+    # Engine-provided accessors for strategy-specific lookbacks
+    _trailing_asset_returns: Optional[Callable[[int], Optional[np.ndarray]]] = None
+    _trailing_portfolio_returns: Optional[Callable[[int], Optional[np.ndarray]]] = None
+
+    @property
+    def n_paths(self) -> int:
+        return self.current_holdings.shape[0]
+
+    def base(self) -> np.ndarray:
+        return np.tile(self.base_allocations, (self.n_paths, 1)).astype(float)
+
+    def ticker_index(self, ticker: str) -> Optional[int]:
+        upper = [t.upper() for t in self.asset_tickers]
+        return upper.index(ticker.upper()) if ticker and ticker.upper() in upper else None
+
+    def trailing_return(self, lookback: int) -> Optional[np.ndarray]:
+        """Compounded return per asset over the last `lookback` days, or None if not warm."""
+        if self._trailing_asset_returns is not None:
+            r = self._trailing_asset_returns(lookback)
+            if r is not None:
+                return np.prod(1 + r, axis=1) - 1
+            return None
+        return self.momentum_score
+
+    def trailing_portfolio_volatility(self, lookback: int) -> Optional[np.ndarray]:
+        if self._trailing_portfolio_returns is not None:
+            r = self._trailing_portfolio_returns(lookback)
+            if r is not None:
+                return np.std(r, axis=1, ddof=1) * np.sqrt(self.periods_per_year)
+            return None
+        return self.portfolio_volatility
 
 
 class AllocationStrategy(ABC):
-    """
-    Base class for all allocation strategies.
-
-    Strategies determine how new contributions (DCA) are allocated,
-    potentially overriding the base allocation based on market conditions.
-    """
+    # The engine only computes MarketContext.rolling_* / momentum_score /
+    # portfolio_volatility when this is True (they are costly on daily checks).
+    # Built-in strategies use the trailing_* accessors instead.
+    uses_rolling_stats = True
 
     def __init__(self, name: str = "BaseStrategy"):
         self.name = name
-        self.requires_history = False  # Set True if strategy needs price_history
-        self.lookback_days = 0         # How many days of history needed
+        self.lookback_days = 0  # Longest history window the strategy reads
+
+    def reset(self, n_paths: int, asset_tickers: List[str]):
+        """Called at the start of every run; strategies with state clear it here."""
 
     @abstractmethod
     def get_allocation(self, context: MarketContext) -> np.ndarray:
-        """
-        Determine allocation weights for new contribution.
-
-        Parameters:
-        -----------
-        context : MarketContext
-            Rich market context with current state and indicators
-
-        Returns:
-        --------
-        np.ndarray : Shape (Batch, Assets) - allocation weights summing to 1.0
-        """
-        pass
+        """Return target weights, shape (paths, assets), rows summing to 1."""
 
     def get_config_summary(self) -> Dict:
-        """Return strategy configuration for logging"""
         return {"name": self.name}
 
 
+def _scale_others(weights: np.ndarray, mask: np.ndarray, idx: int, target_weight: float,
+                  base: np.ndarray):
+    """Set asset idx to target_weight on masked rows, scaling the rest to fill 1 - target."""
+    others = base.sum() - base[idx]
+    weights[mask] = 0.0
+    weights[mask, idx] = target_weight
+    if others > 0:
+        for i in range(len(base)):
+            if i != idx:
+                weights[mask, i] = base[i] / others * (1.0 - target_weight)
+    else:
+        weights[mask, idx] = 1.0
+
+
 class StaticAllocationStrategy(AllocationStrategy):
-    """Standard DCA: Always allocate according to fixed portfolio weights."""
+    """Always the configured weights."""
+    uses_rolling_stats = False
 
     def __init__(self):
-        super().__init__(name="Static DCA")
+        super().__init__(name="Static")
 
     def get_allocation(self, context: MarketContext) -> np.ndarray:
-        batch_size = context.current_holdings.shape[0]
-        return np.tile(context.base_allocations, (batch_size, 1))
+        return context.base()
 
 
 class BuyTheDipStrategy(AllocationStrategy):
-    """
-    Allocates more heavily into assets experiencing significant drawdowns.
-
-    Parameters:
-    -----------
-    target_ticker : str
-        Ticker symbol to monitor for dips
-    threshold : float
-        Drawdown threshold to trigger (e.g., 0.10 = 10% drop)
-    aggressive_weight : float
-        Weight to allocate to dipped asset (e.g., 0.8 = 80%)
-    """
+    """Put `aggressive_weight` into target_ticker while its price is more than
+    `threshold` below its running peak; otherwise use base weights."""
+    uses_rolling_stats = False
 
     def __init__(self, target_ticker: str, threshold: float = 0.10,
                  aggressive_weight: float = 0.80):
@@ -123,67 +137,57 @@ class BuyTheDipStrategy(AllocationStrategy):
         self.target_ticker = target_ticker.upper()
         self.threshold = threshold
         self.aggressive_weight = aggressive_weight
-        self._target_idx = None  # Set dynamically
 
     def get_allocation(self, context: MarketContext) -> np.ndarray:
-        batch_size, n_assets = context.current_holdings.shape
-
-        # Find target index if not set
-        if self._target_idx is None:
-            try:
-                self._target_idx = [t.upper() for t in context.asset_tickers].index(self.target_ticker)
-            except ValueError:
-                print(f"Warning: {self.target_ticker} not in portfolio, using static allocation")
-                return np.tile(context.base_allocations, (batch_size, 1))
-
-        # Default to base allocation
-        weights = np.tile(context.base_allocations, (batch_size, 1))
-
-        # Check for dip condition
-        target_dd = context.current_drawdowns[:, self._target_idx]
-        dip_mask = target_dd < -self.threshold
-
-        if np.any(dip_mask):
-            # Reallocate for dipped scenarios
-            weights[dip_mask] = 0
-            weights[dip_mask, self._target_idx] = self.aggressive_weight
-
-            # Distribute remaining weight proportionally
-            remaining = 1.0 - self.aggressive_weight
-            base_others = np.sum(context.base_allocations) - context.base_allocations[self._target_idx]
-
-            if base_others > 0:
-                for i in range(n_assets):
-                    if i != self._target_idx:
-                        w = (context.base_allocations[i] / base_others) * remaining
-                        weights[dip_mask, i] = w
-
+        weights = context.base()
+        idx = context.ticker_index(self.target_ticker)
+        if idx is None:
+            return weights
+        dip = context.current_drawdowns[:, idx] < -self.threshold
+        if np.any(dip):
+            _scale_others(weights, dip, idx, self.aggressive_weight, context.base_allocations)
         return weights
 
     def get_config_summary(self) -> Dict:
-        return {
-            "name": self.name,
-            "target": self.target_ticker,
-            "threshold": f"{self.threshold*100:.0f}%",
-            "aggressive_weight": f"{self.aggressive_weight*100:.0f}%"
-        }
+        return {"name": self.name, "target": self.target_ticker,
+                "threshold": f"{self.threshold:.0%}",
+                "aggressive_weight": f"{self.aggressive_weight:.0%}"}
+
+
+class CryptoOpportunisticStrategy(AllocationStrategy):
+    """Hold `normal_weight` of a crypto asset (base weight if None), raising it
+    to `dip_weight` while the crypto price is more than `dip_threshold` below its peak."""
+    uses_rolling_stats = False
+
+    def __init__(self, crypto_ticker: str = "BTC-USD", dip_threshold: float = 0.25,
+                 normal_weight: Optional[float] = None, dip_weight: float = 0.40):
+        super().__init__(name=f"Crypto Opportunistic ({crypto_ticker})")
+        self.crypto = crypto_ticker.upper()
+        self.threshold = dip_threshold
+        self.normal_weight = normal_weight
+        self.dip_weight = dip_weight
+
+    def get_allocation(self, context: MarketContext) -> np.ndarray:
+        weights = context.base()
+        idx = context.ticker_index(self.crypto)
+        if idx is None:
+            return weights
+        dip = context.current_drawdowns[:, idx] < -self.threshold
+        if self.normal_weight is not None:
+            _scale_others(weights, ~dip, idx, self.normal_weight, context.base_allocations)
+        if np.any(dip):
+            _scale_others(weights, dip, idx, self.dip_weight, context.base_allocations)
+        return weights
+
+    def get_config_summary(self) -> Dict:
+        return {"name": self.name, "dip_threshold": f"{self.threshold:.0%}",
+                "normal_weight": "base" if self.normal_weight is None else f"{self.normal_weight:.0%}",
+                "dip_weight": f"{self.dip_weight:.0%}"}
 
 
 class MomentumStrategy(AllocationStrategy):
-    """
-    Tilts allocation toward assets with positive momentum.
-
-    Overweights assets with strong recent returns, underweights laggards.
-
-    Parameters:
-    -----------
-    momentum_lookback : int
-        Days to calculate momentum over
-    tilt_strength : float
-        How aggressively to tilt (0 = none, 1 = full momentum weighting)
-    min_weight : float
-        Minimum weight for any asset (prevents going to 0)
-    """
+    """Blend base weights with weights proportional to (shifted) trailing return."""
+    uses_rolling_stats = False
 
     def __init__(self, momentum_lookback: int = 63, tilt_strength: float = 0.5,
                  min_weight: float = 0.05):
@@ -191,156 +195,95 @@ class MomentumStrategy(AllocationStrategy):
         self.lookback = momentum_lookback
         self.tilt_strength = tilt_strength
         self.min_weight = min_weight
-        self.requires_history = True
         self.lookback_days = momentum_lookback
 
     def get_allocation(self, context: MarketContext) -> np.ndarray:
-        batch_size, n_assets = context.current_holdings.shape
-
-        if context.momentum_score is None:
-            # Fallback to static if no momentum data
-            return np.tile(context.base_allocations, (batch_size, 1))
-
-        # Normalize momentum scores to weights
-        # Shift to positive, then normalize
-        mom = context.momentum_score  # (Batch, Assets)
-        mom_shifted = mom - mom.min(axis=1, keepdims=True) + 1e-6
-        mom_weights = mom_shifted / mom_shifted.sum(axis=1, keepdims=True)
-
-        # Blend with base allocation
-        base = np.tile(context.base_allocations, (batch_size, 1))
+        base = context.base()
+        mom = context.trailing_return(self.lookback)
+        if mom is None:
+            return base
+        shifted = mom - mom.min(axis=1, keepdims=True) + 1e-6
+        mom_weights = shifted / shifted.sum(axis=1, keepdims=True)
         blended = (1 - self.tilt_strength) * base + self.tilt_strength * mom_weights
-
-        # Enforce minimum weights
         blended = np.maximum(blended, self.min_weight)
-        blended = blended / blended.sum(axis=1, keepdims=True)
-
-        return blended
+        return blended / blended.sum(axis=1, keepdims=True)
 
 
 class VolatilityTargetStrategy(AllocationStrategy):
-    """
-    Adjusts allocation to maintain a target portfolio volatility.
-
-    When realized vol is high, reduces equity exposure.
-    When realized vol is low, increases exposure.
-
-    Parameters:
-    -----------
-    target_vol : float
-        Target annualized volatility (e.g., 0.15 = 15%)
-    vol_lookback : int
-        Days to calculate realized volatility
-    equity_tickers : list
-        Tickers considered "risky" assets
-    safe_ticker : str
-        Ticker to shift into when de-risking (e.g., 'BND', 'SHY')
-    """
+    """Scale risky weights by target_vol / realized portfolio vol (correlations
+    included, since it is measured on the portfolio's own returns). The freed or
+    needed weight goes to safe_ticker; without one, weights are renormalized."""
+    uses_rolling_stats = False
 
     def __init__(self, target_vol: float = 0.15, vol_lookback: int = 21,
-                 equity_tickers: List[str] = None, safe_ticker: str = None):
+                 equity_tickers: List[str] = None, safe_ticker: str = None,
+                 min_scale: float = 0.25, max_scale: float = 1.5):
         super().__init__(name="Volatility Target")
         self.target_vol = target_vol
         self.lookback = vol_lookback
         self.equity_tickers = [t.upper() for t in (equity_tickers or [])]
         self.safe_ticker = safe_ticker.upper() if safe_ticker else None
-        self.requires_history = True
+        self.min_scale, self.max_scale = min_scale, max_scale
         self.lookback_days = vol_lookback
 
     def get_allocation(self, context: MarketContext) -> np.ndarray:
-        batch_size, n_assets = context.current_holdings.shape
-
-        if context.rolling_volatility is None:
-            return np.tile(context.base_allocations, (batch_size, 1))
-
-        # Calculate portfolio vol (simplified: weighted sum of asset vols)
+        weights = context.base()
+        vol = context.trailing_portfolio_volatility(self.lookback)
+        if vol is None:
+            return weights
+        scale = np.clip(self.target_vol / np.maximum(vol, 1e-6), self.min_scale, self.max_scale)
+        tickers = [t.upper() for t in context.asset_tickers]
+        risky = np.array([t in self.equity_tickers for t in tickers])
+        if not risky.any():
+            risky = np.array([t != self.safe_ticker for t in tickers])
         base = context.base_allocations
-        port_vol = np.sum(context.rolling_volatility * base, axis=1)  # (Batch,)
-
-        # Scale factor to hit target
-        scale = np.clip(self.target_vol / (port_vol + 1e-6), 0.5, 1.5)  # (Batch,)
-
-        # For now, simple scaling of base allocation
-        # More sophisticated: shift between equity and safe assets
-        weights = np.tile(base, (batch_size, 1))
-
-        # Scale risky assets down/up
-        for i, ticker in enumerate(context.asset_tickers):
-            if ticker.upper() in self.equity_tickers:
-                weights[:, i] = weights[:, i] * scale
-
-        # Renormalize
-        weights = weights / weights.sum(axis=1, keepdims=True)
-
-        return weights
+        weights[:, risky] = base[risky] * scale[:, None]
+        safe_idx = context.ticker_index(self.safe_ticker) if self.safe_ticker else None
+        if safe_idx is not None and not risky[safe_idx]:
+            freed = base[risky].sum() - weights[:, risky].sum(axis=1)
+            weights[:, safe_idx] = np.maximum(base[safe_idx] + freed, 0.0)
+        return weights / weights.sum(axis=1, keepdims=True)
 
 
 class DrawdownProtectionStrategy(AllocationStrategy):
-    """
-    Reduces equity exposure when portfolio drawdown exceeds threshold.
-
-    Implements a simple risk-off mechanism during market stress.
-
-    Parameters:
-    -----------
-    dd_threshold : float
-        Portfolio drawdown to trigger de-risking (e.g., 0.15 = 15%)
-    risk_off_allocation : dict
-        Target allocation during risk-off (e.g., {'BND': 0.6, 'VOO': 0.4})
-    recovery_threshold : float
-        Drawdown level to return to normal allocation
-    """
+    """Switch to `risk_off_allocation` when the base-weight portfolio's drawdown
+    exceeds `dd_threshold`; switch back once it recovers to within
+    `recovery_threshold`. The base-weight drawdown is used (not the actual
+    portfolio's) because a portfolio sitting in bonds would never "recover"."""
+    uses_rolling_stats = False
 
     def __init__(self, dd_threshold: float = 0.15,
                  risk_off_allocation: Dict[str, float] = None,
                  recovery_threshold: float = 0.05):
         super().__init__(name="Drawdown Protection")
         self.dd_threshold = dd_threshold
-        self.risk_off_alloc = risk_off_allocation or {}
+        self.risk_off_alloc = {k.upper(): v for k, v in (risk_off_allocation or {}).items()}
         self.recovery_threshold = recovery_threshold
+        self._risk_off = None
+
+    def reset(self, n_paths: int, asset_tickers: List[str]):
+        self._risk_off = np.zeros(n_paths, dtype=bool)
 
     def get_allocation(self, context: MarketContext) -> np.ndarray:
-        batch_size, n_assets = context.current_holdings.shape
-
-        # Start with base allocation
-        weights = np.tile(context.base_allocations, (batch_size, 1))
-
-        if context.portfolio_drawdown is None:
+        weights = context.base()
+        dd = (context.reference_drawdown if context.reference_drawdown is not None
+              else context.portfolio_drawdown)
+        if dd is None or not self.risk_off_alloc:
             return weights
-
-        # Check which simulations are in risk-off mode
-        risk_off_mask = context.portfolio_drawdown < -self.dd_threshold
-
-        if np.any(risk_off_mask) and self.risk_off_alloc:
-            # Apply risk-off allocation
-            for i, ticker in enumerate(context.asset_tickers):
-                t_upper = ticker.upper()
-                if t_upper in self.risk_off_alloc:
-                    weights[risk_off_mask, i] = self.risk_off_alloc[t_upper]
-                else:
-                    weights[risk_off_mask, i] = 0
-
-            # Normalize
-            row_sums = weights[risk_off_mask].sum(axis=1, keepdims=True)
-            weights[risk_off_mask] = weights[risk_off_mask] / np.where(row_sums > 0, row_sums, 1)
-
+        if self._risk_off is None or len(self._risk_off) != context.n_paths:
+            self._risk_off = np.zeros(context.n_paths, dtype=bool)
+        self._risk_off = np.where(self._risk_off, dd < -self.recovery_threshold, dd < -self.dd_threshold)
+        if np.any(self._risk_off):
+            off = np.array([self.risk_off_alloc.get(t.upper(), 0.0) for t in context.asset_tickers])
+            if off.sum() > 0:
+                weights[self._risk_off] = off / off.sum()
         return weights
 
 
 class RelativeValueStrategy(AllocationStrategy):
-    """
-    Allocates more to assets that are "cheap" relative to their history.
-
-    Uses drawdown as a proxy for relative value - bigger drawdowns = cheaper.
-    Good for mean-reversion beliefs.
-
-    Parameters:
-    -----------
-    rebalance_threshold : float
-        Minimum drawdown difference to trigger rebalancing
-    max_tilt : float
-        Maximum overweight for any single asset
-    """
+    """When drawdown dispersion exceeds `threshold`, blend 50/50 toward the most
+    beaten-down assets (mean reversion), capping any asset at `max_tilt`."""
+    uses_rolling_stats = False
 
     def __init__(self, rebalance_threshold: float = 0.10, max_tilt: float = 0.50):
         super().__init__(name="Relative Value")
@@ -348,275 +291,134 @@ class RelativeValueStrategy(AllocationStrategy):
         self.max_tilt = max_tilt
 
     def get_allocation(self, context: MarketContext) -> np.ndarray:
-        batch_size, n_assets = context.current_holdings.shape
-
-        # Deeper drawdown = more attractive (mean reversion)
-        # Convert drawdowns to "value scores" (more negative = higher score)
-        value_scores = -context.current_drawdowns  # (Batch, Assets)
-
-        # Only tilt if there's meaningful dispersion
-        dd_range = value_scores.max(axis=1) - value_scores.min(axis=1)
-
-        weights = np.tile(context.base_allocations, (batch_size, 1))
-
-        # For sims with enough dispersion, tilt toward beaten-down assets
-        tilt_mask = dd_range > self.threshold
-
-        if np.any(tilt_mask):
-            # Normalize value scores to weights
-            vs = value_scores[tilt_mask]
-            vs_shifted = vs - vs.min(axis=1, keepdims=True) + 0.01
-            value_weights = vs_shifted / vs_shifted.sum(axis=1, keepdims=True)
-
-            # Blend: 50% base, 50% value tilt
-            base = context.base_allocations
-            blended = 0.5 * base + 0.5 * value_weights
-
-            # Cap tilts
+        weights = context.base()
+        value = -context.current_drawdowns
+        tilt = (value.max(axis=1) - value.min(axis=1)) > self.threshold
+        if np.any(tilt):
+            vs = value[tilt]
+            vs = vs - vs.min(axis=1, keepdims=True) + 0.01
+            blended = 0.5 * context.base_allocations + 0.5 * vs / vs.sum(axis=1, keepdims=True)
             blended = np.clip(blended, 0, self.max_tilt)
-            blended = blended / blended.sum(axis=1, keepdims=True)
+            weights[tilt] = blended / blended.sum(axis=1, keepdims=True)
+        return weights
 
-            weights[tilt_mask] = blended
 
+class DualMomentumStrategy(AllocationStrategy):
+    """Absolute momentum / trend filter: hold base weights while the risky asset's
+    trailing return beats the safe asset's (or 0 if the safe asset is not in the
+    portfolio); otherwise hold 100% safe asset."""
+    uses_rolling_stats = False
+
+    def __init__(self, equity_ticker: str = "VOO", safe_ticker: str = "BND", lookback: int = 126):
+        super().__init__(name=f"Dual Momentum ({equity_ticker}/{safe_ticker})")
+        self.equity = equity_ticker.upper()
+        self.safe = safe_ticker.upper()
+        self.lookback = lookback
+        self.lookback_days = lookback
+
+    def get_allocation(self, context: MarketContext) -> np.ndarray:
+        weights = context.base()
+        eq, safe = context.ticker_index(self.equity), context.ticker_index(self.safe)
+        mom = context.trailing_return(self.lookback)
+        if eq is None or safe is None or mom is None:
+            return weights
+        risk_off = mom[:, eq] <= mom[:, safe]
+        weights[risk_off] = 0.0
+        weights[risk_off, safe] = 1.0
         return weights
 
 
 class CompositeStrategy(AllocationStrategy):
-    """
-    Combines multiple strategies with configurable weights.
-
-    Parameters:
-    -----------
-    strategies : list of (strategy, weight) tuples
-        Strategies to combine and their relative weights
-    """
+    """Weighted average of several strategies' targets."""
 
     def __init__(self, strategies: List[tuple]):
-        names = [s[0].name for s in strategies]
-        super().__init__(name=f"Composite({', '.join(names)})")
+        super().__init__(name=f"Composite({', '.join(s.name for s, _ in strategies)})")
         self.strategies = strategies
-
-        # Set requirements based on children
-        self.requires_history = any(s.requires_history for s, _ in strategies)
         self.lookback_days = max((s.lookback_days for s, _ in strategies), default=0)
+        self.uses_rolling_stats = any(s.uses_rolling_stats for s, _ in strategies)
+
+    def reset(self, n_paths, asset_tickers):
+        for s, _ in self.strategies:
+            s.reset(n_paths, asset_tickers)
 
     def get_allocation(self, context: MarketContext) -> np.ndarray:
-        batch_size, n_assets = context.current_holdings.shape
-
-        total_weight = sum(w for _, w in self.strategies)
-        combined = np.zeros((batch_size, n_assets))
-
-        for strategy, weight in self.strategies:
-            alloc = strategy.get_allocation(context)
-            combined += alloc * (weight / total_weight)
-
-        # Normalize
-        combined = combined / combined.sum(axis=1, keepdims=True)
-
-        return combined
+        total = sum(w for _, w in self.strategies)
+        combined = sum(s.get_allocation(context) * (w / total) for s, w in self.strategies)
+        return combined / combined.sum(axis=1, keepdims=True)
 
 
 class ConditionalStrategy(AllocationStrategy):
-    """
-    Switches between strategies based on market conditions.
+    """condition(context) -> bool (paths,) chooses between two strategies."""
 
-    Parameters:
-    -----------
-    condition : callable
-        Function(context) -> bool array indicating which condition is met
-    strategy_if_true : AllocationStrategy
-    strategy_if_false : AllocationStrategy
-    """
-
-    def __init__(self, condition: Callable,
-                 strategy_if_true: AllocationStrategy,
-                 strategy_if_false: AllocationStrategy,
-                 name: str = "Conditional"):
+    def __init__(self, condition: Callable, strategy_if_true: AllocationStrategy,
+                 strategy_if_false: AllocationStrategy, name: str = "Conditional"):
         super().__init__(name=name)
         self.condition = condition
         self.true_strategy = strategy_if_true
         self.false_strategy = strategy_if_false
+        self.lookback_days = max(strategy_if_true.lookback_days, strategy_if_false.lookback_days)
 
-        self.requires_history = (strategy_if_true.requires_history or
-                                  strategy_if_false.requires_history)
-        self.lookback_days = max(strategy_if_true.lookback_days,
-                                  strategy_if_false.lookback_days)
+    def reset(self, n_paths, asset_tickers):
+        self.true_strategy.reset(n_paths, asset_tickers)
+        self.false_strategy.reset(n_paths, asset_tickers)
 
     def get_allocation(self, context: MarketContext) -> np.ndarray:
-        batch_size, n_assets = context.current_holdings.shape
-
-        # Evaluate condition
-        mask = self.condition(context)  # (Batch,) bool
-
-        # Get allocations from both strategies
-        true_alloc = self.true_strategy.get_allocation(context)
-        false_alloc = self.false_strategy.get_allocation(context)
-
-        # Combine based on condition
-        weights = np.where(mask[:, np.newaxis], true_alloc, false_alloc)
-
-        return weights
+        mask = np.asarray(self.condition(context), dtype=bool)
+        return np.where(mask[:, None], self.true_strategy.get_allocation(context),
+                        self.false_strategy.get_allocation(context))
 
 
 # ============================================================================
-# Factory Functions for Easy Strategy Creation
+# Registry: the only place config `type` strings map to classes.
+# Param names match the documented StrategyConfig params.
 # ============================================================================
 
-def create_btc_dip_buyer(btc_ticker: str = "BTC-USD",
-                         threshold: float = 0.20,
-                         aggressive_weight: float = 0.50) -> BuyTheDipStrategy:
-    """
-    Creates a strategy that buys Bitcoin aggressively during major dips.
-
-    Default: When BTC drops 20%, allocate 50% of new money to it.
-    """
-    return BuyTheDipStrategy(
-        target_ticker=btc_ticker,
-        threshold=threshold,
-        aggressive_weight=aggressive_weight
-    )
+def _p(params, *names, default=None):
+    for n in names:
+        if n in params:
+            return params[n]
+    return default
 
 
-def create_dual_momentum_strategy(equity_ticker: str = "VOO",
-                                   safe_ticker: str = "BND",
-                                   lookback: int = 126) -> ConditionalStrategy:
-    """
-    Classic dual momentum: Risk-on when equities have positive momentum,
-    risk-off otherwise.
-    """
-    def positive_momentum(ctx: MarketContext) -> np.ndarray:
-        if ctx.momentum_score is None:
-            return np.ones(ctx.current_holdings.shape[0], dtype=bool)
-
-        try:
-            eq_idx = [t.upper() for t in ctx.asset_tickers].index(equity_ticker.upper())
-            return ctx.momentum_score[:, eq_idx] > 0
-        except ValueError:
-            return np.ones(ctx.current_holdings.shape[0], dtype=bool)
-
-    risk_on = StaticAllocationStrategy()
-    risk_off = DrawdownProtectionStrategy(
-        dd_threshold=0.0,  # Always "triggered"
-        risk_off_allocation={safe_ticker.upper(): 1.0}
-    )
-
-    return ConditionalStrategy(
-        condition=positive_momentum,
-        strategy_if_true=risk_on,
-        strategy_if_false=risk_off,
-        name=f"Dual Momentum ({equity_ticker}/{safe_ticker})"
-    )
-
-
-def create_crypto_opportunistic_strategy(
-    crypto_ticker: str = "BTC-USD",
-    equity_ticker: str = "VOO",
-    crypto_dip_threshold: float = 0.25,
-    normal_crypto_weight: float = 0.10,
-    dip_crypto_weight: float = 0.40
-) -> AllocationStrategy:
-    """
-    Strategy that normally maintains small crypto allocation but
-    increases significantly during major crypto drawdowns.
-
-    Example: Normally 10% BTC, but 40% when BTC is down 25%+
-    """
-
-    class CryptoOpportunistic(AllocationStrategy):
-        def __init__(self):
-            super().__init__(name=f"Crypto Opportunistic ({crypto_ticker})")
-            self.crypto = crypto_ticker.upper()
-            self.equity = equity_ticker.upper()
-            self.threshold = crypto_dip_threshold
-            self.normal_weight = normal_crypto_weight
-            self.dip_weight = dip_crypto_weight
-
-        def get_allocation(self, context: MarketContext) -> np.ndarray:
-            batch_size, n_assets = context.current_holdings.shape
-
-            try:
-                crypto_idx = [t.upper() for t in context.asset_tickers].index(self.crypto)
-                equity_idx = [t.upper() for t in context.asset_tickers].index(self.equity)
-            except ValueError:
-                return np.tile(context.base_allocations, (batch_size, 1))
-
-            weights = np.tile(context.base_allocations, (batch_size, 1))
-
-            # Check crypto drawdown
-            crypto_dd = context.current_drawdowns[:, crypto_idx]
-            dip_mask = crypto_dd < -self.threshold
-
-            if np.any(dip_mask):
-                # During dip: increase crypto, decrease equity proportionally
-                weights[dip_mask, crypto_idx] = self.dip_weight
-
-                # Reduce other weights proportionally to fit
-                other_sum = 1.0 - self.dip_weight
-                original_other = 1.0 - context.base_allocations[crypto_idx]
-
-                for i in range(n_assets):
-                    if i != crypto_idx:
-                        scale = other_sum / original_other if original_other > 0 else 0
-                        weights[dip_mask, i] = context.base_allocations[i] * scale
-
-            # Normal times: use normal crypto weight
-            normal_mask = ~dip_mask
-            if np.any(normal_mask):
-                weights[normal_mask, crypto_idx] = self.normal_weight
-                other_sum = 1.0 - self.normal_weight
-                original_other = 1.0 - context.base_allocations[crypto_idx]
-
-                for i in range(n_assets):
-                    if i != crypto_idx:
-                        scale = other_sum / original_other if original_other > 0 else 0
-                        weights[normal_mask, i] = context.base_allocations[i] * scale
-
-            return weights
-
-        def get_config_summary(self) -> Dict:
-            return {
-                "name": self.name,
-                "crypto_ticker": self.crypto,
-                "dip_threshold": f"{self.threshold*100:.0f}%",
-                "normal_weight": f"{self.normal_weight*100:.0f}%",
-                "dip_weight": f"{self.dip_weight*100:.0f}%"
-            }
-
-    return CryptoOpportunistic()
-
-
-# ============================================================================
-# Strategy Registry for Config-Based Loading
-# ============================================================================
-
-STRATEGY_REGISTRY = {
-    "static": StaticAllocationStrategy,
-    "buy_the_dip": BuyTheDipStrategy,
-    "momentum": MomentumStrategy,
-    "volatility_target": VolatilityTargetStrategy,
-    "drawdown_protection": DrawdownProtectionStrategy,
-    "relative_value": RelativeValueStrategy,
+STRATEGY_BUILDERS: Dict[str, Callable[[Dict], AllocationStrategy]] = {
+    'static': lambda p: StaticAllocationStrategy(),
+    'buy_the_dip': lambda p: BuyTheDipStrategy(
+        target_ticker=_p(p, 'target_ticker', default='VOO'),
+        threshold=_p(p, 'threshold', default=0.10),
+        aggressive_weight=_p(p, 'aggressive_weight', default=0.80)),
+    'momentum': lambda p: MomentumStrategy(
+        momentum_lookback=_p(p, 'lookback', 'momentum_lookback', default=63),
+        tilt_strength=_p(p, 'tilt_strength', default=0.5),
+        min_weight=_p(p, 'min_weight', default=0.05)),
+    'volatility_target': lambda p: VolatilityTargetStrategy(
+        target_vol=_p(p, 'target_vol', default=0.15),
+        vol_lookback=_p(p, 'lookback', 'vol_lookback', default=21),
+        equity_tickers=_p(p, 'equity_tickers', default=[]),
+        safe_ticker=_p(p, 'safe_ticker', default=None)),
+    'drawdown_protection': lambda p: DrawdownProtectionStrategy(
+        dd_threshold=_p(p, 'threshold', 'dd_threshold', default=0.15),
+        risk_off_allocation=_p(p, 'risk_off_allocation', default={}),
+        recovery_threshold=_p(p, 'recovery_threshold', default=0.05)),
+    'relative_value': lambda p: RelativeValueStrategy(
+        rebalance_threshold=_p(p, 'threshold', 'rebalance_threshold', default=0.10),
+        max_tilt=_p(p, 'max_tilt', default=0.50)),
+    'crypto_opportunistic': lambda p: CryptoOpportunisticStrategy(
+        crypto_ticker=_p(p, 'crypto_ticker', default='BTC-USD'),
+        dip_threshold=_p(p, 'dip_threshold', default=0.25),
+        normal_weight=_p(p, 'normal_weight', default=None),
+        dip_weight=_p(p, 'dip_weight', default=0.40)),
+    'dual_momentum': lambda p: DualMomentumStrategy(
+        equity_ticker=_p(p, 'equity_ticker', default='VOO'),
+        safe_ticker=_p(p, 'safe_ticker', default='BND'),
+        lookback=_p(p, 'lookback', default=126)),
 }
 
 
-def create_strategy_from_config(config: Dict) -> AllocationStrategy:
-    """
-    Factory function to create strategies from configuration dictionaries.
-
-    Example config:
-    {
-        "type": "buy_the_dip",
-        "params": {
-            "target_ticker": "BTC-USD",
-            "threshold": 0.20,
-            "aggressive_weight": 0.50
-        }
-    }
-    """
-    strategy_type = config.get("type", "static")
-    params = config.get("params", {})
-
-    if strategy_type not in STRATEGY_REGISTRY:
-        raise ValueError(f"Unknown strategy type: {strategy_type}")
-
-    return STRATEGY_REGISTRY[strategy_type](**params)
+def create_strategy(strategy_type: str, params: Optional[Dict] = None,
+                    name: Optional[str] = None) -> AllocationStrategy:
+    if strategy_type not in STRATEGY_BUILDERS:
+        raise ValueError(f"Unknown strategy type: {strategy_type}. Valid: {sorted(STRATEGY_BUILDERS)}")
+    strategy = STRATEGY_BUILDERS[strategy_type](params or {})
+    if name:
+        strategy.name = name
+    return strategy

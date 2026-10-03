@@ -104,26 +104,28 @@ config = RunConfig(
         # =========================================================
         # DRAWDOWN PROTECTION: De-risk during crashes
         # =========================================================
-        # PortfolioConfig(
-        #     name='Drawdown Protected Growth',
-        #     allocations={
-        #         'VOO': 0.70,
-        #         'QQQ': 0.20,
-        #         'BND': 0.10,
-        #     },
-        #     description='Shift to bonds when portfolio drops 15%+',
-        #     strategy=StrategyConfig(
-        #         type='drawdown_protection',
-        #         params={
-        #             'threshold': 0.15,           # 15% portfolio drawdown
-        #             'risk_off_allocation': {     # Defensive allocation
-        #                 'VOO': 0.30,
-        #                 'BND': 0.70
-        #             },
-        #             'recovery_threshold': 0.05   # Return to normal at 5% DD
-        #         }
-        #     )
-        # ),
+        PortfolioConfig(
+            name='Drawdown Protected Growth',
+            allocations={
+                'VOO': 0.70,
+                'QQQ': 0.20,
+                'BND': 0.10,
+            },
+            description='Move holdings to bonds in a 15% drawdown, back in near the old high',
+            strategy=StrategyConfig(
+                type='drawdown_protection',
+                apply_to='rebalance',        # trade existing holdings, not just new cash
+                check_frequency='daily',
+                params={
+                    'threshold': 0.15,           # 15% drawdown of the 70/20/10 mix
+                    'risk_off_allocation': {     # Defensive allocation
+                        'VOO': 0.30,
+                        'BND': 0.70
+                    },
+                    'recovery_threshold': 0.05   # Return to normal within 5% of the peak
+                }
+            )
+        ),
 
         # =========================================================
         # RELATIVE VALUE: Buy whatever is most beaten down
@@ -169,7 +171,11 @@ config = RunConfig(
 
         # DCA Settings - CRITICAL for strategy testing!
         contribution_amount=500.0,    # $500/month
-        contribution_frequency=21     # ~monthly (21 trading days)
+        contribution_frequency=21,    # ~monthly (21 trading days)
+
+        # Contribution-steering strategies accumulate their tilts, so don't
+        # rebalance them away (portfolios can override with rebalance=...)
+        rebalance='none',
     ),
 
     optimization=OptimizationConfig(

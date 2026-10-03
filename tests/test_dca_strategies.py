@@ -55,7 +55,7 @@ class TestDCAContributions:
         """
         np.random.seed(42)
         n_days = 252
-        dates = pd.date_range(start='2020-01-01', periods=n_days, freq='D')
+        dates = pd.date_range(start='2020-01-01', periods=n_days, freq='B')
         returns = np.random.normal(0.0003, 0.01, n_days)
 
         dm = MockDataManager()
@@ -91,7 +91,7 @@ class TestDCAContributions:
         """
         np.random.seed(42)
         n_days = 252
-        dates = pd.date_range(start='2020-01-01', periods=n_days, freq='D')
+        dates = pd.date_range(start='2020-01-01', periods=n_days, freq='B')
 
         # Zero returns to isolate contribution effect
         returns = np.zeros(n_days)
@@ -134,7 +134,7 @@ class TestDCAContributions:
         """
         np.random.seed(42)
         n_days = 252
-        dates = pd.date_range(start='2020-01-01', periods=n_days, freq='D')
+        dates = pd.date_range(start='2020-01-01', periods=n_days, freq='B')
 
         # V-shaped market: decline then recovery
         decline = np.linspace(0, -0.002, 126)  # ~25% decline over 6 months
@@ -337,7 +337,7 @@ class TestTimeSteppedSimulation:
         """
         np.random.seed(42)
         n_days = 63  # ~3 months
-        dates = pd.date_range(start='2020-01-01', periods=n_days, freq='D')
+        dates = pd.date_range(start='2020-01-01', periods=n_days, freq='B')
 
         # Known returns
         returns = np.array([0.01] * n_days)  # Constant 1% daily
@@ -375,7 +375,7 @@ class TestTimeSteppedSimulation:
         """
         np.random.seed(42)
         n_days = 252
-        dates = pd.date_range(start='2020-01-01', periods=n_days, freq='D')
+        dates = pd.date_range(start='2020-01-01', periods=n_days, freq='B')
         returns = np.zeros(n_days)  # Zero returns to isolate contribution effect
 
         dm = MockDataManager()
@@ -416,7 +416,7 @@ class TestStrategyMetrics:
         """
         np.random.seed(42)
         n_days = 252
-        dates = pd.date_range(start='2020-01-01', periods=n_days, freq='D')
+        dates = pd.date_range(start='2020-01-01', periods=n_days, freq='B')
 
         # 10% annual return
         daily_return = (1.10) ** (1/252) - 1
@@ -454,7 +454,7 @@ class TestStrategyMetrics:
         """
         np.random.seed(42)
         n_days = 252
-        dates = pd.date_range(start='2020-01-01', periods=n_days, freq='D')
+        dates = pd.date_range(start='2020-01-01', periods=n_days, freq='B')
 
         # Market crash then recovery
         crash = np.array([-0.02] * 50)  # 50 days of -2% daily
@@ -498,7 +498,7 @@ class TestMultiAssetDCA:
         """
         np.random.seed(42)
         n_days = 252
-        dates = pd.date_range(start='2020-01-01', periods=n_days, freq='D')
+        dates = pd.date_range(start='2020-01-01', periods=n_days, freq='B')
 
         # Zero returns to isolate contribution effect
         returns_a = np.zeros(n_days)
