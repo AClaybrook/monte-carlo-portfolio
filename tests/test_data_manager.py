@@ -426,3 +426,81 @@ class TestChunkedDownloads:
         assert len(DataManager._extract_ticker_frame(flat, 'X')) == 3
         assert len(DataManager._extract_ticker_frame(multi, 'X')) == 3
         assert DataManager._extract_ticker_frame(multi, 'Y') is None
+
+
+class TestNoWastedRequests:
+    """Regression: weekends between two cached downloads were re-requested on every run,
+    each empty answer retried 5 times with backoff (~1 min per gap per ticker)."""
+
+    def _db_with_split_cache(self, tmp_path, ticker='QQQ'):
+        dm = DataManager(str(tmp_path / 't.db'))
+        dm.chunk_pause_seconds = 0
+        first = pd.bdate_range('2025-11-03', '2025-12-05')     # ends Friday
+        second = pd.bdate_range('2025-12-08', '2026-01-30')    # starts Monday, ends Friday
+        for dates in (first, second):                          # two separate downloads
+            df = pd.DataFrame({c: 1.0 for c in ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']},
+                              index=dates)
+            dm._save_to_db(ticker, df)
+            tracker = dm._get_interval_tracker(ticker)
+            tracker.add_dates([d.date() for d in dates])
+            dm._save_interval_tracker(ticker, tracker)
+        return dm
+
+    def test_weekend_gaps_are_not_requested(self, tmp_path):
+        dm = self._db_with_split_cache(tmp_path)
+        with patch('data_manager.yf.download') as bulk, patch('data_manager.yf.Ticker') as single, \
+             patch('data_manager.time.sleep'):
+            out = dm.bulk_download(['QQQ'], date(2025, 11, 3), date(2026, 2, 1))   # ends on a Sunday
+        bulk.assert_not_called()
+        single.assert_not_called()
+        assert len(out['QQQ']) == len(pd.bdate_range('2025-11-03', '2026-01-30'))
+        dm.close()
+
+    def test_crypto_weekend_gaps_are_still_requested(self, tmp_path):
+        dm = self._db_with_split_cache(tmp_path, 'BTC-USD')
+        missing = dm._missing_intervals('BTC-USD', dm._get_interval_tracker('BTC-USD'),
+                                        date(2025, 11, 3), date(2026, 1, 30))
+        assert (date(2025, 12, 6), date(2025, 12, 7)) in missing
+        dm.close()
+
+    def test_empty_answer_is_not_retried_and_short_past_window_is_remembered(self, tmp_path):
+        dm = DataManager(str(tmp_path / 't.db'))
+        history = MagicMock()
+        history.history.return_value = pd.DataFrame()
+        with patch('data_manager.yf.Ticker', return_value=history), patch('data_manager.time.sleep') as sleep:
+            tracker = dm._get_interval_tracker('VOO')
+            dm._download_and_save('VOO', date(2025, 12, 25), date(2025, 12, 25), tracker)   # Christmas
+        assert history.history.call_count == 1          # no retry loop on "no data"
+        assert sum(c.args[0] for c in sleep.call_args_list) < 5
+        assert dm._missing_intervals('VOO', tracker, date(2025, 12, 25), date(2025, 12, 25)) == []
+        dm.close()
+
+    def test_long_empty_window_is_not_marked_checked(self, tmp_path):
+        dm = DataManager(str(tmp_path / 't.db'))
+        history = MagicMock()
+        history.history.return_value = pd.DataFrame()
+        with patch('data_manager.yf.Ticker', return_value=history), patch('data_manager.time.sleep'):
+            tracker = dm._get_interval_tracker('VOO')
+            dm._download_and_save('VOO', date(2025, 3, 3), date(2025, 3, 31), tracker)
+        assert dm._missing_intervals('VOO', tracker, date(2025, 3, 3), date(2025, 3, 31))
+        dm.close()
+
+    def test_tickers_with_the_same_gap_share_one_request(self, tmp_path):
+        dm = DataManager(str(tmp_path / 't.db'))
+        dm.chunk_pause_seconds = 0
+        calls = []
+
+        def fake(tickers, start, end, **kw):
+            calls.append(tuple(tickers))
+            idx = pd.bdate_range(start, end - timedelta(days=1))
+            cols = pd.MultiIndex.from_product([tickers, ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']])
+            return pd.DataFrame(1.0, index=idx, columns=cols)
+
+        for t in ('A', 'B', 'C'):
+            tracker = dm._get_interval_tracker(t)
+            tracker.add_dates([d.date() for d in pd.bdate_range('2024-01-01', '2025-06-30')])
+            dm._save_interval_tracker(t, tracker)
+        with patch('data_manager.yf.download', side_effect=fake), patch('data_manager.time.sleep'):
+            dm.bulk_download(['A', 'B', 'C'], date(2024, 1, 1), date(2025, 7, 31))
+        assert calls == [('A', 'B', 'C')]
+        dm.close()

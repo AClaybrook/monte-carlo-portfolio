@@ -304,6 +304,25 @@ class DataManager:
     def _setup_session(self) -> requests.Session:
         return requests.Session()
 
+    @staticmethod
+    def _trades_weekends(ticker: str) -> bool:
+        return ticker.upper().endswith('-USD')   # crypto trades 24/7
+
+    def _missing_intervals(self, ticker: str, tracker: 'IntervalTracker',
+                           start: date, end: date) -> List[Tuple[date, date]]:
+        """Gaps worth requesting. For exchange-traded tickers, gaps with no weekdays
+        (the weekend between two separate downloads) cannot hold data and are skipped."""
+        missing = tracker.get_missing_intervals(start, end)
+        if self._trades_weekends(ticker):
+            return missing
+        return [(s, e) for s, e in missing if np.busday_count(s, e + timedelta(days=1)) > 0]
+
+    @staticmethod
+    def _is_closed_window(start: date, end: date) -> bool:
+        """A short window in the settled past that returned no rows is a market closure
+        (holiday), not a failure: safe to remember as checked. Longer or recent windows are not."""
+        return (end - start).days <= 5 and end <= date.today() - timedelta(days=4)
+
     def _date_chunks(self, start: date, end: date) -> List[Tuple[date, date]]:
         """Split [start, end] into consecutive chunks of at most max_chunk_years."""
         chunk_days = int(365.25 * self.max_chunk_years)
@@ -413,7 +432,7 @@ class DataManager:
         if end_date is None:
             end_date = date.today()
         else:
-            end_date = self._normalize_date(end_date)
+            end_date = min(self._normalize_date(end_date), date.today())
 
         # Adjust start date based on known inception
         inception = self.get_ticker_inception_date(ticker)
@@ -428,7 +447,7 @@ class DataManager:
             missing_intervals = [(start_date, end_date)]
         else:
             # Find what we're missing
-            missing_intervals = tracker.get_missing_intervals(start_date, end_date)
+            missing_intervals = self._missing_intervals(ticker, tracker, start_date, end_date)
 
         # Download missing data
         if missing_intervals:
@@ -454,8 +473,12 @@ class DataManager:
             df = self._smart_download(ticker, start, end)
 
             if df.empty:
-                print(f"  ⚠ No data returned for {ticker} [{start} to {end}]")
-                self._record_failure(ticker, start, end)
+                if self._is_closed_window(start, end):
+                    tracker.add_interval(start, end)
+                    print(f"  · {ticker} [{start} to {end}]: market closed, remembered as checked")
+                else:
+                    print(f"  ⚠ No data returned for {ticker} [{start} to {end}]")
+                    self._record_failure(ticker, start, end)
                 return
 
             # Normalize index
@@ -501,7 +524,7 @@ class DataManager:
 
     def _yf_download_one(self, ticker: str, start: date, end: date,
                          max_retries: int = 5) -> pd.DataFrame:
-        """Single-ticker, single-chunk yfinance download with backoff."""
+        """Single-ticker, single-chunk yfinance download. Retries (with backoff) only on errors."""
 
         delay = 2.0  # Start with longer delay
 
@@ -514,13 +537,9 @@ class DataManager:
                 time.sleep(0.5 + random.random())
 
                 data = yf.Ticker(ticker)
-                df = data.history(start=start, end=end_buffered, auto_adjust=False, timeout=30)
-
-                if not df.empty:
-                    return df
-
-                time.sleep(delay)
-                delay *= 2
+                # "No data" (weekend, holiday, before listing) is an answer, not an error:
+                # return it instead of retrying with backoff
+                return data.history(start=start, end=end_buffered, auto_adjust=False, timeout=30)
 
             except Exception as e:
                 error_str = str(e).lower()
@@ -561,9 +580,7 @@ class DataManager:
                 data = response.json()
 
                 if not data or not isinstance(data, list):
-                    time.sleep(delay)
-                    delay *= 2
-                    continue
+                    return pd.DataFrame()   # no rows for this window: an answer, not an error
 
                 df = pd.DataFrame(data)
                 df['date'] = pd.to_datetime(df['date'])
@@ -641,7 +658,7 @@ class DataManager:
         if end_date is None:
             end_date = date.today()
         else:
-            end_date = self._normalize_date(end_date)
+            end_date = min(self._normalize_date(end_date), date.today())
 
         tickers = [t.upper() for t in tickers]
         results = {}
@@ -661,7 +678,7 @@ class DataManager:
                 tickers_to_download[ticker] = [(effective_start, end_date)]
             else:
                 tracker = self._get_interval_tracker(ticker)
-                missing = tracker.get_missing_intervals(effective_start, end_date)
+                missing = self._missing_intervals(ticker, tracker, effective_start, end_date)
 
                 if missing:
                     tickers_to_download[ticker] = missing
@@ -683,33 +700,20 @@ class DataManager:
                 print(f"  {ticker}: {', '.join(interval_strs)}")
             print()
 
-            # Decide: bulk yf.download() only when all tickers need the same full range
-            # (e.g., force_update or fresh database). Otherwise, sequential per-ticker
-            # interval-targeted downloads are more efficient and avoid wasted API calls.
-            all_need_full_range = (
-                self.data_source == 'yfinance'  # FMP has no bulk endpoint
-                and not sequential
-                and len(all_tickers_needing_data) > 1
-                and all(
-                    len(intervals) == 1
-                    and intervals[0][0] <= start_date
-                    and intervals[0][1] >= end_date
-                    for intervals in tickers_to_download.values()
-                )
-            )
-
-            if all_need_full_range:
-                # True bulk download - all tickers need the same full range
-                print(f"↓ Bulk downloading {len(all_tickers_needing_data)} tickers (full range)...")
-                self._bulk_download_and_save(
-                    all_tickers_needing_data, start_date, end_date,
-                    ticker_intervals=tickers_to_download
-                )
-            else:
-                # Sequential with per-ticker intervals (most efficient for catch-up)
-                print(f"↓ Downloading {len(all_tickers_needing_data)} tickers (interval-targeted)...")
-                self._sequential_download(all_tickers_needing_data, start_date, end_date,
-                                          tickers_to_download)
+            # Tickers missing the same date ranges share one batched yf.download() per range;
+            # anything else downloads per ticker, per gap.
+            groups: Dict[tuple, List[str]] = {}
+            for ticker, intervals in tickers_to_download.items():
+                groups.setdefault(tuple(intervals), []).append(ticker)
+            for intervals, group in groups.items():
+                if self.data_source == 'yfinance' and not sequential and len(group) > 1:
+                    print(f"↓ Bulk downloading {', '.join(group)} ({len(intervals)} range(s))")
+                    for s_, e_ in intervals:
+                        self._bulk_download_and_save(group, s_, e_, {t: [(s_, e_)] for t in group})
+                else:
+                    print(f"↓ Downloading {', '.join(group)}")
+                    self._sequential_download(group, start_date, end_date,
+                                              {t: list(intervals) for t in group})
 
         # Retrieve all data from database
         for ticker in tickers:
@@ -763,10 +767,19 @@ class DataManager:
                     break
 
                 if df is None or df.empty:
+                    if self._is_closed_window(c_start, c_end):   # holiday for every ticker
+                        for ticker in batch:
+                            tracker = self._get_interval_tracker(ticker)
+                            tracker.add_interval(c_start, c_end)
+                            self._save_interval_tracker(ticker, tracker)
                     continue
                 for ticker in batch:
                     ticker_df = self._extract_ticker_frame(df, ticker)
                     if ticker_df is None or ticker_df.empty:
+                        if self._is_closed_window(c_start, c_end):
+                            tracker = self._get_interval_tracker(ticker)
+                            tracker.add_interval(c_start, c_end)
+                            self._save_interval_tracker(ticker, tracker)
                         continue
                     self._save_to_db(ticker, ticker_df)
                     tracker = self._get_interval_tracker(ticker)
