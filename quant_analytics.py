@@ -1,526 +1,381 @@
 """
-Enhanced Quant Analytics Module
+Performance metrics: the single source of every number in reports.
 
-Inspired by Portfolio Visualizer, provides:
-- Risk-adjusted return metrics (Sharpe, Sortino, Calmar, Treynor)
-- Drawdown analysis with recovery times
-- Rolling statistics
-- Factor regression (market beta, alpha)
-- Capture ratios (upside/downside)
-- Value at Risk (VaR) and Conditional VaR
-- Return decomposition
+Conventions (chosen to match Portfolio Visualizer where it matters):
+- CAGR is time-weighted and annualized by calendar span: (end/start)^(365.25/days) - 1.
+  It never depends on how many rows a series has, so 24/7 crypto and 5-day
+  equity calendars annualize correctly.
+- Stdev, Sharpe, Sortino, beta, capture ratios and VaR use MONTHLY returns
+  (PV's default), falling back to daily returns for histories under a year.
+- Sharpe = mean(excess) / std(excess) * sqrt(periods/yr); excess over a
+  constant annual risk-free rate converted to the period.
+- Sortino = annualized mean excess / downside deviation, where downside
+  deviation = sqrt(mean(min(excess, 0)^2)) over ALL periods.
+- Max drawdown uses the daily series (deeper than PV's month-end drawdown).
+- Best/Worst Year use calendar-year compounded returns (full years only when
+  at least one exists).
+- With contributions, every return-based metric uses the time-weighted index
+  (cash flows removed). Money-weighted return is reported separately as IRR.
 """
+from datetime import date
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from scipy import stats
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-from datetime import date
+from scipy import optimize, stats
+
+TRADING_DAYS = 252
+DAYS_PER_YEAR = 365.25
 
 
-@dataclass
-class DrawdownPeriod:
-    """Represents a single drawdown period"""
-    start_date: date
-    trough_date: date
-    recovery_date: Optional[date]
-    drawdown: float  # Negative percentage
-    length_days: int
-    recovery_days: Optional[int]
+# ---------------------------------------------------------------------------
+# Calendar helpers
+# ---------------------------------------------------------------------------
+
+def years_between(start, end) -> float:
+    return (pd.Timestamp(end) - pd.Timestamp(start)).days / DAYS_PER_YEAR
 
 
-@dataclass
-class RiskMetrics:
-    """Comprehensive risk metrics"""
-    # Basic
-    cagr: float
-    arithmetic_return: float
-    volatility: float
+def infer_periods_per_year(index: pd.DatetimeIndex) -> float:
+    """Observed rows per calendar year (~252 for equities, ~365 for crypto)."""
+    if len(index) < 2:
+        return float(TRADING_DAYS)
+    span = years_between(index[0], index[-1])
+    return (len(index) - 1) / span if span > 0 else float(TRADING_DAYS)
 
-    # Risk-adjusted
-    sharpe_ratio: float
-    sortino_ratio: float
-    calmar_ratio: float
-    treynor_ratio: Optional[float]
-    information_ratio: Optional[float]
 
-    # Downside
-    max_drawdown: float
-    average_drawdown: float
-    downside_deviation: float
+# ---------------------------------------------------------------------------
+# Series transforms
+# ---------------------------------------------------------------------------
 
-    # VaR
-    var_95: float
-    var_99: float
-    cvar_95: float
+def growth_index(returns: pd.Series, start_value: float = 1.0) -> pd.Series:
+    return start_value * (1 + returns.fillna(0)).cumprod()
 
-    # Capture ratios (vs benchmark)
-    upside_capture: Optional[float]
-    downside_capture: Optional[float]
 
-    # Market exposure
-    beta: Optional[float]
-    alpha: Optional[float]
-    r_squared: Optional[float]
-    correlation: Optional[float]
+def periodic_returns(index: pd.Series, freq: str = 'ME') -> pd.Series:
+    """Returns over calendar periods from a value/growth series.
 
-    # Distribution
-    skewness: float
-    kurtosis: float
-    positive_periods: float  # % of periods with positive returns
+    The first period runs from the series' first value, so a partial first
+    month/year is measured from the actual start.
+    """
+    ends = index.resample(freq).last().dropna()
+    prev = ends.shift(1)
+    prev.iloc[0] = index.iloc[0]
+    return (ends / prev - 1).dropna()
 
+
+def monthly_returns(index: pd.Series) -> pd.Series:
+    return periodic_returns(index, 'ME')
+
+
+def annual_returns(index: pd.Series) -> pd.DataFrame:
+    """Calendar-year returns with a flag for partial first/last years."""
+    r = periodic_returns(index, 'YE')
+    first, last = index.index[0], index.index[-1]
+    years = r.index.year
+    partial = [(y == first.year and (first.month, first.day) > (1, 7)) or
+               (y == last.year and (last.month, last.day) < (12, 24)) for y in years]
+    return pd.DataFrame({'return': r.values, 'partial': partial}, index=years)
+
+
+def monthly_returns_table(index: pd.Series) -> pd.DataFrame:
+    """Year x month grid of returns plus a calendar-year column (PV style)."""
+    m = monthly_returns(index)
+    df = pd.DataFrame({'year': m.index.year, 'month': m.index.month, 'r': m.values})
+    table = df.pivot(index='year', columns='month', values='r')
+    table = table.reindex(columns=range(1, 13))
+    table.columns = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                     'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    table['Year'] = annual_returns(index)['return']
+    return table
+
+
+def drawdown_series(index: pd.Series) -> pd.Series:
+    return index / index.cummax() - 1
+
+
+def max_drawdown(index: pd.Series) -> float:
+    if len(index) < 2:
+        return 0.0
+    return float(drawdown_series(index).min())
+
+
+def drawdown_periods(index: pd.Series, top: int = 10, min_depth: float = 0.0) -> List[Dict]:
+    """Distinct peak-to-recovery episodes, deepest first."""
+    dd = drawdown_series(index).values
+    dates = index.index
+    periods = []
+    i, n = 0, len(dd)
+    while i < n:
+        if dd[i] < 0:
+            start = i - 1 if i > 0 else 0
+            j = i
+            while j < n and dd[j] < 0:
+                j += 1
+            trough = start + int(np.argmin(dd[start:j]))
+            recovered = j < n
+            periods.append({
+                'start': dates[start].date(),
+                'trough': dates[trough].date(),
+                'end': dates[j].date() if recovered else None,
+                'depth': float(dd[trough]),
+                'decline_days': (dates[trough] - dates[start]).days,
+                'recovery_days': (dates[j] - dates[trough]).days if recovered else None,
+                'underwater_days': ((dates[j] if recovered else dates[-1]) - dates[start]).days,
+            })
+            i = j
+        else:
+            i += 1
+    periods = [p for p in periods if p['depth'] <= -min_depth]
+    return sorted(periods, key=lambda p: p['depth'])[:top]
+
+
+def rolling_annualized_return(index: pd.Series, years: float) -> pd.Series:
+    """Annualized return over the trailing `years` calendar years at each date."""
+    offset = pd.DateOffset(days=int(round(years * DAYS_PER_YEAR)))
+    lookback = index.index - offset
+    valid = lookback >= index.index[0]
+    pos = index.index.searchsorted(lookback[valid], side='right') - 1
+    past = index.values[pos]
+    out = pd.Series(np.nan, index=index.index)
+    out[valid] = (index.values[valid] / past) ** (1 / years) - 1
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Scalar metrics on a return series (period-based)
+# ---------------------------------------------------------------------------
+
+def _rf_per_period(rf_annual: float, ppy: float) -> float:
+    return (1 + rf_annual) ** (1 / ppy) - 1
+
+
+def cagr_from_returns(returns: pd.Series, ppy: float = TRADING_DAYS) -> float:
+    returns = returns.dropna()
+    if len(returns) == 0:
+        return 0.0
+    growth = float((1 + returns).prod())
+    if growth <= 0:
+        return -1.0
+    return growth ** (ppy / len(returns)) - 1
+
+
+def cagr_from_index(index: pd.Series) -> float:
+    """Calendar-span CAGR of a value/growth series."""
+    yrs = years_between(index.index[0], index.index[-1])
+    if yrs <= 0 or index.iloc[0] <= 0:
+        return 0.0
+    ratio = index.iloc[-1] / index.iloc[0]
+    return float(ratio ** (1 / yrs) - 1) if ratio > 0 else -1.0
+
+
+def volatility(returns: pd.Series, ppy: float = TRADING_DAYS) -> float:
+    if len(returns) < 2:
+        return 0.0
+    return float(returns.std(ddof=1) * np.sqrt(ppy))
+
+
+def downside_deviation(returns: pd.Series, mar_per_period: float = 0.0,
+                       ppy: float = TRADING_DAYS) -> float:
+    if len(returns) == 0:
+        return 0.0
+    shortfall = np.minimum(returns.values - mar_per_period, 0.0)
+    return float(np.sqrt(np.mean(shortfall ** 2)) * np.sqrt(ppy))
+
+
+def sharpe_ratio(returns: pd.Series, rf_annual: float = 0.0, ppy: float = TRADING_DAYS) -> float:
+    excess = returns - _rf_per_period(rf_annual, ppy)
+    sd = excess.std(ddof=1) if len(excess) > 1 else 0.0
+    return float(excess.mean() / sd * np.sqrt(ppy)) if sd > 0 else 0.0
+
+
+def sortino_ratio(returns: pd.Series, rf_annual: float = 0.0, ppy: float = TRADING_DAYS) -> float:
+    rf = _rf_per_period(rf_annual, ppy)
+    dd = downside_deviation(returns, rf, ppy)
+    return float((returns.mean() - rf) * ppy / dd) if dd > 0 else 0.0
+
+
+def value_at_risk(returns: pd.Series, level: float = 0.05) -> float:
+    return float(np.percentile(returns, level * 100)) if len(returns) else 0.0
+
+
+def conditional_var(returns: pd.Series, level: float = 0.05) -> float:
+    var = value_at_risk(returns, level)
+    tail = returns[returns <= var]
+    return float(tail.mean()) if len(tail) else var
+
+
+def capture_ratios(returns: pd.Series, bench: pd.Series):
+    """PV-style up/down capture: ratio of geometric mean returns in up/down benchmark periods."""
+    def geo(r):
+        return (1 + r).prod() ** (1 / len(r)) - 1 if len(r) else np.nan
+
+    up, down = bench > 0, bench < 0
+    up_c = geo(returns[up]) / geo(bench[up]) if up.any() else np.nan
+    down_c = geo(returns[down]) / geo(bench[down]) if down.any() else np.nan
+    return float(up_c), float(down_c)
+
+
+def regression_stats(returns: pd.Series, bench: pd.Series, rf_annual: float, ppy: float) -> Dict:
+    rf = _rf_per_period(rf_annual, ppy)
+    ex_p, ex_b = returns - rf, bench - rf
+    if len(ex_p) < 3 or ex_b.std() == 0:
+        return {'Beta': np.nan, 'Alpha': np.nan, 'R2': np.nan, 'Correlation': np.nan}
+    res = stats.linregress(ex_b.values, ex_p.values)
+    return {
+        'Beta': float(res.slope),
+        'Alpha': float((1 + res.intercept) ** ppy - 1),
+        'R2': float(res.rvalue ** 2),
+        'Correlation': float(np.corrcoef(returns, bench)[0, 1]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Money-weighted return
+# ---------------------------------------------------------------------------
+
+def xirr(dates, amounts) -> float:
+    """Annualized IRR. amounts: negative = money in, positive = money out/final value."""
+    dates = pd.to_datetime(pd.Index(dates))
+    t = np.asarray((dates - dates[0]).days, dtype=float) / DAYS_PER_YEAR
+    a = np.asarray(amounts, dtype=float)
+
+    def npv(r):
+        return np.sum(a / (1 + r) ** t)
+
+    lo, hi = -0.9999, 1.0
+    while npv(hi) > 0 and hi < 1e6:
+        hi *= 2
+    if np.sign(npv(lo)) == np.sign(npv(hi)):
+        return np.nan
+    return float(optimize.brentq(npv, lo, hi, xtol=1e-10))
+
+
+# ---------------------------------------------------------------------------
+# Full metric set for a backtest
+# ---------------------------------------------------------------------------
+
+def compute_performance(balance: pd.Series, twr_index: pd.Series,
+                        contributions: Optional[pd.Series] = None,
+                        benchmark_index: Optional[pd.Series] = None,
+                        benchmark_name: Optional[str] = None,
+                        risk_free_rate: float = 0.0) -> Dict:
+    """All headline metrics for one backtest.
+
+    Args:
+        balance: Portfolio value in dollars (includes contributions).
+        twr_index: Time-weighted growth index (cash flows removed), same dates.
+        contributions: External cash added after the start, indexed by date.
+        benchmark_index: Benchmark growth index (aligned/overlapping dates).
+        risk_free_rate: Annual rate used for Sharpe/Sortino/alpha.
+    """
+    start_balance = float(balance.iloc[0])
+    end_balance = float(balance.iloc[-1])
+    contributions = contributions if contributions is not None else pd.Series(dtype=float)
+    contributions = contributions[contributions != 0]
+    total_contrib = float(contributions.sum())
+
+    monthly = monthly_returns(twr_index)
+    if len(monthly) >= 12:
+        rets, ppy, freq = monthly, 12.0, 'monthly'
+    else:
+        rets = twr_index.pct_change().dropna()
+        ppy, freq = infer_periods_per_year(twr_index.index), 'daily'
+
+    annual = annual_returns(twr_index)
+    full_years = annual[~annual['partial']]
+    year_pool = full_years if len(full_years) else annual
+
+    cagr = cagr_from_index(twr_index)
+    mdd = max_drawdown(twr_index)
+
+    flow_dates = [balance.index[0], *contributions.index, balance.index[-1]]
+    flow_amts = [-start_balance, *(-contributions.values), end_balance]
+    irr = xirr(flow_dates, flow_amts) if total_contrib else cagr
+
+    m = {
+        'Start Balance': start_balance,
+        'Total Contributions': total_contrib,
+        'End Balance': end_balance,
+        'CAGR': cagr,
+        'IRR': irr,
+        'Stdev': volatility(rets, ppy),
+        'Best Year': float(year_pool['return'].max()) if len(year_pool) else np.nan,
+        'Worst Year': float(year_pool['return'].min()) if len(year_pool) else np.nan,
+        'Max Drawdown': mdd,
+        'Sharpe': sharpe_ratio(rets, risk_free_rate, ppy),
+        'Sortino': sortino_ratio(rets, risk_free_rate, ppy),
+        'Calmar': cagr / abs(mdd) if mdd < 0 else np.nan,
+        'Downside Deviation': downside_deviation(rets, _rf_per_period(risk_free_rate, ppy), ppy),
+        'VaR 5%': value_at_risk(rets),
+        'CVaR 5%': conditional_var(rets),
+        'Skewness': float(rets.skew()) if len(rets) > 2 else np.nan,
+        'Excess Kurtosis': float(rets.kurt()) if len(rets) > 3 else np.nan,
+        'Positive Periods': float((rets > 0).mean()) if len(rets) else np.nan,
+        'Stats Frequency': freq,
+        'Years': years_between(twr_index.index[0], twr_index.index[-1]),
+        'Benchmark': benchmark_name,
+    }
+
+    if benchmark_index is not None and len(benchmark_index) > 1:
+        b = benchmark_index.reindex(twr_index.index).ffill().dropna()
+        p = twr_index.reindex(b.index)
+        if freq == 'monthly':
+            pr, br = monthly_returns(p), monthly_returns(b)
+        else:
+            pr, br = p.pct_change().dropna(), b.pct_change().dropna()
+        pr, br = pr.align(br, join='inner')
+        active = pr - br
+        te = volatility(active, ppy)
+        up_c, down_c = capture_ratios(pr, br)
+        m.update(regression_stats(pr, br, risk_free_rate, ppy))
+        m.update({
+            'Active Return': cagr_from_index(p) - cagr_from_index(b),
+            'Tracking Error': te,
+            'Info Ratio': float(active.mean() * ppy / te) if te > 0 else np.nan,
+            'Upside Capture': up_c,
+            'Downside Capture': down_c,
+        })
+    return m
+
+
+# ---------------------------------------------------------------------------
+# Period-count convenience wrapper (daily series, 252/yr unless told otherwise)
+# ---------------------------------------------------------------------------
 
 class QuantAnalytics:
-    """
-    Advanced quantitative analytics for portfolio analysis.
-    """
+    """Thin wrapper over the module functions for a single return series."""
 
-    # Risk-free rate (annualized)
-    RISK_FREE_RATE = 0.045  # 4.5%
-    TRADING_DAYS = 252
-
-    def __init__(self, risk_free_rate: float = None):
-        if risk_free_rate is not None:
-            self.RISK_FREE_RATE = risk_free_rate
-
-    def calculate_returns(self, prices: pd.Series) -> pd.Series:
-        """Calculate daily returns from prices"""
-        return prices.pct_change().dropna()
-
-    def calculate_log_returns(self, prices: pd.Series) -> pd.Series:
-        """Calculate log returns from prices"""
-        return np.log(prices / prices.shift(1)).dropna()
+    def __init__(self, risk_free_rate: float = 0.0, periods_per_year: float = TRADING_DAYS):
+        self.risk_free_rate = risk_free_rate
+        self.periods_per_year = periods_per_year
 
     def calculate_cagr(self, returns: pd.Series) -> float:
-        """Calculate Compound Annual Growth Rate"""
-        total_return = (1 + returns).prod()
-        years = len(returns) / self.TRADING_DAYS
-        if years <= 0:
-            return 0.0
-        return total_return ** (1 / years) - 1
+        return cagr_from_returns(returns, self.periods_per_year)
 
     def calculate_volatility(self, returns: pd.Series, annualize: bool = True) -> float:
-        """Calculate return volatility"""
-        vol = returns.std()
-        return vol * np.sqrt(self.TRADING_DAYS) if annualize else vol
+        return volatility(returns, self.periods_per_year if annualize else 1)
 
     def calculate_downside_deviation(self, returns: pd.Series, threshold: float = 0,
-                                      annualize: bool = True) -> float:
-        """Calculate downside deviation (semi-deviation)"""
-        downside = returns[returns < threshold]
-        if len(downside) == 0:
-            return 0.0
-        dd = np.sqrt(np.mean(downside ** 2))
-        return dd * np.sqrt(self.TRADING_DAYS) if annualize else dd
+                                     annualize: bool = True) -> float:
+        return downside_deviation(returns, threshold, self.periods_per_year if annualize else 1)
 
     def calculate_sharpe_ratio(self, returns: pd.Series) -> float:
-        """Calculate Sharpe Ratio"""
-        excess_return = self.calculate_cagr(returns) - self.RISK_FREE_RATE
-        vol = self.calculate_volatility(returns)
-        return excess_return / vol if vol > 0 else 0.0
+        return sharpe_ratio(returns, self.risk_free_rate, self.periods_per_year)
 
     def calculate_sortino_ratio(self, returns: pd.Series) -> float:
-        """Calculate Sortino Ratio (uses downside deviation)"""
-        excess_return = self.calculate_cagr(returns) - self.RISK_FREE_RATE
-        downside = self.calculate_downside_deviation(returns)
-        return excess_return / downside if downside > 0 else 0.0
-
-    def calculate_calmar_ratio(self, returns: pd.Series) -> float:
-        """Calculate Calmar Ratio (return / max drawdown)"""
-        cagr = self.calculate_cagr(returns)
-        max_dd = self.calculate_max_drawdown(returns)
-        return cagr / abs(max_dd) if max_dd != 0 else 0.0
+        return sortino_ratio(returns, self.risk_free_rate, self.periods_per_year)
 
     def calculate_max_drawdown(self, returns: pd.Series) -> float:
-        """Calculate maximum drawdown from returns"""
-        cumulative = (1 + returns).cumprod()
-        running_max = cumulative.cummax()
-        drawdown = (cumulative - running_max) / running_max
-        return drawdown.min()
+        idx = growth_index(returns)
+        return min(0.0, max_drawdown(pd.concat([pd.Series([1.0]), idx.reset_index(drop=True)])))
 
-    def calculate_drawdown_series(self, returns: pd.Series) -> pd.Series:
-        """Calculate drawdown series from returns"""
-        cumulative = (1 + returns).cumprod()
-        running_max = cumulative.cummax()
-        return (cumulative - running_max) / running_max
-
-    def analyze_drawdowns(self, returns: pd.Series,
-                          min_drawdown: float = 0.05) -> List[DrawdownPeriod]:
-        """
-        Analyze all drawdown periods.
-
-        Parameters:
-            returns: Daily returns series
-            min_drawdown: Minimum drawdown to include (e.g., 0.05 = 5%)
-
-        Returns list of DrawdownPeriod objects sorted by severity.
-        """
-        cumulative = (1 + returns).cumprod()
-        running_max = cumulative.cummax()
-        drawdown = (cumulative - running_max) / running_max
-
-        periods = []
-        in_drawdown = False
-        start_idx = None
-        trough_idx = None
-        trough_value = 0
-
-        for i, (dt, dd) in enumerate(drawdown.items()):
-            if dd < 0 and not in_drawdown:
-                # Start of drawdown
-                in_drawdown = True
-                start_idx = i - 1 if i > 0 else i
-                trough_idx = i
-                trough_value = dd
-            elif in_drawdown:
-                if dd < trough_value:
-                    # New trough
-                    trough_idx = i
-                    trough_value = dd
-                elif dd == 0:
-                    # Recovery
-                    if abs(trough_value) >= min_drawdown:
-                        periods.append(DrawdownPeriod(
-                            start_date=drawdown.index[start_idx].date() if hasattr(drawdown.index[start_idx], 'date') else drawdown.index[start_idx],
-                            trough_date=drawdown.index[trough_idx].date() if hasattr(drawdown.index[trough_idx], 'date') else drawdown.index[trough_idx],
-                            recovery_date=drawdown.index[i].date() if hasattr(drawdown.index[i], 'date') else drawdown.index[i],
-                            drawdown=trough_value,
-                            length_days=trough_idx - start_idx,
-                            recovery_days=i - trough_idx
-                        ))
-                    in_drawdown = False
-
-        # Handle ongoing drawdown
-        if in_drawdown and abs(trough_value) >= min_drawdown:
-            periods.append(DrawdownPeriod(
-                start_date=drawdown.index[start_idx].date() if hasattr(drawdown.index[start_idx], 'date') else drawdown.index[start_idx],
-                trough_date=drawdown.index[trough_idx].date() if hasattr(drawdown.index[trough_idx], 'date') else drawdown.index[trough_idx],
-                recovery_date=None,
-                drawdown=trough_value,
-                length_days=trough_idx - start_idx,
-                recovery_days=None
-            ))
-
-        return sorted(periods, key=lambda x: x.drawdown)
+    def calculate_calmar_ratio(self, returns: pd.Series) -> float:
+        mdd = self.calculate_max_drawdown(returns)
+        return self.calculate_cagr(returns) / abs(mdd) if mdd < 0 else 0.0
 
     def calculate_var(self, returns: pd.Series, confidence: float = 0.95) -> float:
-        """Calculate Value at Risk (historical method)"""
-        return np.percentile(returns, (1 - confidence) * 100)
+        return value_at_risk(returns, 1 - confidence)
 
     def calculate_cvar(self, returns: pd.Series, confidence: float = 0.95) -> float:
-        """Calculate Conditional VaR (Expected Shortfall)"""
-        var = self.calculate_var(returns, confidence)
-        return returns[returns <= var].mean()
-
-    def calculate_beta(self, returns: pd.Series, benchmark_returns: pd.Series) -> Tuple[float, float, float]:
-        """
-        Calculate beta and alpha vs benchmark.
-
-        Returns: (beta, alpha, r_squared)
-        """
-        # Align the series
-        aligned = pd.concat([returns, benchmark_returns], axis=1, join='inner').dropna()
-        if len(aligned) < 30:
-            return (None, None, None)
-
-        aligned.columns = ['portfolio', 'benchmark']
-
-        # Regression
-        slope, intercept, r_value, p_value, std_err = stats.linregress(
-            aligned['benchmark'], aligned['portfolio']
-        )
-
-        # Annualize alpha
-        alpha = intercept * self.TRADING_DAYS
-
-        return (slope, alpha, r_value ** 2)
-
-    def calculate_capture_ratios(self, returns: pd.Series,
-                                  benchmark_returns: pd.Series) -> Tuple[float, float]:
-        """
-        Calculate upside and downside capture ratios.
-
-        Returns: (upside_capture, downside_capture)
-        """
-        aligned = pd.concat([returns, benchmark_returns], axis=1, join='inner').dropna()
-        if len(aligned) < 30:
-            return (None, None)
-
-        aligned.columns = ['portfolio', 'benchmark']
-
-        # Upside periods
-        up_mask = aligned['benchmark'] > 0
-        up_portfolio = (1 + aligned.loc[up_mask, 'portfolio']).prod() ** (self.TRADING_DAYS / up_mask.sum()) - 1
-        up_benchmark = (1 + aligned.loc[up_mask, 'benchmark']).prod() ** (self.TRADING_DAYS / up_mask.sum()) - 1
-
-        upside_capture = (up_portfolio / up_benchmark) * 100 if up_benchmark != 0 else 0
-
-        # Downside periods
-        down_mask = aligned['benchmark'] < 0
-        down_portfolio = (1 + aligned.loc[down_mask, 'portfolio']).prod() ** (self.TRADING_DAYS / down_mask.sum()) - 1
-        down_benchmark = (1 + aligned.loc[down_mask, 'benchmark']).prod() ** (self.TRADING_DAYS / down_mask.sum()) - 1
-
-        downside_capture = (down_portfolio / down_benchmark) * 100 if down_benchmark != 0 else 0
-
-        return (upside_capture, downside_capture)
-
-    def calculate_information_ratio(self, returns: pd.Series,
-                                     benchmark_returns: pd.Series) -> float:
-        """Calculate Information Ratio"""
-        aligned = pd.concat([returns, benchmark_returns], axis=1, join='inner').dropna()
-        if len(aligned) < 30:
-            return None
-
-        aligned.columns = ['portfolio', 'benchmark']
-        active_returns = aligned['portfolio'] - aligned['benchmark']
-
-        active_return_ann = active_returns.mean() * self.TRADING_DAYS
-        tracking_error = active_returns.std() * np.sqrt(self.TRADING_DAYS)
-
-        return active_return_ann / tracking_error if tracking_error > 0 else 0
-
-    def calculate_treynor_ratio(self, returns: pd.Series,
-                                 benchmark_returns: pd.Series) -> Optional[float]:
-        """Calculate Treynor Ratio"""
-        beta, _, _ = self.calculate_beta(returns, benchmark_returns)
-        if beta is None or beta == 0:
-            return None
-
-        excess_return = self.calculate_cagr(returns) - self.RISK_FREE_RATE
-        return excess_return / beta
-
-    def get_full_metrics(self, returns: pd.Series,
-                         benchmark_returns: pd.Series = None) -> RiskMetrics:
-        """
-        Calculate all risk metrics for a return series.
-
-        Parameters:
-            returns: Daily portfolio returns
-            benchmark_returns: Daily benchmark returns (optional)
-        """
-        cagr = self.calculate_cagr(returns)
-        vol = self.calculate_volatility(returns)
-        max_dd = self.calculate_max_drawdown(returns)
-        dd_series = self.calculate_drawdown_series(returns)
-
-        # Benchmark-relative metrics
-        beta, alpha, r_sq = (None, None, None)
-        upside_cap, downside_cap = (None, None)
-        info_ratio = None
-        treynor = None
-        correlation = None
-
-        if benchmark_returns is not None:
-            beta, alpha, r_sq = self.calculate_beta(returns, benchmark_returns)
-            upside_cap, downside_cap = self.calculate_capture_ratios(returns, benchmark_returns)
-            info_ratio = self.calculate_information_ratio(returns, benchmark_returns)
-            treynor = self.calculate_treynor_ratio(returns, benchmark_returns)
-            correlation = returns.corr(benchmark_returns)
-
-        return RiskMetrics(
-            cagr=cagr,
-            arithmetic_return=returns.mean() * self.TRADING_DAYS,
-            volatility=vol,
-            sharpe_ratio=self.calculate_sharpe_ratio(returns),
-            sortino_ratio=self.calculate_sortino_ratio(returns),
-            calmar_ratio=self.calculate_calmar_ratio(returns),
-            treynor_ratio=treynor,
-            information_ratio=info_ratio,
-            max_drawdown=max_dd,
-            average_drawdown=dd_series[dd_series < 0].mean() if (dd_series < 0).any() else 0,
-            downside_deviation=self.calculate_downside_deviation(returns),
-            var_95=self.calculate_var(returns, 0.95),
-            var_99=self.calculate_var(returns, 0.99),
-            cvar_95=self.calculate_cvar(returns, 0.95),
-            upside_capture=upside_cap,
-            downside_capture=downside_cap,
-            beta=beta,
-            alpha=alpha,
-            r_squared=r_sq,
-            correlation=correlation,
-            skewness=returns.skew(),
-            kurtosis=returns.kurtosis(),
-            positive_periods=(returns > 0).mean() * 100
-        )
-
-    def calculate_rolling_metrics(self, returns: pd.Series,
-                                   window: int = 252) -> pd.DataFrame:
-        """
-        Calculate rolling metrics.
-
-        Returns DataFrame with:
-        - rolling_return: Annualized return
-        - rolling_vol: Annualized volatility
-        - rolling_sharpe: Rolling Sharpe ratio
-        - rolling_sortino: Rolling Sortino ratio
-        - rolling_max_dd: Rolling max drawdown
-        """
-        results = pd.DataFrame(index=returns.index)
-
-        # Rolling cumulative return
-        rolling_cum = returns.rolling(window).apply(
-            lambda x: (1 + x).prod() ** (self.TRADING_DAYS / len(x)) - 1
-        )
-        results['rolling_return'] = rolling_cum
-
-        # Rolling volatility
-        results['rolling_vol'] = returns.rolling(window).std() * np.sqrt(self.TRADING_DAYS)
-
-        # Rolling Sharpe
-        results['rolling_sharpe'] = (rolling_cum - self.RISK_FREE_RATE) / results['rolling_vol']
-
-        # Rolling Sortino
-        rolling_downside = returns.rolling(window).apply(
-            lambda x: np.sqrt(np.mean(x[x < 0] ** 2)) * np.sqrt(self.TRADING_DAYS) if (x < 0).any() else 0.01
-        )
-        results['rolling_sortino'] = (rolling_cum - self.RISK_FREE_RATE) / rolling_downside
-
-        # Rolling max drawdown
-        def rolling_max_dd(r):
-            cum = (1 + r).cumprod()
-            peak = cum.cummax()
-            dd = (cum - peak) / peak
-            return dd.min()
-
-        results['rolling_max_dd'] = returns.rolling(window).apply(rolling_max_dd)
-
-        return results
-
-    def calculate_monthly_returns(self, returns: pd.Series) -> pd.DataFrame:
-        """
-        Calculate monthly returns table (like Portfolio Visualizer).
-
-        Returns DataFrame with years as rows, months as columns.
-        """
-        # Ensure datetime index
-        if not isinstance(returns.index, pd.DatetimeIndex):
-            returns.index = pd.to_datetime(returns.index)
-
-        # Resample to monthly
-        monthly = (1 + returns).resample('M').prod() - 1
-
-        # Create pivot table
-        monthly_df = pd.DataFrame({
-            'year': monthly.index.year,
-            'month': monthly.index.month,
-            'return': monthly.values
-        })
-
-        pivot = monthly_df.pivot(index='year', columns='month', values='return')
-        pivot.columns = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-                         'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-
-        # Add annual return
-        annual = (1 + returns).resample('Y').prod() - 1
-        pivot['Year'] = annual.values
-
-        return pivot
-
-    def calculate_annual_returns(self, returns: pd.Series) -> pd.Series:
-        """Calculate annual returns"""
-        if not isinstance(returns.index, pd.DatetimeIndex):
-            returns.index = pd.to_datetime(returns.index)
-        return (1 + returns).resample('Y').prod() - 1
-
-
-def format_metrics_table(metrics: RiskMetrics) -> str:
-    """Format metrics as a readable table"""
-    lines = [
-        "=" * 50,
-        "RISK METRICS",
-        "=" * 50,
-        "",
-        "RETURNS",
-        f"  CAGR:              {metrics.cagr * 100:>8.2f}%",
-        f"  Arithmetic Mean:   {metrics.arithmetic_return * 100:>8.2f}%",
-        "",
-        "RISK",
-        f"  Volatility:        {metrics.volatility * 100:>8.2f}%",
-        f"  Max Drawdown:      {metrics.max_drawdown * 100:>8.2f}%",
-        f"  Avg Drawdown:      {metrics.average_drawdown * 100:>8.2f}%",
-        f"  Downside Dev:      {metrics.downside_deviation * 100:>8.2f}%",
-        "",
-        "RISK-ADJUSTED",
-        f"  Sharpe Ratio:      {metrics.sharpe_ratio:>8.2f}",
-        f"  Sortino Ratio:     {metrics.sortino_ratio:>8.2f}",
-        f"  Calmar Ratio:      {metrics.calmar_ratio:>8.2f}",
-    ]
-
-    if metrics.treynor_ratio is not None:
-        lines.append(f"  Treynor Ratio:     {metrics.treynor_ratio:>8.2f}")
-    if metrics.information_ratio is not None:
-        lines.append(f"  Information Ratio: {metrics.information_ratio:>8.2f}")
-
-    lines.extend([
-        "",
-        "VALUE AT RISK",
-        f"  VaR (95%):         {metrics.var_95 * 100:>8.2f}%",
-        f"  VaR (99%):         {metrics.var_99 * 100:>8.2f}%",
-        f"  CVaR (95%):        {metrics.cvar_95 * 100:>8.2f}%",
-    ])
-
-    if metrics.beta is not None:
-        lines.extend([
-            "",
-            "BENCHMARK METRICS",
-            f"  Beta:              {metrics.beta:>8.2f}",
-            f"  Alpha:             {metrics.alpha * 100:>8.2f}%",
-            f"  R-Squared:         {metrics.r_squared * 100:>8.2f}%",
-            f"  Correlation:       {metrics.correlation:>8.2f}",
-        ])
-
-    if metrics.upside_capture is not None:
-        lines.extend([
-            "",
-            "CAPTURE RATIOS",
-            f"  Upside Capture:    {metrics.upside_capture:>8.1f}%",
-            f"  Downside Capture:  {metrics.downside_capture:>8.1f}%",
-        ])
-
-    lines.extend([
-        "",
-        "DISTRIBUTION",
-        f"  Skewness:          {metrics.skewness:>8.2f}",
-        f"  Kurtosis:          {metrics.kurtosis:>8.2f}",
-        f"  % Positive:        {metrics.positive_periods:>8.1f}%",
-        "",
-        "=" * 50,
-    ])
-
-    return "\n".join(lines)
-
-
-# Quick analysis function
-def analyze_portfolio(prices: pd.Series,
-                      benchmark_prices: pd.Series = None,
-                      name: str = "Portfolio") -> Dict:
-    """
-    Quick portfolio analysis.
-
-    Parameters:
-        prices: Price series for portfolio
-        benchmark_prices: Price series for benchmark (optional)
-        name: Portfolio name
-
-    Returns dict with metrics and analysis.
-    """
-    qa = QuantAnalytics()
-
-    returns = qa.calculate_returns(prices)
-    benchmark_returns = qa.calculate_returns(benchmark_prices) if benchmark_prices is not None else None
-
-    metrics = qa.get_full_metrics(returns, benchmark_returns)
-    drawdowns = qa.analyze_drawdowns(returns)
-    monthly = qa.calculate_monthly_returns(returns)
-    rolling = qa.calculate_rolling_metrics(returns)
-
-    return {
-        'name': name,
-        'returns': returns,
-        'metrics': metrics,
-        'drawdowns': drawdowns,
-        'monthly_returns': monthly,
-        'rolling_metrics': rolling,
-        'formatted_report': format_metrics_table(metrics)
-    }
+        return conditional_var(returns, 1 - confidence)
