@@ -265,7 +265,8 @@ def compute_performance(balance: pd.Series, twr_index: pd.Series,
     Args:
         balance: Portfolio value in dollars (includes contributions).
         twr_index: Time-weighted growth index (cash flows removed), same dates.
-        contributions: External cash added after the start, indexed by date.
+        contributions: External cash flows after the start, indexed by date
+            (+ money added, - money withdrawn).
         benchmark_index: Benchmark growth index (aligned/overlapping dates).
         risk_free_rate: Annual rate used for Sharpe/Sortino/alpha.
     """
@@ -273,7 +274,8 @@ def compute_performance(balance: pd.Series, twr_index: pd.Series,
     end_balance = float(balance.iloc[-1])
     contributions = contributions if contributions is not None else pd.Series(dtype=float)
     contributions = contributions[contributions != 0]
-    total_contrib = float(contributions.sum())
+    total_contrib = float(contributions[contributions > 0].sum())
+    total_withdrawn = float(-contributions[contributions < 0].sum())
 
     monthly = monthly_returns(twr_index)
     if len(monthly) >= 12:
@@ -291,11 +293,12 @@ def compute_performance(balance: pd.Series, twr_index: pd.Series,
 
     flow_dates = [balance.index[0], *contributions.index, balance.index[-1]]
     flow_amts = [-start_balance, *(-contributions.values), end_balance]
-    irr = xirr(flow_dates, flow_amts) if total_contrib else cagr
+    irr = xirr(flow_dates, flow_amts) if len(contributions) else cagr
 
     m = {
         'Start Balance': start_balance,
         'Total Contributions': total_contrib,
+        'Total Withdrawals': total_withdrawn,
         'End Balance': end_balance,
         'CAGR': cagr,
         'IRR': irr,

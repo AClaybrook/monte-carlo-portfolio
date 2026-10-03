@@ -7,8 +7,8 @@ import numpy as np
 import pandas as pd
 
 import quant_analytics as qa
-from engine import (HistoricalReturns, align_asset_prices, calendar_schedule,
-                    contribution_schedule, run_engine)
+from engine import (HistoricalReturns, align_asset_prices, build_cash_flows, calendar_schedule,
+                    run_engine)
 from run_config import RebalanceConfig
 
 
@@ -33,6 +33,9 @@ class Backtester:
                      benchmark_ticker=None, start_date_override=None,
                      strategy=None, contribution_amount=0.0, contribution_frequency=21,
                      rebalance=None, apply_to: str = 'contributions',
+                     withdrawal_amount: float = 0.0, withdrawal_frequency='monthly',
+                     withdrawal_start_years: float = 0.0, contribution_years=None,
+                     cash_flow_growth: float = 0.0,
                      check_frequency: str = 'monthly', risk_free_rate: float = 0.0,
                      benchmark: Optional[dict] = None, end_date=None) -> Dict:
         """
@@ -53,12 +56,13 @@ class Backtester:
         tickers = [a['ticker'] for a in assets]
         ppy = qa.infer_periods_per_year(dates)
 
-        contrib_days = (contribution_schedule(contribution_frequency, n_days, dates=dates)
-                        if contribution_amount > 0 else np.zeros(n_days, dtype=bool))
+        years_at_step = np.asarray((dates[1:] - dates[0]).days, dtype=float) / qa.DAYS_PER_YEAR
+        flows = build_cash_flows(n_days, years_at_step, contribution_amount, contribution_frequency,
+                                 withdrawal_amount, withdrawal_frequency, withdrawal_start_years,
+                                 contribution_years, cash_flow_growth, dates=dates)
         res = run_engine(
             HistoricalReturns(returns), n_days, allocations, tickers, initial_capital,
-            contribution_amount=contribution_amount,
-            contribution_days=contrib_days,
+            cash_flows=flows,
             rebalance_days=calendar_schedule(dates, rebalance.frequency),
             rebalance_threshold=rebalance.threshold,
             transaction_cost_bps=rebalance.transaction_cost_bps,
@@ -69,11 +73,11 @@ class Backtester:
 
         balance = pd.Series(res.values[0], index=dates)
         twr = pd.Series(res.twr[0], index=dates)
-        contributions = pd.Series(contribution_amount, index=dates[res.contribution_steps],
-                                  dtype=float)
+        cash_flows = pd.Series(res.flow_amounts[0], index=dates[res.flow_steps], dtype=float)
+        contributions = cash_flows[cash_flows > 0]
 
         bench_index, bench_name = self._benchmark_index(prices, benchmark, benchmark_ticker, tickers)
-        metrics = qa.compute_performance(balance, twr, contributions, bench_index,
+        metrics = qa.compute_performance(balance, twr, cash_flows, bench_index,
                                          bench_name, risk_free_rate)
         metrics['Transaction Costs'] = float(res.costs[0])
         metrics['Rebalances'] = int(res.n_trades[0])
@@ -85,6 +89,8 @@ class Backtester:
             'balance': balance,
             'twr': twr,
             'contributions': contributions,
+            'cash_flows': cash_flows,
+            'depleted_on': dates[res.depleted_at[0]] if res.depleted_at[0] >= 0 else None,
             'total_invested': initial_capital + float(contributions.sum()),
             'drawdowns': qa.drawdown_series(twr),
             'rolling_1y': qa.rolling_annualized_return(twr, 1),

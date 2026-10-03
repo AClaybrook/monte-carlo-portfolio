@@ -111,6 +111,30 @@ def contribution_schedule(frequency, n_days: int, dates: Optional[pd.DatetimeInd
     return simulated_schedule(n_days, frequency, days_per_year)
 
 
+def build_cash_flows(n_days: int, years_at_step: np.ndarray, contribution_amount: float = 0.0,
+                     contribution_frequency=21, withdrawal_amount: float = 0.0,
+                     withdrawal_frequency='monthly', withdrawal_start_years: float = 0.0,
+                     contribution_years: Optional[float] = None, cash_flow_growth: float = 0.0,
+                     dates: Optional[pd.DatetimeIndex] = None, days_per_year: int = 252) -> np.ndarray:
+    """Signed cash flow per step: + contributions, - withdrawals.
+
+    years_at_step[t] is the time in years at step t (after day t's return);
+    amounts grow by (1 + cash_flow_growth) per year from the start.
+    """
+    flows = np.zeros(n_days)
+    growth = (1 + cash_flow_growth) ** np.asarray(years_at_step, dtype=float)
+    if contribution_amount:
+        sched = contribution_schedule(contribution_frequency, n_days, dates, days_per_year)
+        if contribution_years is not None:   # inclusive: 20 years of monthly = 240 contributions
+            sched = sched & (years_at_step <= contribution_years + 1e-9)
+        flows += sched * contribution_amount * growth
+    if withdrawal_amount:
+        sched = contribution_schedule(withdrawal_frequency, n_days, dates, days_per_year)
+        sched = sched & (years_at_step > withdrawal_start_years + 1e-9)   # first one after the start
+        flows -= sched * withdrawal_amount * growth
+    return flows
+
+
 # ---------------------------------------------------------------------------
 # Return sources
 # ---------------------------------------------------------------------------
@@ -208,6 +232,20 @@ class EngineResult:
     n_trades: np.ndarray                # (P,) rebalances executed
     contribution_steps: np.ndarray      # step indices (1-based) where cash was added
     events: List[dict] = field(default_factory=list)  # single-path runs only
+    flow_steps: np.ndarray = None       # (F,) steps with any scheduled cash flow
+    flow_amounts: np.ndarray = None     # (P, F) signed amounts actually applied (withdrawals capped)
+    depleted_at: np.ndarray = None      # (P,) step a withdrawal emptied the path, -1 if never
+
+
+def _apply_flow(holdings: np.ndarray, amount: float, weights, ones_k: np.ndarray):
+    """Contribution (amount > 0) split by `weights`, or withdrawal (amount < 0) sold
+    pro-rata and capped at the balance. Returns (holdings, per-path signed flow)."""
+    if amount > 0:
+        return holdings + weights * amount, np.full(len(holdings), float(amount))
+    v = holdings @ ones_k
+    take = np.minimum(-amount, np.maximum(v, 0.0))
+    keep = np.divide(v - take, v, out=np.zeros_like(v), where=v > 0)
+    return holdings * keep[:, None], -take
 
 
 def _sanitize(weights, base: np.ndarray, n_paths: int) -> np.ndarray:
@@ -228,6 +266,7 @@ def run_engine(source, n_days: int, base_weights, tickers: List[str],
                contribution_amount: float = 0.0,
                contribution_days: Optional[np.ndarray] = None,
                rebalance_days: Optional[np.ndarray] = None,
+               cash_flows: Optional[np.ndarray] = None,
                rebalance_threshold: Optional[float] = None,
                transaction_cost_bps: float = 0.0,
                strategy: Optional[AllocationStrategy] = None,
@@ -244,7 +283,11 @@ def run_engine(source, n_days: int, base_weights, tickers: List[str],
     K = len(base)
     ones_k = np.ones(K)  # row sums via matmul: ~10x faster than .sum(axis=1) for small K
     zeros = np.zeros(n_days, dtype=bool)
-    contribution_days = zeros if contribution_days is None or not contribution_amount else contribution_days
+    if cash_flows is None:
+        cash_flows = (np.zeros(n_days) if contribution_days is None or not contribution_amount
+                      else np.asarray(contribution_days, dtype=float) * contribution_amount)
+    cash_flows = np.asarray(cash_flows, dtype=float)   # signed: + contribution, - withdrawal
+    contribution_days = cash_flows > 0
     rebalance_days = zeros if rebalance_days is None else rebalance_days
     check_days = zeros if check_days is None else check_days
     strat_contrib = strategy is not None and apply_to in ('contributions', 'both')
@@ -258,8 +301,8 @@ def run_engine(source, n_days: int, base_weights, tickers: List[str],
     R = len(record_steps)
 
     if vectorize and strategy is None and not rebalance_threshold:
-        return _run_segments(source, n_days, base, initial_capital, contribution_amount,
-                             contribution_days, rebalance_days, transaction_cost_bps / 1e4,
+        return _run_segments(source, n_days, base, initial_capital, cash_flows,
+                             rebalance_days, transaction_cost_bps / 1e4,
                              periods_per_year, record_steps, chunk_days)
 
     holdings = np.tile(base, (P, 1)) * initial_capital
@@ -302,7 +345,8 @@ def run_engine(source, n_days: int, base_weights, tickers: List[str],
         return pbuf[:, idx] if portfolio else buf[:, idx, :]
 
     events = []
-    contribution_steps = []
+    contribution_steps, flow_steps, flow_log = [], [], []
+    depleted_at = np.full(P, -1)
 
     for c0 in range(0, n_days, chunk_days):
         block = source.chunk(c0, min(c0 + chunk_days, n_days))
@@ -352,14 +396,21 @@ def run_engine(source, n_days: int, base_weights, tickers: List[str],
                 target_s = _sanitize(strategy.get_allocation(ctx), base, P)
 
             flow = 0.0
-            if contribution_days[t]:
+            amount = cash_flows[t]
+            if amount > 0:
                 w_c = target_s if strat_contrib else base
-                holdings += w_c * contribution_amount
-                flow = contribution_amount
+                holdings, flow = _apply_flow(holdings, amount, w_c, ones_k)
                 contribution_steps.append(t + 1)
                 if collect_events and strat_contrib and np.abs(w_c[0] - base).max() > 1e-6:
                     events.append({'step': t + 1, 'type': 'contribution', 'trigger': 'strategy',
                                    'weights': w_c[0].copy()})
+            elif amount < 0:
+                holdings, flow = _apply_flow(holdings, amount, None, ones_k)
+                newly = (holdings @ ones_k <= 1e-9) & (depleted_at < 0)
+                depleted_at[newly] = t + 1
+            if amount != 0:
+                flow_steps.append(t + 1)
+                flow_log.append(flow)
 
             trade = all_paths if rebalance_days[t] else None
             reason = 'calendar' if rebalance_days[t] else None
@@ -379,6 +430,8 @@ def run_engine(source, n_days: int, base_weights, tickers: List[str],
                     reason = reason or 'threshold'
                 trade |= breach
 
+            if trade is not None:
+                trade = trade & (holdings @ ones_k > 0)   # nothing to trade in an emptied portfolio
             if trade is not None and trade.any():
                 v_now = holdings @ ones_k
                 before = holdings[trade] / np.where(v_now[trade] > 0, v_now[trade], 1)[:, None]
@@ -416,11 +469,14 @@ def run_engine(source, n_days: int, base_weights, tickers: List[str],
         max_drawdown=max_dd, volatility=np.sqrt(var * periods_per_year),
         costs=costs, n_trades=n_trades,
         contribution_steps=np.asarray(contribution_steps, dtype=int), events=events,
+        flow_steps=np.asarray(flow_steps, dtype=int),
+        flow_amounts=np.column_stack(flow_log) if flow_log else np.zeros((P, 0)),
+        depleted_at=depleted_at,
     )
 
 
-def _run_segments(source, n_days, base, initial_capital, contribution_amount,
-                  contribution_days, rebalance_days, cost_rate, periods_per_year,
+def _run_segments(source, n_days, base, initial_capital, cash_flows,
+                  rebalance_days, cost_rate, periods_per_year,
                   record_steps, chunk_days) -> EngineResult:
     """run_engine for portfolios without a strategy or drift band.
 
@@ -443,8 +499,9 @@ def _run_segments(source, n_days, base, initial_capital, contribution_amount,
         values_rec[:, rec_pos[0]] = v_prev
         twr_rec[:, rec_pos[0]] = 1.0
         weights_rec[:, rec_pos[0]] = base
-    events, contribution_steps = [], []
-    event_days = contribution_days | rebalance_days
+    events, contribution_steps, flow_steps, flow_log = [], [], [], []
+    depleted_at = np.full(P, -1)
+    event_days = (cash_flows != 0) | rebalance_days
 
     for c0 in range(0, n_days, chunk_days):
         c1 = min(c0 + chunk_days, n_days)
@@ -459,18 +516,24 @@ def _run_segments(source, n_days, base, initial_capital, contribution_amount,
             t = c0 + e
             holdings = held[:, -1, :].copy()
             flow = 0.0
-            if contribution_days[t]:
-                holdings += base * contribution_amount
-                flow = contribution_amount
-                contribution_steps.append(t + 1)
+            amount = cash_flows[t]
+            if amount != 0:
+                holdings, flow = _apply_flow(holdings, amount, base, ones_k)
+                if amount > 0:
+                    contribution_steps.append(t + 1)
+                else:
+                    newly = (holdings @ ones_k <= 1e-9) & (depleted_at < 0)
+                    depleted_at[newly] = t + 1
+                flow_steps.append(t + 1)
+                flow_log.append(flow)
             if rebalance_days[t]:
                 v_now = holdings @ ones_k
                 before = holdings / np.where(v_now > 0, v_now, 1)[:, None]
                 cost = np.abs(base * v_now[:, None] - holdings).sum(axis=1) * cost_rate
                 holdings = base * (v_now - cost)[:, None]
                 costs += cost
-                n_trades += 1
-                if P == 1:
+                n_trades += v_now > 0
+                if P == 1 and v_now[0] > 0:
                     events.append({'step': t + 1, 'type': 'rebalance', 'trigger': 'calendar',
                                    'before': before[0].copy(), 'weights': base.copy(),
                                    'turnover': float(np.abs(base - before[0]).sum() / 2)})
@@ -509,23 +572,33 @@ def _run_segments(source, n_days, base, initial_capital, contribution_amount,
         max_drawdown=max_dd, volatility=np.sqrt(var * periods_per_year),
         costs=costs, n_trades=n_trades,
         contribution_steps=np.asarray(contribution_steps, dtype=int), events=events,
+        flow_steps=np.asarray(flow_steps, dtype=int),
+        flow_amounts=np.column_stack(flow_log) if flow_log else np.zeros((P, 0)),
+        depleted_at=depleted_at,
     )
 
 
-def vectorized_irr(initial: float, contribution: float, contribution_years: np.ndarray,
+def vectorized_irr(initial: float, flow_years: np.ndarray, flow_amounts: np.ndarray,
                    final_values: np.ndarray, horizon_years: float) -> np.ndarray:
-    """Per-path annual IRR for identical cash flows and different end values (bisection)."""
-    lo = np.full(len(final_values), -0.9999)
-    hi = np.full(len(final_values), 10.0)
-    remaining = horizon_years - np.asarray(contribution_years, dtype=float)
+    """Per-path annual money-weighted return (bisection).
 
-    def fv(rate):
+    Solves initial*(1+r)^T + sum_j c_j (1+r)^(T - t_j) = V_T per path, where c_j are the
+    signed flows into the portfolio (+ contributions, - withdrawals) at t_j years.
+    flow_amounts: (F,) shared by all paths, or (P, F) per path.
+    """
+    final_values = np.asarray(final_values, dtype=float)
+    P = len(final_values)
+    remaining = horizon_years - np.asarray(flow_years, dtype=float)
+    amounts = np.broadcast_to(np.asarray(flow_amounts, dtype=float), (P, len(remaining)))
+    lo, hi = np.full(P, -0.9999), np.full(P, 10.0)
+
+    def excess(rate):
         g = 1 + rate[:, None]
-        return initial * g[:, 0] ** horizon_years + contribution * (g ** remaining[None, :]).sum(axis=1)
+        return initial * g[:, 0] ** horizon_years + (amounts * g ** remaining[None, :]).sum(axis=1) - final_values
 
     for _ in range(60):
         mid = (lo + hi) / 2
-        too_high = fv(mid) > final_values
+        too_high = excess(mid) > 0
         hi = np.where(too_high, mid, hi)
         lo = np.where(too_high, lo, mid)
     return (lo + hi) / 2

@@ -48,8 +48,8 @@ def run_walk_forward(label: str, fit: Callable[[List[dict]], Dict], assets: List
     if not schedule:
         return None
     first = schedule[0][0]
-    common = dict(start_date_override=first, end_date=end, contribution_amount=sim_cfg.contribution_amount,
-                  contribution_frequency=sim_cfg.contribution_frequency, rebalance=sim_cfg.rebalance,
+    common = dict(start_date_override=first, end_date=end, **sim_cfg.cash_flow_settings(),
+                  rebalance=sim_cfg.rebalance,
                   risk_free_rate=sim_cfg.risk_free_rate, benchmark=benchmark)
     bt = Backtester()
     oos = bt.run_backtest(assets, schedule[0][1], sim_cfg.initial_capital,

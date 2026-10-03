@@ -188,7 +188,8 @@ class TestMonteCarloConsistency:
         years = np.arange(1, 25) / 12
         r = 0.07
         final = 1000 * (1 + r) ** 2 + (100 * (1 + r) ** (2 - years)).sum()
-        assert vectorized_irr(1000, 100, years, np.array([final]), 2.0)[0] == pytest.approx(r, abs=1e-9)
+        assert vectorized_irr(1000, years, np.full(len(years), 100.0), np.array([final]), 2.0)[0] == \
+            pytest.approx(r, abs=1e-9)
 
 
 class TestVectorizedPathMatchesLoop:

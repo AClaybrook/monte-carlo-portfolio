@@ -24,3 +24,4 @@ config/*.py
 !config/example_config.py
 !config/strategy_example.py
 !config/synthetic_demo.py
+!config/retirement_demo.py

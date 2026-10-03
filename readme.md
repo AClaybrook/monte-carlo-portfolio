@@ -78,6 +78,24 @@ config = RunConfig(
 )
 ```
 
+### Withdrawals (retirement planning)
+
+```python
+SimulationConfig(
+    initial_capital=1_000_000,
+    withdrawal_amount=40_000 / 12, withdrawal_frequency='monthly',   # 4% a year
+    cash_flow_growth=0.025,        # raise contributions/withdrawals 2.5%/yr (inflation, nominal runs)
+    # Accumulate then retire: contribution_amount=..., contribution_years=20, withdrawal_start_years=20
+    years=30, method='block_bootstrap',
+)
+```
+
+Withdrawals sell every holding pro-rata. A path that runs out of money stays at $0 and counts as
+depleted. The report then shows the success rate (share of paths that never ran out), the median
+amount withdrawn, a portfolio-survival chart, and linear balance axes. With `inflation_rate` set,
+results are already in today's dollars, so leave `cash_flow_growth` at 0. Try it with
+`python main.py config/retirement_demo.py --synthetic`.
+
 ### Rebalancing
 
 `RebalanceConfig(frequency, threshold=None, transaction_cost_bps=0)`, or just the frequency
@@ -135,6 +153,8 @@ With `optimization` configured, the report also includes:
 - **Efficient frontier:** the long-only mean-variance frontier of the optimization assets, with every fixed-weight portfolio built from them placed on the chart (`efficient_frontier=False` to skip).
 
 ## How the numbers are computed
+
+Correctness is tested independently of the production code: `tests/reference_impl.py` is a deliberately naive share-counting simulator with first-principles metrics. The engine must match it to 1e-10 across about 100 randomized scenarios: contributions, withdrawals, every rebalance frequency, drift bands, costs and signal strategies. The Monte Carlo is checked against closed-form lognormal and bootstrap expectations. The report test parses the generated HTML and checks every chart against its table, and the tables against values recomputed from raw prices.
 
 One engine ([`engine.py`](engine.py)) runs both the historical backtest (one path) and the
 Monte Carlo (many paths), so a portfolio's rules behave identically in both. All report

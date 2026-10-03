@@ -65,8 +65,7 @@ def run_sweep(sweep: SweepConfig, asset_map: Dict[str, dict], sim_cfg: Simulatio
         check = strategy_conf.check_frequency if strategy_conf else 'monthly'
         bt = backtester.run_backtest(
             assets, weights, sim_cfg.initial_capital, start_date_override=start, end_date=end,
-            strategy=strategy, contribution_amount=sim_cfg.contribution_amount,
-            contribution_frequency=sim_cfg.contribution_frequency, rebalance=rebalance,
+            strategy=strategy, **sim_cfg.cash_flow_settings(), rebalance=rebalance,
             apply_to=apply_to, check_frequency=check, risk_free_rate=sim_cfg.risk_free_rate,
             benchmark=benchmark)
         mc = None

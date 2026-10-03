@@ -63,6 +63,7 @@ python -m pytest tests -q
 ## Configuration Highlights
 
 - `SimulationConfig`: `start_date`/`end_date` or `lookback_years`; `contribution_amount` + `contribution_frequency` (int trading days or `'monthly'`/`'quarterly'`/`'annual'`); `rebalance`; `risk_free_rate`; `method` (`bootstrap`, `block_bootstrap`, `geometric_brownian`, `parametric`); `block_size`; `seed`; `inflation_rate`.
+- Withdrawals: `withdrawal_amount`, `withdrawal_frequency`, `withdrawal_start_years`, `contribution_years`, `cash_flow_growth` (engine takes signed `cash_flows`; withdrawals sell pro-rata; `depleted_at` per path; `success_rate` / `probabilities['survival']`).
 - `PortfolioConfig.rebalance` overrides the default: a `RebalanceConfig(frequency, threshold, transaction_cost_bps)` or a frequency string.
 - `StrategyConfig(type, params, apply_to='contributions'|'rebalance'|'both', check_frequency='monthly')`. Types are the keys of `strategies.STRATEGY_BUILDERS`.
 - `RunConfig.benchmark_ticker` (defaults to `optimization.benchmark_ticker`).
@@ -80,6 +81,7 @@ python -m pytest tests -q
 ## Testing
 
 - `tests/test_performance.py`: golden metric values; `test_engine.py`: rebalancing, signals, costs, alignment, MC/backtest consistency; `test_monte_carlo.py`: generators, seeds, inflation; `test_sweeps.py`, `test_walk_forward.py`, `test_frontier.py`; `test_report.py`: end-to-end synthetic run.
+- `tests/reference_impl.py` is an independent naive simulator + first-principles metrics. `test_reference_crosscheck.py` and `test_withdrawals.py` require the engine to match it to 1e-10. `test_mc_analytic.py` checks the Monte Carlo against closed-form results. `test_report_numbers.py` parses the generated HTML and checks charts against tables and tables against raw prices. When changing engine or metrics, extend the reference, never loosen it.
 - `test_pv_benchmark.py` / `test_historical_validation.py` compare against Portfolio Visualizer reference numbers and need `stock_data.db`; they skip otherwise.
 - Test data that means "trading days" should use business-day dates (`freq='B'`); calendar-day dates are annualized as 365/yr.
 
