@@ -219,7 +219,7 @@ def capture_ratios(returns: pd.Series, bench: pd.Series):
 def regression_stats(returns: pd.Series, bench: pd.Series, rf_annual: float, ppy: float) -> Dict:
     rf = _rf_per_period(rf_annual, ppy)
     ex_p, ex_b = returns - rf, bench - rf
-    if len(ex_p) < 3 or ex_b.std() == 0:
+    if len(ex_p) < 3 or ex_b.std() == 0 or ex_p.std() == 0:
         return {'Beta': np.nan, 'Alpha': np.nan, 'R2': np.nan, 'Correlation': np.nan}
     res = stats.linregress(ex_b.values, ex_p.values)
     return {

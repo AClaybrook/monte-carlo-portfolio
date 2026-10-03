@@ -154,10 +154,10 @@ class SimulatedReturns:
         n_obs, k = self.hist.shape
         if method == 'geometric_brownian':
             logs = np.log1p(self.hist)
-            self.mu = logs.mean(axis=0)
+            self.mu = np.atleast_1d(logs.mean(axis=0))
             self.chol = _robust_cholesky(np.cov(logs, rowvar=False) if k > 1 else np.var(logs, ddof=1))
         elif method == 'parametric':
-            self.mu = self.hist.mean(axis=0)
+            self.mu = np.atleast_1d(self.hist.mean(axis=0))
             self.chol = _robust_cholesky(np.cov(self.hist, rowvar=False) if k > 1 else np.var(self.hist, ddof=1))
         elif method == 'block_bootstrap':
             self._pos = np.zeros(n_paths, dtype=np.int64)
@@ -182,9 +182,11 @@ class SimulatedReturns:
                 self._left -= 1
             r = self.hist[idx]
         else:
-            z = self.rng.standard_normal((self.n_paths, n, k))
-            x = self.mu + z @ self.chol.T
+            # float32 draws and a 2-D (BLAS) matmul: ~3x faster than a stacked 3-D matmul
+            z = self.rng.standard_normal((self.n_paths * n, k), dtype=np.float32)
+            x = (z @ self.chol.T.astype(np.float32) + self.mu.astype(np.float32)).reshape(self.n_paths, n, k)
             r = np.expm1(x) if self.method == 'geometric_brownian' else np.maximum(x, -0.99)
+            r = r.astype(np.float64)
         if self.deflator != 1.0:
             r = (1 + r) / self.deflator - 1
         return r
@@ -234,7 +236,8 @@ def run_engine(source, n_days: int, base_weights, tickers: List[str],
                periods_per_year: float = 252.0,
                record_steps: Optional[np.ndarray] = None,
                dates: Optional[pd.DatetimeIndex] = None,
-               chunk_days: int = 252) -> EngineResult:
+               chunk_days: int = 252,
+               vectorize: bool = True) -> EngineResult:
     P = source.n_paths
     base = np.asarray(base_weights, dtype=float)
     base = base / base.sum()
@@ -253,6 +256,11 @@ def run_engine(source, n_days: int, base_weights, tickers: List[str],
     record_steps = np.asarray(record_steps, dtype=int)
     rec_pos = {int(s): i for i, s in enumerate(record_steps)}
     R = len(record_steps)
+
+    if vectorize and strategy is None and not rebalance_threshold:
+        return _run_segments(source, n_days, base, initial_capital, contribution_amount,
+                             contribution_days, rebalance_days, transaction_cost_bps / 1e4,
+                             periods_per_year, record_steps, chunk_days)
 
     holdings = np.tile(base, (P, 1)) * initial_capital
     target = np.tile(base, (P, 1))
@@ -400,6 +408,99 @@ def run_engine(source, n_days: int, base_weights, tickers: List[str],
                 values_rec[:, pos] = v_end
                 twr_rec[:, pos] = twr
                 weights_rec[:, pos] = holdings / np.where(v_end > 0, v_end, 1)[:, None]
+
+    n = max(n_days, 2)
+    var = np.maximum(sum_r2 / n - (sum_r / n) ** 2, 0) * n / (n - 1)
+    return EngineResult(
+        record_steps=record_steps, values=values_rec, twr=twr_rec, weights=weights_rec,
+        max_drawdown=max_dd, volatility=np.sqrt(var * periods_per_year),
+        costs=costs, n_trades=n_trades,
+        contribution_steps=np.asarray(contribution_steps, dtype=int), events=events,
+    )
+
+
+def _run_segments(source, n_days, base, initial_capital, contribution_amount,
+                  contribution_days, rebalance_days, cost_rate, periods_per_year,
+                  record_steps, chunk_days) -> EngineResult:
+    """run_engine for portfolios without a strategy or drift band.
+
+    Holdings only change on contribution/rebalance days, so each stretch between
+    events is a vectorized cumulative product instead of a Python loop per day.
+    Produces the same results as the day loop (see tests/test_engine.py).
+    """
+    P, K = source.n_paths, len(base)
+    ones_k = np.ones(K)
+    rec_pos = {int(s): i for i, s in enumerate(record_steps)}
+    R = len(record_steps)
+
+    holdings = np.tile(base, (P, 1)) * initial_capital
+    v_prev = holdings @ ones_k
+    twr, twr_peak = np.ones(P), np.ones(P)
+    max_dd, sum_r, sum_r2, costs = np.zeros(P), np.zeros(P), np.zeros(P), np.zeros(P)
+    n_trades = np.zeros(P, dtype=int)
+    values_rec, twr_rec, weights_rec = np.empty((P, R)), np.empty((P, R)), np.empty((P, R, K))
+    if 0 in rec_pos:
+        values_rec[:, rec_pos[0]] = v_prev
+        twr_rec[:, rec_pos[0]] = 1.0
+        weights_rec[:, rec_pos[0]] = base
+    events, contribution_steps = [], []
+    event_days = contribution_days | rebalance_days
+
+    for c0 in range(0, n_days, chunk_days):
+        c1 = min(c0 + chunk_days, n_days)
+        block = source.chunk(c0, c1)
+        cuts = [int(e) for e in np.flatnonzero(event_days[c0:c1])]
+        if not cuts or cuts[-1] != c1 - c0 - 1:
+            cuts.append(c1 - c0 - 1)
+        s = 0
+        for e in cuts:
+            held = holdings[:, None, :] * np.cumprod(1 + block[:, s:e + 1, :], axis=1)
+            vals = held @ ones_k                                   # (P, n) end-of-day values
+            t = c0 + e
+            holdings = held[:, -1, :].copy()
+            flow = 0.0
+            if contribution_days[t]:
+                holdings += base * contribution_amount
+                flow = contribution_amount
+                contribution_steps.append(t + 1)
+            if rebalance_days[t]:
+                v_now = holdings @ ones_k
+                before = holdings / np.where(v_now > 0, v_now, 1)[:, None]
+                cost = np.abs(base * v_now[:, None] - holdings).sum(axis=1) * cost_rate
+                holdings = base * (v_now - cost)[:, None]
+                costs += cost
+                n_trades += 1
+                if P == 1:
+                    events.append({'step': t + 1, 'type': 'rebalance', 'trigger': 'calendar',
+                                   'before': before[0].copy(), 'weights': base.copy(),
+                                   'turnover': float(np.abs(base - before[0]).sum() / 2)})
+            v_end = holdings @ ones_k
+
+            ends = vals.copy()
+            ends[:, -1] = v_end - flow
+            prev = np.concatenate([v_prev[:, None], vals[:, :-1]], axis=1)
+            day_r = np.divide(ends, prev, out=np.ones_like(ends), where=prev > 0) - 1
+            path = twr[:, None] * np.cumprod(1 + day_r, axis=1)
+            peak = np.maximum(np.maximum.accumulate(path, axis=1), twr_peak[:, None])
+            np.minimum(max_dd, (path / peak - 1).min(axis=1), out=max_dd)
+            twr, twr_peak = path[:, -1].copy(), peak[:, -1].copy()
+            sum_r += day_r.sum(axis=1)
+            sum_r2 += (day_r * day_r).sum(axis=1)
+
+            last = e - s
+            for j in range(last + 1):
+                pos = rec_pos.get(c0 + s + j + 1)
+                if pos is None:
+                    continue
+                twr_rec[:, pos] = path[:, j]
+                if j == last:
+                    values_rec[:, pos] = v_end
+                    weights_rec[:, pos] = holdings / np.where(v_end > 0, v_end, 1)[:, None]
+                else:
+                    values_rec[:, pos] = vals[:, j]
+                    weights_rec[:, pos] = held[:, j, :] / np.where(vals[:, j] > 0, vals[:, j], 1)[:, None]
+            v_prev = v_end
+            s = e + 1
 
     n = max(n_days, 2)
     var = np.maximum(sum_r2 / n - (sum_r / n) ** 2, 0) * n / (n - 1)

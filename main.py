@@ -35,6 +35,10 @@ def evaluate_portfolio(sim, backtester, sim_cfg, label, assets, weights, start=N
     """Monte Carlo + backtest with identical cash flows, rebalancing and benchmark."""
     strategy = create_strategy_from_config(strategy_conf) if strategy_conf else None
     apply_to = strategy_conf.apply_to if strategy_conf else 'contributions'
+    if strategy is None:
+        # Zero-weight assets never trade without a strategy; skipping them saves simulation work
+        kept = [(a, w) for a, w in zip(assets, weights) if w > 1e-9]
+        assets, weights = [a for a, _ in kept], [w for _, w in kept]
     check = strategy_conf.check_frequency if strategy_conf else 'monthly'
     rebalance = rebalance or sim_cfg.rebalance
     sim_res = sim.simulate_portfolio(

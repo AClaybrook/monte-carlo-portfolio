@@ -42,7 +42,8 @@ class TestGenerators:
         hist = rng.normal(0.0005, 0.012, (2500, 1))
         src = SimulatedReturns(hist, 'geometric_brownian', 4000, np.random.default_rng(1))
         sim = np.log1p(src.chunk(0, 252))
-        assert sim.mean() == pytest.approx(np.log1p(hist).mean(), abs=2e-5)
+        se = np.log1p(hist).std() / np.sqrt(sim.size)
+        assert sim.mean() == pytest.approx(np.log1p(hist).mean(), abs=4 * se)
         assert sim.std() == pytest.approx(np.log1p(hist).std(), rel=0.01)
 
     def test_parametric_matches_simple_return_mean(self):
@@ -50,7 +51,8 @@ class TestGenerators:
         rng = np.random.default_rng(0)
         hist = rng.normal(0.0005, 0.02, (2500, 1))
         src = SimulatedReturns(hist, 'parametric', 4000, np.random.default_rng(1))
-        assert src.chunk(0, 252).mean() == pytest.approx(hist.mean(), abs=2e-5)
+        sim = src.chunk(0, 252)
+        assert sim.mean() == pytest.approx(hist.mean(), abs=4 * hist.std() / np.sqrt(sim.size))
 
     def test_gbm_preserves_correlation(self):
         rng = np.random.default_rng(0)

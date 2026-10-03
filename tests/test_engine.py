@@ -189,3 +189,46 @@ class TestMonteCarloConsistency:
         r = 0.07
         final = 1000 * (1 + r) ** 2 + (100 * (1 + r) ** (2 - years)).sum()
         assert vectorized_irr(1000, 100, years, np.array([final]), 2.0)[0] == pytest.approx(r, abs=1e-9)
+
+
+class TestVectorizedPathMatchesLoop:
+    """The segment-vectorized fast path must reproduce the day loop exactly."""
+
+    @pytest.mark.parametrize('freq,contrib,cost', [
+        ('none', 0, 0), ('annual', 0, 0), ('monthly', 500, 0), ('quarterly', 250, 15)])
+    def test_simulated(self, freq, contrib, cost):
+        from engine import SimulatedReturns, run_engine
+        rng = np.random.default_rng(0)
+        hist = rng.normal(0.0004, 0.01, (1500, 3))
+        n_days, dpy = 3 * 252, 252
+        record = np.unique(np.round(np.linspace(0, n_days, 37)).astype(int))
+        kw = dict(n_days=n_days, base_weights=[0.5, 0.3, 0.2], tickers=['A', 'B', 'C'],
+                  initial_capital=10000, contribution_amount=contrib,
+                  contribution_days=simulated_schedule(n_days, 'monthly', dpy),
+                  rebalance_days=simulated_schedule(n_days, freq, dpy),
+                  transaction_cost_bps=cost, record_steps=record)
+        out = [run_engine(SimulatedReturns(hist, 'bootstrap', 40, np.random.default_rng(3)),
+                          vectorize=v, **kw) for v in (False, True)]
+        for field in ('values', 'twr', 'weights', 'max_drawdown', 'volatility', 'costs',
+                      'n_trades', 'contribution_steps'):
+            np.testing.assert_allclose(getattr(out[1], field), getattr(out[0], field),
+                                       rtol=1e-9, atol=1e-9, err_msg=field)
+
+    def test_historical_events_match(self):
+        a = asset('A', random_prices(BDAYS, 0.0008, 0.012, 1))
+        b = asset('B', random_prices(BDAYS, 0.0001, 0.004, 2))
+        fast = Backtester().run_backtest([a, b], [0.6, 0.4], 10000, rebalance='quarterly',
+                                         contribution_amount=300, contribution_frequency='monthly')
+        import engine
+        orig = engine.run_engine
+        try:
+            engine_slow = lambda *args, **kw: orig(*args, vectorize=False, **kw)
+            import backtester
+            backtester.run_engine = engine_slow
+            slow = Backtester().run_backtest([a, b], [0.6, 0.4], 10000, rebalance='quarterly',
+                                             contribution_amount=300, contribution_frequency='monthly')
+        finally:
+            backtester.run_engine = orig
+        np.testing.assert_allclose(fast['values'], slow['values'], rtol=1e-10)
+        assert len(fast['events']) == len(slow['events'])
+        assert fast['metrics']['Sharpe'] == pytest.approx(slow['metrics']['Sharpe'])
