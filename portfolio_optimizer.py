@@ -13,6 +13,14 @@ class PortfolioOptimizer:
         self.data_manager = data_manager
         self._data_cache = {}  # Cache for aligned returns/covariance
         self.periods_per_year = 252.0
+        self.verbose = True
+
+    @staticmethod
+    def _span(asset):
+        data = asset.get('full_data')
+        if data is None or data.empty:
+            data = asset['historical_returns']
+        return (data.index[0], data.index[-1], len(data))
 
     def _get_data(self, assets, start_date_override=None):
         """
@@ -20,7 +28,8 @@ class PortfolioOptimizer:
         Results are cached to avoid redundant computation across optimization strategies.
         """
         # Check cache first
-        cache_key = (tuple(a['ticker'] for a in assets), start_date_override)
+        # Key on each asset's data span too: walk-forward refits pass sliced copies
+        cache_key = (tuple((a['ticker'], *self._span(a)) for a in assets), start_date_override)
         if cache_key in self._data_cache:
             cached = self._data_cache[cache_key]
             self.periods_per_year = qa.infer_periods_per_year(cached[0].index)
@@ -266,7 +275,8 @@ class PortfolioOptimizer:
         allocations = allocations / np.sum(allocations)
         alloc_str = " | ".join(f"{a['ticker']}: {w*100:.1f}%"
                                for a, w in zip(assets, allocations) if w > 0.001)
-        print(f"  → {label}: {alloc_str}")
+        if self.verbose:
+            print(f"  → {label}: {alloc_str}")
         return {'label': label,
                 'score': -scipy_result.fun if scipy_result.success else 0,
                 'allocations': allocations}

@@ -15,6 +15,7 @@ from portfolio_optimizer import PortfolioOptimizer
 from visualizations import PortfolioVisualizer
 from pv_compat import save_portfolio_csv
 from sweeps import run_sweep
+from walk_forward import run_walk_forward
 from backtester import Backtester
 
 
@@ -267,6 +268,7 @@ def main():
         portfolio_results.append(evaluate(p_conf.name, assets, weights, p_conf.strategy,
                                           p_conf.rebalance, p_conf.description))
 
+    walk_forward_results = []
     if config.optimization and not args.no_optimize:
         print("\n" + "="*60)
         print("RUNNING OPTIMIZATIONS (in-sample: weights are fit to the same history they are tested on)")
@@ -277,30 +279,44 @@ def main():
         if len(opt_assets) < 2:
             print("⚠ Need at least 2 assets for optimization")
         else:
-            strategy_map = {
-                'max_sharpe': lambda: optimizer.optimize_sharpe_ratio(
-                    opt_assets, risk_free_rate=sim_cfg.risk_free_rate,
-                    start_date_override=global_start_date),
-                'min_volatility': lambda: optimizer.optimize_min_volatility(
-                    opt_assets, start_date_override=global_start_date),
-                'risk_parity': lambda: optimizer.optimize_risk_parity(
-                    opt_assets, start_date_override=global_start_date),
-                'max_sortino': lambda: optimizer.optimize_sortino_ratio(
-                    opt_assets, risk_free_rate=sim_cfg.risk_free_rate,
-                    start_date_override=global_start_date),
-                'custom_weighted': lambda: optimizer.optimize_custom_weighted(
-                    opt_assets, weights_config=config.optimization.objective_weights,
-                    risk_free_rate=sim_cfg.risk_free_rate,
-                    start_date_override=global_start_date),
+            rf = sim_cfg.risk_free_rate
+            fitters = {
+                'max_sharpe': lambda A, start=None: optimizer.optimize_sharpe_ratio(
+                    A, risk_free_rate=rf, start_date_override=start),
+                'min_volatility': lambda A, start=None: optimizer.optimize_min_volatility(
+                    A, start_date_override=start),
+                'risk_parity': lambda A, start=None: optimizer.optimize_risk_parity(
+                    A, start_date_override=start),
+                'max_sortino': lambda A, start=None: optimizer.optimize_sortino_ratio(
+                    A, risk_free_rate=rf, start_date_override=start),
+                'custom_weighted': lambda A, start=None: optimizer.optimize_custom_weighted(
+                    A, weights_config=config.optimization.objective_weights, risk_free_rate=rf,
+                    start_date_override=start),
             }
-            for strat_name in config.optimization.active_strategies:
-                if strat_name not in strategy_map:
+            opt_cfg = config.optimization
+            for strat_name in opt_cfg.active_strategies:
+                if strat_name not in fitters:
                     print(f"⚠ Unknown strategy: {strat_name}")
                     continue
                 print(f"\n→ {strat_name}...")
-                opt = strategy_map[strat_name]()
+                opt = fitters[strat_name](opt_assets, global_start_date)
                 portfolio_results.append(evaluate(opt['label'], opt_assets, opt['allocations'],
                                                   description='Optimized (in-sample)'))
+                if opt_cfg.walk_forward:
+                    optimizer.verbose = False
+                    wf = run_walk_forward(opt['label'], lambda A, f=fitters[strat_name]: f(A),
+                                          opt_assets, opt['allocations'], sim_cfg,
+                                          start=global_start_date, end=global_end_date,
+                                          train_years=opt_cfg.train_years, test_years=opt_cfg.test_years,
+                                          benchmark=bench_asset)
+                    optimizer.verbose = True
+                    if wf is None:
+                        print(f"  ⚠ Walk-forward skipped: need more than {opt_cfg.train_years} years of history")
+                    else:
+                        walk_forward_results.append(wf)
+                        mi, mo = wf['in_sample']['metrics'], wf['oos']['metrics']
+                        print(f"  Walk-forward ({len(wf['schedule'])} refits): CAGR {mo['CAGR']*100:.2f}% "
+                              f"vs in-sample {mi['CAGR']*100:.2f}% over the same window")
 
     sweep_results = []
     if config.sweeps:
@@ -343,6 +359,7 @@ def main():
         synthetic=args.synthetic,
         embed_plotlyjs=config.visualization.embed_plotlyjs or args.embed_plotlyjs,
         sweeps=sweep_results,
+        walk_forward=walk_forward_results,
     )
     print(f"✓ Report saved to: {output_path}")
 

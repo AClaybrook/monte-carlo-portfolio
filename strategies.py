@@ -15,9 +15,11 @@ paths: the same code runs on one historical path or 10,000 simulated ones.
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import bisect
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
+import pandas as pd
 
 
 @dataclass
@@ -326,6 +328,30 @@ class DualMomentumStrategy(AllocationStrategy):
         weights[risk_off] = 0.0
         weights[risk_off, safe] = 1.0
         return weights
+
+
+class ScheduledWeightsStrategy(AllocationStrategy):
+    """Piecewise-constant targets by date: [(effective_date, weights), ...].
+
+    Used for walk-forward tests (weights refit each window). Historical runs
+    only, since simulated paths have no dates; before the first date, and in
+    simulations, it returns base weights.
+    """
+    uses_rolling_stats = False
+
+    def __init__(self, schedule, name: str = "Scheduled weights"):
+        super().__init__(name=name)
+        self.schedule = sorted(((pd.Timestamp(d), np.asarray(w, dtype=float)) for d, w in schedule),
+                               key=lambda x: x[0])
+        self._dates = [d for d, _ in self.schedule]
+
+    def get_allocation(self, context: MarketContext) -> np.ndarray:
+        if context.current_date is None:
+            return context.base()
+        i = bisect.bisect_right(self._dates, pd.Timestamp(context.current_date)) - 1
+        if i < 0:
+            return context.base()
+        return np.tile(self.schedule[i][1], (context.n_paths, 1))
 
 
 class CompositeStrategy(AllocationStrategy):

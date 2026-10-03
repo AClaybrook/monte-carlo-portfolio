@@ -544,6 +544,60 @@ class PortfolioVisualizer:
                 f'<details><summary>All cells, best Sharpe first</summary>{self._sweep_table(res)}</details>')
         return ''.join(parts)
 
+    def _walk_forward_section(self, wfs, figs):
+        headers = ['Optimizer', 'Out-of-sample window', 'Refits', 'CAGR in-sample', 'CAGR walk-forward',
+                   'Sharpe in-sample', 'Sharpe walk-forward', 'Max DD in-sample', 'Max DD walk-forward',
+                   'Avg refit turnover']
+        rows = []
+        for wf in wfs:
+            mi, mo = wf['in_sample']['metrics'], wf['oos']['metrics']
+            d = wf['oos']['dates']
+            rows.append([wf['label'], f"{d[0].date()} to {d[-1].date()}", str(len(wf['schedule'])),
+                         pct(mi['CAGR']), pct(mo['CAGR']), num(mi['Sharpe']), num(mo['Sharpe']),
+                         pct(mi['Max Drawdown']), pct(mo['Max Drawdown']), pct(wf['mean_refit_turnover'], 0)])
+
+        growth = go.Figure()
+        weights = go.Figure()
+        tickers = []
+        for wf in wfs:
+            for t in wf['tickers']:
+                if t not in tickers:
+                    tickers.append(t)
+        colors = {t: (SERIES[i] if i < len(SERIES) else OVERFLOW) for i, t in enumerate(tickers)}
+        shapes = []
+        for i, wf in enumerate(wfs):
+            vis = i == 0
+            for key, name, pair, width in (('in_sample', 'In-sample weights (hindsight)', BENCHMARK, 1.5),
+                                           ('oos', 'Walk-forward', SERIES[0], 2)):
+                bal = wf[key]['balance']
+                growth.add_trace(go.Scatter(x=bal.index, y=bal.values, name=name, meta=str(i), visible=vis,
+                                            line=dict(color=self._c(pair), width=width),
+                                            hovertemplate='%{y:$,.0f}'))
+            w = wf['oos']['weights'].resample('W').last().dropna(how='all')
+            for t in w.columns:
+                weights.add_trace(go.Scatter(
+                    x=w.index, y=w[t].values, name=t, meta=str(i), visible=vis, stackgroup=f's{i}',
+                    legendgroup=t, line=dict(width=1, color=self._chrome('surface')),
+                    fillcolor=self._c(colors[t]), hovertemplate='%{y:.1%}'))
+            for d, _ in wf['schedule']:
+                shapes.append(dict(type='line', xref='x', yref='paper', x0=d, x1=d, y0=0, y1=1, name=str(i),
+                                   visible=vis, line=dict(color=self._chrome('text2'), width=1)))
+        growth.update_layout(**self._layout(height=400, yfmt='$,.0f', ytitle='Balance (log scale)', ylog=True))
+        weights.update_layout(**self._layout(height=320, ytitle='Weight', shapes=shapes,
+                                             yaxis=dict(self._layout()['yaxis'], range=[0, 1], tickformat='.0%')))
+        figs['wfgrowth'], figs['wfweights'] = growth, weights
+        opts = ''.join(f'<option value="{i}">{esc(wf["label"])}</option>' for i, wf in enumerate(wfs))
+        wf0 = wfs[0]
+        return (f'<h2>Optimizer walk-forward check</h2><p class="lede">At each refit the optimizer sees only '
+                f'the previous {wf0["train_years"]} years, and its weights are held for the next '
+                f'{wf0["test_years"]} year(s). The in-sample line holds the full-history optimum over the same '
+                f'window; the gap between them is how much the optimized rows owe to hindsight.</p>'
+                f'{self._table(headers, rows)}'
+                f'<label class="select">Optimizer <select data-chart="wfgrowth wfweights">{opts}</select></label>'
+                f'<div class="chart" id="c-wfgrowth"></div>'
+                f'<h3>Walk-forward weights</h3><div class="chart" id="c-wfweights"></div>'
+                f'<p class="caption">Vertical lines mark refits.</p>')
+
     def _events_section(self, items):
         blocks = []
         for i, it in enumerate(items):
@@ -568,7 +622,8 @@ class PortfolioVisualizer:
     def generate_html_report(self, portfolio_results, filename, start_date=None, end_date=None,
                              title: str = 'Portfolio Analysis', assumptions: Optional[Dict[str, str]] = None,
                              synthetic: bool = False, embed_plotlyjs: bool = False,
-                             sweeps: Optional[List[Dict]] = None):
+                             sweeps: Optional[List[Dict]] = None,
+                             walk_forward: Optional[List[Dict]] = None):
         items = [it for it in portfolio_results if it.get('backtest') and it.get('results')]
         if not items:
             raise ValueError("No results to report")
@@ -664,6 +719,8 @@ class PortfolioVisualizer:
                 <h3>Median balance</h3>{chart('mcmedian')}
                 <h3>Annualized return distribution</h3>{chart('mcbox', 'Box = 25th–75th percentile, whiskers = 10th–90th, line = median.')}
                 <h3>Probability of loss</h3>{chart('mcloss', 'Share of paths whose balance is below the money invested so far.')}'''),
+            *([('walkforward', 'Walk-forward', self._walk_forward_section(walk_forward, figs))]
+              if walk_forward else []),
             *([('sweeps', 'Sweeps', self._sweeps_section(sweeps, figs))] if sweeps else []),
             ('notes', 'Notes', f'''
                 <h2>Assumptions and methodology</h2>
@@ -786,7 +843,7 @@ function swap(o) {{
   return o;
 }}
 function selectionFor(id) {{
-  const el = document.querySelector('select[data-chart="' + id.slice(2) + '"]');
+  const el = document.querySelector('select[data-chart~="' + id.slice(2) + '"]');
   return el ? el.value : null;
 }}
 function applySelection(fig, sel) {{

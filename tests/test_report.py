@@ -49,13 +49,13 @@ def test_main_synthetic_report(tmp_path):
         assert '<title>Smoke &lt;Test&gt;</title>' in page          # names are escaped
         assert 'Synthetic data.' in page
         for section in ('summary', 'growth', 'returns', 'drawdowns', 'risk', 'allocation',
-                        'montecarlo', 'sweeps', 'notes'):
+                        'montecarlo', 'walkforward', 'sweeps', 'notes'):
             assert f'<section id="{section}">' in page
         for label in ('Benchmark (VOO)', '60/40', 'Thirds', 'Protected', 'Min Volatility'):
             assert label in page
         assert 'signal rebalances' in page
         figs = json.loads(re.search(r'const FIGS = (\{.*?\});\nconst CMAP', page, re.S).group(1))
-        assert {'c-growth', 'c-mcfan', 'c-corr', 'c-allocation', 'c-sweep0'} <= set(figs)
+        assert {'c-growth', 'c-mcfan', 'c-corr', 'c-allocation', 'c-sweep0', 'c-wfgrowth'} <= set(figs)
         # Every PV backtest link has whole-percent weights summing to exactly 100
         urls = re.findall(r'href="(https://www.portfoliovisualizer.com/backtest-portfolio[^"]+)"', page)
         assert len(urls) == 5
