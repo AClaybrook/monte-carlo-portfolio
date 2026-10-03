@@ -379,3 +379,50 @@ class TestFMPDataSource:
             # Verify the condition would be False for FMP even if other conditions met
             assert dm.data_source != 'yfinance'
             dm.close()
+
+
+class TestChunkedDownloads:
+    """Large requests are split so no single Yahoo call is big enough to get rate limited."""
+
+    def _fake_download(self, calls):
+        def fake(tickers, start, end, **kw):
+            calls.append((tuple(tickers), start, end))
+            idx = pd.bdate_range(start, end - timedelta(days=1))
+            cols = pd.MultiIndex.from_product(
+                [tickers, ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']])
+            return pd.DataFrame(1.0, index=idx, columns=cols)
+        return fake
+
+    def test_date_chunks_cover_range_without_overlap(self, tmp_path):
+        dm = DataManager(str(tmp_path / 't.db'))
+        dm.max_chunk_years = 5
+        chunks = dm._date_chunks(date(2006, 1, 1), date(2025, 12, 31))
+        assert chunks[0][0] == date(2006, 1, 1)
+        assert chunks[-1][1] == date(2025, 12, 31)
+        for (_, e1), (s2, _) in zip(chunks, chunks[1:]):
+            assert s2 == e1 + timedelta(days=1)
+        assert all((e - s).days < 365.25 * 5 for s, e in chunks)
+        dm.close()
+
+    def test_bulk_download_batches_tickers_and_dates(self, tmp_path):
+        dm = DataManager(str(tmp_path / 't.db'))
+        dm.chunk_pause_seconds = 0
+        calls = []
+        tickers = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
+        with patch('data_manager.yf.download', side_effect=self._fake_download(calls)), \
+             patch('data_manager.time.sleep'):
+            out = dm.bulk_download(tickers, date(2006, 1, 1), date(2025, 12, 31))
+        assert all(len(c[0]) <= dm.bulk_batch_size for c in calls)
+        assert len(calls) == 2 * len(dm._date_chunks(date(2006, 1, 1), date(2025, 12, 31)))
+        assert set(out) == set(tickers)
+        assert out['A'].index.min().date() == date(2006, 1, 2)
+        assert out['A'].index.max().date() == date(2025, 12, 31)
+        dm.close()
+
+    def test_extract_ticker_frame_handles_flat_and_multiindex(self):
+        idx = pd.bdate_range('2024-01-01', periods=3)
+        flat = pd.DataFrame({'Adj Close': [1.0, 2.0, 3.0]}, index=idx)
+        multi = pd.concat({'X': flat}, axis=1)
+        assert len(DataManager._extract_ticker_frame(flat, 'X')) == 3
+        assert len(DataManager._extract_ticker_frame(multi, 'X')) == 3
+        assert DataManager._extract_ticker_frame(multi, 'Y') is None

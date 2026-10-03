@@ -1,18 +1,9 @@
 """
-Portfolio optimization using SciPy with Enhanced Methods.
-FIXED:
-- Min volatility now excludes leveraged ETFs by default
-- Custom weighted objective normalized properly
-- Better constraint handling
+Portfolio optimization using SciPy (SLSQP with multi-start).
 """
 import numpy as np
 import scipy.optimize as sco
 from portfolio_simulator import PortfolioSimulator
-
-# Leveraged ETFs that shouldn't dominate "min volatility" portfolios
-LEVERAGED_ETFS = {'TQQQ', 'SQQQ', 'SPXL', 'SPXS', 'UPRO', 'TMF', 'TMV', 'UDOW', 'SDOW',
-                  'QLD', 'QID', 'SSO', 'SDS', 'UVXY', 'SVXY', 'SOXL', 'SOXS'}
-LEVERAGED_ETFS = {}
 
 class PortfolioOptimizer:
     def __init__(self, simulator: PortfolioSimulator, data_manager):
@@ -132,15 +123,8 @@ class PortfolioOptimizer:
         return self._minimize(neg_sharpe, assets, args=(mean_rets, cov_mat, risk_free_rate),
                               label="Max Sharpe Ratio")
 
-    def optimize_min_volatility(self, assets, start_date_override=None,
-                                 exclude_leveraged=True, max_leveraged_weight=0.10):
-        """
-        Minimize Volatility
-
-        Parameters:
-            exclude_leveraged: If True, cap leveraged ETF weights (they shouldn't dominate min vol)
-            max_leveraged_weight: Maximum weight for any single leveraged ETF
-        """
+    def optimize_min_volatility(self, assets, start_date_override=None):
+        """Minimize Volatility"""
         returns, mean_rets, cov_mat = self._get_data(assets, start_date_override=start_date_override)
 
         if returns is None: return self._package_fail(assets, "Min Volatility", "No Data")
@@ -148,25 +132,7 @@ class PortfolioOptimizer:
         def port_vol(weights, cov_mat):
             return np.sqrt(np.dot(weights.T, np.dot(cov_mat, weights))) * np.sqrt(252)
 
-        # Build custom bounds - cap leveraged ETFs
-        bounds = []
-        for asset in assets:
-            ticker = asset['ticker'].upper()
-            if exclude_leveraged and ticker in LEVERAGED_ETFS:
-                bounds.append((0.0, max_leveraged_weight))
-            else:
-                bounds.append((0.0, 1.0))
-
-        result = self._minimize(port_vol, assets, args=(cov_mat,), label="Min Volatility",
-                                bounds=tuple(bounds))
-
-        # Verify result makes sense
-        allocations = result['allocations']
-        for i, asset in enumerate(assets):
-            if asset['ticker'].upper() in LEVERAGED_ETFS and allocations[i] > 0.15:
-                print(f"  ⚠ Warning: {asset['ticker']} at {allocations[i]*100:.1f}% in Min Vol portfolio")
-
-        return result
+        return self._minimize(port_vol, assets, args=(cov_mat,), label="Min Volatility")
 
     def optimize_sortino_ratio(self, assets, risk_free_rate=0.04, start_date_override=None):
         """Maximize Sortino Ratio"""

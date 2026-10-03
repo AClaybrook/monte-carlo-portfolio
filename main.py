@@ -53,6 +53,8 @@ def main():
     parser.add_argument('--offline', action='store_true', help='Use cached data only (no yfinance calls)')
     parser.add_argument('--data-source', choices=['yfinance', 'fmp'], default='yfinance',
                         help='Data source for market data (default: yfinance)')
+    parser.add_argument('--synthetic', action='store_true',
+                        help='Use deterministic synthetic prices (no network, not real data)')
     args = parser.parse_args()
 
     config_path = find_config_file(args.config)
@@ -65,10 +67,15 @@ def main():
         return 1
 
     # Initialize data manager
-    data_source = getattr(args, 'data_source', 'yfinance')
-    data_manager = DataManager(db_path=config.database.path, data_source=data_source)
-    if data_source != 'yfinance':
-        print(f"  Data source: {data_source.upper()}")
+    if args.synthetic:
+        from synthetic_data import SyntheticDataManager
+        data_manager = SyntheticDataManager()
+        print("  Data source: SYNTHETIC (generated prices, not real market data)")
+    else:
+        data_source = args.data_source
+        data_manager = DataManager(db_path=config.database.path, data_source=data_source)
+        if data_source != 'yfinance':
+            print(f"  Data source: {data_source.upper()}")
 
     # Coverage report mode
     if args.coverage_report:

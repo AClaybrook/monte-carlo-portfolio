@@ -10,6 +10,11 @@ Usage:
     python test_strategies.py --dca 1000         # Test with $1000/month DCA
 """
 
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
 import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
