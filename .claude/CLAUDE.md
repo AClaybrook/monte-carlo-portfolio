@@ -1,208 +1,86 @@
 # Monte Carlo Portfolio Simulator
 
-Portfolio analysis tool inspired by [PortfolioVisualizer.com](https://www.portfoliovisualizer.com). Runs Monte Carlo simulations, historical backtests, and portfolio optimization to compare investment strategies.
+Portfolio analysis tool inspired by [PortfolioVisualizer.com](https://www.portfoliovisualizer.com): historical backtests, Monte Carlo simulation, dynamic/conditional rebalancing strategies, and SciPy optimization, compared in one interactive HTML report.
 
 ## Tech Stack
 
-- **Python 3.11** with type-safe dataclass configuration
-- **Data**: pandas, numpy, scipy for numerical operations
-- **Market Data**: yfinance with SQLite caching via SQLAlchemy
-- **Visualization**: Plotly for interactive HTML dashboards
-- **Database**: SQLite (`stock_data.db`) for price caching and results
+- Python 3.11, dataclass configuration
+- pandas / numpy / scipy; Plotly for the report
+- yfinance (default) or Financial Modeling Prep, cached in SQLite (`stock_data.db`) via SQLAlchemy
 
 ## Project Structure
 
 ```
-├── main.py                    # Entry point - orchestrates analysis pipeline
-├── run_config.py              # Dataclass config definitions (RunConfig, PortfolioConfig, etc.)
-├── data_manager.py            # Data fetching, caching, interval-based smart downloads
-├── portfolio_simulator.py     # Monte Carlo simulation engine
-├── portfolio_optimizer.py     # SciPy-based portfolio optimization
-├── backtester.py              # Historical backtesting with strategy support
-├── strategies.py              # Dynamic allocation strategies (buy-the-dip, momentum, etc.)
-├── visualizations.py          # Plotly HTML report generation
-├── config/                    # Portfolio configuration files
-│   ├── example_config.py      # Example with optimization
-│   ├── quick_test.py          # Fast testing config (~10s)
-│   └── strategy_example.py    # Example with dynamic strategies
-├── repair_metadata.py         # Fix DB metadata sync issues
-├── output/                    # Generated HTML reports
-└── stock_data.db              # SQLite cache for market data
+main.py                  Pipeline: data -> evaluate_portfolio() per portfolio -> optimize -> report
+run_config.py            RunConfig, PortfolioConfig, SimulationConfig, RebalanceConfig, StrategyConfig, ...
+engine.py                Shared day-step engine (run_engine), price alignment, schedules, return generators
+backtester.py            Backtester.run_backtest: one historical path through the engine + metrics
+portfolio_simulator.py   PortfolioSimulator.simulate_portfolio: N simulated paths through the engine
+quant_analytics.py       Every metric (compute_performance, CAGR, Sharpe, drawdowns, XIRR, ...)
+strategies.py            AllocationStrategy subclasses + STRATEGY_BUILDERS registry
+portfolio_optimizer.py   SLSQP optimizers (max Sharpe, min vol, risk parity, Sortino, custom)
+visualizations.py        PortfolioVisualizer.generate_html_report (presentation only)
+data_manager.py          Downloads + interval-tracked SQLite cache; data_utils.py is its CLI
+synthetic_data.py        Deterministic generated prices (SyntheticDataManager) for offline runs/tests
+pv_compat.py             Portfolio Visualizer CSV/URL export
+config/                  example_config.py, strategy_example.py, synthetic_demo.py (others git-ignored)
+examples/                compare_strategies.py, timing_analysis.py
+db_scripts/              DB repair/migration one-offs
+tests/                   pytest suite
 ```
 
 ## Essential Commands
 
-
-
 ```bash
-# Activate virtual environment
 source venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
 
-# Run with default config (config/my_portfolios.py or config/example_config.py)
-python main.py
-
-# Run with specific config
+python main.py                                  # config/my_portfolios.py, else example_config.py
 python main.py config/example_config.py
+python main.py config/synthetic_demo.py --synthetic   # offline, ~5s, fake prices
+python main.py --offline                        # cached data only
+python main.py --no-optimize --force-download --coverage-report --embed-plotlyjs
+python main.py --data-source fmp                # needs FMP_API_KEY
 
-# Force re-download all market data
-python main.py --force-download
+python data_utils.py list | coverage | sync --since 2024-12-05 | download VOO,QQQ | info VOO
+python examples/compare_strategies.py --synthetic --test broad
 
-# Check data coverage for configured tickers
-python main.py --coverage-report
-
-# Skip optimization step
-python main.py --no-optimize
-
-# Use Financial Modeling Prep instead of yfinance (requires FMP_API_KEY env var)
-export FMP_API_KEY=your_key_here
-python main.py --data-source fmp
-python data_utils.py --data-source fmp download GBTC,VOO
-
-# Data management utility (data_utils.py)
-python data_utils.py list                      # List all tickers in DB
-python data_utils.py coverage                  # Show data coverage report
-python data_utils.py sync --since 2024-12-05   # Update all tickers stale since Dec 5
-python data_utils.py sync --dry-run            # Preview what would be updated
-python data_utils.py download VOO,QQQ,BND      # Bulk download specific tickers
-python data_utils.py info VOO                  # Show ticker info and gaps
+python -m pytest tests -q
 ```
 
-## Configuration
+## Key Design Rules
 
-All configuration uses type-safe dataclasses. Create configs in `config/my_*.py` (gitignored).
+- **One engine.** Backtests and Monte Carlo both go through `engine.run_engine`; never add a separate fast path with different math.
+- **One metrics module.** Every reported number comes from `quant_analytics`. The report never recomputes financial metrics.
+- **Align prices, then compute returns** (`engine.align_asset_prices`), so crypto weekend moves land in Monday's return.
+- **Time-weighted vs money-weighted.** Return metrics use the TWR index (contributions removed); IRR is reported separately.
+- **Annualize by calendar span** (`quant_analytics.years_between` / `infer_periods_per_year`), never rows / 252.
+- **Strategy indicators come from prices**, not holdings. Strategies are vectorized over paths and get `reset()` at the start of every run.
+- Library defaults are buy-and-hold (`rebalance=None`); configs default to annual rebalancing (`SimulationConfig.rebalance`).
 
-Key config classes ([run_config.py:8-129](run_config.py#L8-L129)):
-- `RunConfig` - Top-level container
-- `PortfolioConfig` - Portfolio name, allocations, optional strategy
-- `SimulationConfig` - Capital, years, simulation count, method, **start_date/end_date**
-- `OptimizationConfig` - Assets to optimize, strategies (max_sharpe, min_volatility, etc.)
-- `StrategyConfig` - Dynamic allocation strategy type and params
+## Configuration Highlights
 
-### SimulationConfig Date Options
+- `SimulationConfig`: `start_date`/`end_date` or `lookback_years`; `contribution_amount` + `contribution_frequency` (int trading days or `'monthly'`/`'quarterly'`/`'annual'`); `rebalance`; `risk_free_rate`; `method` (`bootstrap`, `block_bootstrap`, `geometric_brownian`, `parametric`); `block_size`; `seed`; `inflation_rate`.
+- `PortfolioConfig.rebalance` overrides the default: a `RebalanceConfig(frequency, threshold, transaction_cost_bps)` or a frequency string.
+- `StrategyConfig(type, params, apply_to='contributions'|'rebalance'|'both', check_frequency='monthly')`. Types are the keys of `strategies.STRATEGY_BUILDERS`.
+- `RunConfig.benchmark_ticker` (defaults to `optimization.benchmark_ticker`).
+- `VisualizationConfig.embed_plotlyjs` for offline reports.
 
-```python
-# Option 1: Explicit date range (most control)
-SimulationConfig(start_date='2020-01-01', end_date='2024-12-31')
+## Data Notes
 
-# Option 2: End date with lookback period
-SimulationConfig(end_date='2024-12-31', lookback_years=5)
-
-# Option 3: Lookback from today (default behavior)
-SimulationConfig(lookback_years=10)
-```
-
-## Key Module Entry Points
-
-| Module | Main Class/Function | Purpose |
-|--------|---------------------|---------|
-| [main.py:47](main.py#L47) | `main()` | Orchestrates full analysis pipeline |
-| [data_manager.py:237](data_manager.py#L237) | `DataManager` | Market data with interval caching |
-| [portfolio_simulator.py:12](portfolio_simulator.py#L12) | `PortfolioSimulator` | Monte Carlo engine |
-| [portfolio_optimizer.py:17](portfolio_optimizer.py#L17) | `PortfolioOptimizer` | SciPy optimization |
-| [backtester.py:10](backtester.py#L10) | `Backtester` | Historical backtesting |
-| [strategies.py:61](strategies.py#L61) | `AllocationStrategy` | Base class for strategies |
-| [visualizations.py:12](visualizations.py#L12) | `PortfolioVisualizer` | HTML report generation |
-
-## Simulation Methods
-
-- **bootstrap** (default): Resamples historical returns, preserves fat tails
-- **geometric_brownian**: Industry-standard GBM model
-- **parametric**: Simple normal distribution
-
-## Dynamic Strategies
-
-Strategies modify DCA allocation based on market conditions ([strategies.py:61-622](strategies.py#L61-L622)):
-- `static` - Fixed allocation
-- `buy_the_dip` - Increase allocation when target asset drops
-- `crypto_opportunistic` - Buy more crypto during drawdowns
-- `momentum` - Tilt toward positive momentum assets
-- `volatility_target` - Adjust to maintain target volatility
-- `drawdown_protection` - Shift to defensive allocation during crashes
-- `relative_value` - Buy most beaten-down assets
-
-## Data Sources
-
-Two market data providers are supported via the `--data-source` flag:
-
-| Source | Flag | Notes |
-|--------|------|-------|
-| **yfinance** (default) | `--data-source yfinance` | Free, supports bulk downloads, may rate-limit on WSL/Linux |
-| **FMP** | `--data-source fmp` | Requires `FMP_API_KEY` env var. Free tier: 250 req/day. Sequential downloads only (no bulk endpoint) |
-
-Both sources write to the same SQLite cache in yfinance column format (`Open`, `High`, `Low`, `Close`, `Adj Close`, `Volume`). FMP columns are automatically mapped. The `--data-source` flag works with both `main.py` and `data_utils.py`.
-
-## Output
-
-Reports saved to `output/` as interactive HTML dashboards with:
-- Monte Carlo probability distributions
-- Historical backtest equity curves
-- Drawdown analysis
-- Rolling returns
-- Risk-return scatter plots
-
-## Additional Documentation
-
-See `.claude/docs/` for detailed patterns:
-- [architectural_patterns.md](.claude/docs/architectural_patterns.md) - Design patterns and code conventions
-- [last_worked.md](.claude/docs/last_worked.md) - Notes on recent changes and data fetching architecture
-
-## Recent Improvements (2026-02)
-
-### Data Management
-- Added Financial Modeling Prep (FMP) as alternative data source via `--data-source fmp` flag
-- FMP support in `main.py`, `data_utils.py`, and `data_manager.py` with API key from `FMP_API_KEY` env var
-- Added `sync` command to `data_utils.py` for bulk updating stale data
-- Added `start_date` and `end_date` to `SimulationConfig` for explicit date ranges
-- Use `--offline` flag to skip yfinance calls and use cached data only
-- `repair_metadata.py` - Fixes ticker_metadata sync issues when DB has data but missing/stale metadata
-
-### Data Fetching Fixes
-- Fixed `bulk_download()` to use per-ticker missing intervals instead of global date range
-- Fixed `_bulk_download_and_save()` fallback to use per-ticker intervals
-- Fixed offline mode to dynamically detect latest cached date (was hardcoded)
-- Added download failure cooldown (1hr) to prevent repeated failed API calls
-- Added download plan summary printed before any yfinance API calls
-- Changed `data_intervals_json` column from `String(2000)` to `Text`
-- Added `test_data_manager.py` with IntervalTracker and DataManager unit tests
-
-### Performance Optimizations
-Reduced full example_config runtime from ~3min to ~1.3min:
-- **portfolio_simulator.py**: float32 arrays, 2000 batch size, pre-allocation, vectorized bootstrap
-- **portfolio_optimizer.py**: Data caching across strategies, 1000 sims during optimization (full sims done for final results), concentrated starting points for better convergence
-- **visualizations.py**: Downsampled percentile calculations (~500 points)
-
-### Stability Fixes
-- Fixed overflow in `portfolio_optimizer.py` custom_objective using log-returns for drawdown
-- Fixed overflow in `portfolio_simulator.py` using float64 for cumprod operations
-- Fixed single-asset covariance with `np.atleast_2d()`
-
-### Quick Test Config
-- `config/quick_test.py` - Fast config for iteration (~10s, 2000 sims, no optimization)
+- Yahoo rate-limits large requests (worse on WSL). `bulk_download` splits work into `bulk_batch_size` tickers × `max_chunk_years` date chunks with `chunk_pause_seconds` pauses; per-ticker downloads are chunked too.
+- yfinance must NOT be given a `requests.Session` (yfinance >= 0.2.58 requires its own curl_cffi session).
+- Failed intervals have a 1-hour in-memory cooldown. `db_scripts/repair_metadata.py` fixes interval metadata drift.
+- For reproducible comparisons, set an explicit `end_date` that your cache covers (`python data_utils.py coverage`).
 
 ## Testing
 
-```bash
-# Run all tests
-python -m pytest tests/ -v
+- `tests/test_performance.py`: golden metric values; `test_engine.py`: rebalancing, signals, costs, alignment, MC/backtest consistency; `test_monte_carlo.py`: generators, seeds, inflation; `test_report.py`: end-to-end synthetic run.
+- `test_pv_benchmark.py` / `test_historical_validation.py` compare against Portfolio Visualizer reference numbers and need `stock_data.db`; they skip otherwise.
+- Test data that means "trading days" should use business-day dates (`freq='B'`); calendar-day dates are annualized as 365/yr.
 
-# Run specific test file
-python -m pytest tests/test_simulator.py -v
+## Additional Documentation
 
-# Run with coverage
-python -m pytest tests/ -v --cov=. --cov-report=term-missing
-```
-
-### Test Files
-- `test_metrics.py` - CAGR, Sharpe, Sortino, drawdown calculations
-- `test_simulator.py` - Monte Carlo simulation engine
-- `test_optimizer.py` - Portfolio optimization (Sharpe, min vol, risk parity)
-- `test_backtest.py` - Historical backtesting
-- `test_dca_strategies.py` - DCA and dynamic allocation strategies
-- `test_historical_validation.py` - Validates against cached market data (VOO, BND, BTC-USD, etc.)
-
-### Known Issues
-- yfinance may heavily rate limit downloads, especially on WSL/Linux
-- For best results, use explicit `end_date` matching your cached data (check with `python data_utils.py coverage`)
+- [.claude/docs/architecture_diagram.md](docs/architecture_diagram.md): pipeline and module map
+- [.claude/docs/architectural_patterns.md](docs/architectural_patterns.md): conventions
+- [.claude/docs/last_worked.md](docs/last_worked.md): recent change log and data-fetching notes
