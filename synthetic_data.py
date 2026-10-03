@@ -59,21 +59,27 @@ def _calendar() -> pd.DatetimeIndex:
 
 
 def _market_factor() -> np.ndarray:
-    """Daily simple returns of a two-regime market (bull 10%/15%, bear -30%/35%)."""
+    """Daily simple returns of a two-regime market (bull 16%/14% vol, bear -30%/30% vol).
+
+    Seed and parameters were picked so calendar years stay plausible
+    (+41% best, -26% worst, two bear years, ~9.5% CAGR over 2000-2026).
+    """
     if '__MKT__' in _cache:
         return _cache['__MKT__'].values
-    rng = np.random.default_rng(12345)
+    rng = np.random.default_rng(17)
     n = len(_calendar())
     dt = 1 / 365
-    mu = {0: 0.13, 1: -0.30}
-    vol = {0: 0.14, 1: 0.32}
-    p_switch = {0: 1 / (365 * 4), 1: 1 / 180}   # ~4y bulls, ~6m bears
+    mu = {0: 0.16, 1: -0.30}
+    vol = {0: 0.14, 1: 0.30}
+    p_switch = {0: 1 / (365 * 5), 1: 1 / 150}   # ~5y bulls, ~5m bears
+    switches = rng.random(n)
+    shocks = rng.standard_normal(n)
     regime = 0
     out = np.empty(n)
     for i in range(n):
-        if rng.random() < p_switch[regime]:
+        if switches[i] < p_switch[regime]:
             regime = 1 - regime
-        out[i] = mu[regime] * dt + vol[regime] * np.sqrt(dt) * rng.standard_normal()
+        out[i] = mu[regime] * dt + vol[regime] * np.sqrt(dt) * shocks[i]
     _cache['__MKT__'] = pd.Series(out, index=_calendar())
     return out
 
@@ -110,8 +116,8 @@ def synthetic_prices(ticker: str, start: Optional[date] = None,
     prices = 100.0 * (1 + r).cumprod()
     if not ticker.endswith('-USD'):
         prices = prices[prices.index.dayofweek < 5]
-    first = max(start or CALENDAR_START, _INCEPTION.get(ticker, CALENDAR_START))
-    last = min(end or CALENDAR_END, CALENDAR_END)
+    first = max(_to_date(start) or CALENDAR_START, _INCEPTION.get(ticker, CALENDAR_START))
+    last = min(_to_date(end) or CALENDAR_END, CALENDAR_END)
     prices = prices[(prices.index >= pd.Timestamp(first)) & (prices.index <= pd.Timestamp(last))]
     return prices.rename(ticker)
 

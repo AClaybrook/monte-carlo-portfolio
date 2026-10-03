@@ -271,3 +271,10 @@ class TestPVCompatibility:
         parsed = parse_portfolio_csv(content)
         assert parsed['allocations']['SPY'] == 0.70
         assert parsed['allocations']['BND'] == 0.30
+
+
+def test_whole_percentages_sum_to_100():
+    from pv_compat import whole_percentages
+    assert sum(whole_percentages({'A': 1/3, 'B': 1/3, 'C': 1/3}).values()) == 100
+    assert whole_percentages({'A': 0.6, 'B': 0.4}) == {'A': 60, 'B': 40}
+    assert whole_percentages({'A': 0.5, 'B': 0.0, 'C': 0.5}) == {'A': 50, 'C': 50}

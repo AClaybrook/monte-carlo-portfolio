@@ -632,3 +632,61 @@ class TestPortfolioVisualizerBenchmark:
                 print_comparison(PV_BENCHMARK['name'], metrics, PV_BENCHMARK['expected'])
         except Exception as e:
             print(f"\n  Benchmark: SKIPPED ({e})")
+
+
+# ============================================================
+# Backtester vs Portfolio Visualizer, metric by metric
+# (needs stock_data.db with the tickers below; skipped otherwise)
+# ============================================================
+
+# PV computes Sharpe/Sortino against actual 1-month T-bill returns; their
+# average over Feb 2016 - Jan 2026 was roughly 1.9%/yr.
+PV_APPROX_RISK_FREE = 0.019
+
+
+class TestBacktesterMatchesPV:
+    """The report's numbers come from Backtester + quant_analytics; check them against PV."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.dm = get_data_manager()
+        yield
+        self.dm.close()
+
+    def _run(self, pv_config):
+        assets = []
+        for ticker in pv_config['tickers']:
+            df = load_ticker_data(self.dm, ticker, PV_START_DATE - pd.Timedelta(days=7), PV_END_DATE)
+            if df is None:
+                pytest.skip(f"No data for {ticker}")
+            assets.append({'ticker': ticker, 'full_data': df,
+                           'historical_returns': df['Adj Close'].pct_change().dropna()})
+        weights = [pv_config['weights'][t] for t in pv_config['tickers']]
+        # PV's month-to-month period starts from the prior month-end close (Fri 2016-01-29)
+        start = pd.Timestamp('2016-01-29')
+        return Backtester(self.dm).run_backtest(
+            assets, weights, PV_INITIAL_CAPITAL, start_date_override=start,
+            end_date=pd.Timestamp(PV_END_DATE), rebalance='none',
+            risk_free_rate=PV_APPROX_RISK_FREE)
+
+    @pytest.mark.parametrize('pv', [PV_PORTFOLIO_2, PV_PORTFOLIO_1], ids=['P2', 'P1'])
+    def test_headline_metrics(self, pv):
+        res = self._run(pv)
+        m, e = res['metrics'], pv['expected']
+        print(f"\n  {pv['name']}")
+        for k in ('CAGR', 'Stdev', 'Sharpe', 'Sortino', 'Max Drawdown', 'Best Year', 'Worst Year'):
+            print(f"    {k:<13} ours {m[k]:>8.4f}   PV {e[k]:>8.4f}")
+        assert m['CAGR'] == pytest.approx(e['CAGR'], abs=0.005)
+        assert m['End Balance'] == pytest.approx(e['End Balance'], rel=0.03)
+        assert m['Stdev'] == pytest.approx(e['Stdev'], abs=0.015)
+        assert m['Sharpe'] == pytest.approx(e['Sharpe'], abs=0.10)
+        assert m['Best Year'] == pytest.approx(e['Best Year'], abs=0.01)
+        assert m['Worst Year'] == pytest.approx(e['Worst Year'], abs=0.01)
+        # Daily data sees intra-month lows that PV's month-end series cannot
+        assert m['Max Drawdown'] <= e['Max Drawdown'] + 0.005
+
+    @pytest.mark.parametrize('pv', [PV_PORTFOLIO_2, PV_PORTFOLIO_1], ids=['P2', 'P1'])
+    def test_annual_returns(self, pv):
+        annual = self._run(pv)['annual_returns']['return']
+        for year, expected in pv['annual_returns'].items():
+            assert annual[year] == pytest.approx(expected, abs=0.01), f"{year}"

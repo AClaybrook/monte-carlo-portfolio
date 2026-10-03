@@ -332,7 +332,7 @@ def compute_performance(balance: pd.Series, twr_index: pd.Series,
         m.update({
             'Active Return': cagr_from_index(p) - cagr_from_index(b),
             'Tracking Error': te,
-            'Info Ratio': float(active.mean() * ppy / te) if te > 0 else np.nan,
+            'Info Ratio': float(active.mean() * ppy / te) if te > 1e-9 else np.nan,
             'Upside Capture': up_c,
             'Downside Capture': down_c,
         })

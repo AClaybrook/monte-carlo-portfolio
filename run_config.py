@@ -231,6 +231,7 @@ class VisualizationConfig:
     save_html: bool = True
     show_browser: bool = True
     output_filename: str = 'portfolio_dashboard.html'
+    embed_plotlyjs: bool = False  # True: report works offline (+~4.5 MB)
 
 @dataclass
 class DatabaseConfig:
